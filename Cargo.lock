@@ -2443,8 +2443,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "hex",
  "hmac",
  "parking_lot",
+ "serde",
+ "serde_json",
  "sha2",
  "tacit-core",
  "tacit-transport",
