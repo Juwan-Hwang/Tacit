@@ -18,7 +18,7 @@ pub use frontier::{Frontier, FrontierOps};
 pub use ids::{BlockId, CheckpointId, DocId, PeerId, SessionId};
 pub use model::{
     AckSummary, AnchorCapabilities, ApplyResult, BlockKind, BlockRecord, ChangeEnvelope,
-    DataFrame, DataFrameKind, DocumentView, Endpoint, ImportResult, NetworkType, PathHint,
-    PeerRecord, PeerSummary, PortHint, PortRange, PresenceHint, Priority, RenderModel,
+    DataFrame, DataFrameKind, DocumentView, Endpoint, ImportResult, NatCapability, NetworkType,
+    PathHint, PeerRecord, PeerSummary, PortHint, PortRange, PresenceHint, Priority, RenderModel,
     SnapshotChunk, SnapshotKind, SnapshotMeta, TrustState, UserEdit, Viewport, Watermarks,
 };
