@@ -5,5 +5,13 @@
 //! - 命令总线：UI 线程发命令到 Rust 内部队列。
 //! - 回调事件桥接：CoreEvent 转发到平台层监听器。
 //! - 不返回 LoroDoc 指针，平台层只通过 doc_id 与 blob 交互。
-//!
-//! Phase 0 占位：实际实现见后续 commit。
+
+pub mod engine;
+pub mod listener;
+pub mod view;
+
+pub use engine::TacitEngine;
+pub use listener::TacitEventListener;
+pub use view::{DocumentView, SyncStatus};
+
+uniffi::setup_scaffolding!();
