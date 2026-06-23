@@ -322,6 +322,36 @@ pub fn get_ack(conn: &Connection, peer_id: &PeerId, doc_id: &DocId) -> CoreResul
     }
 }
 
+/// 列出指定文档的所有 ack 摘要。
+pub fn list_acks_by_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Vec<AckSummary>> {
+    let mut stmt = conn
+        .prepare("SELECT peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at FROM acks WHERE doc_id = ?1")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![doc_id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (pid, did, cp, frontier, updated) = r.map_err(store_err)?;
+        out.push(AckSummary {
+            peer_id: PeerId::new(pid),
+            doc_id: DocId::new(did),
+            ack_checkpoint: cp.map(CheckpointId::new),
+            ack_frontier: de_frontier(&frontier),
+            updated_at: from_millis(updated),
+        });
+    }
+    Ok(out)
+}
+
 // ===== block_sync_state 表 =====
 
 /// block 同步状态记录。

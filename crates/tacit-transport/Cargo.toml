@@ -15,5 +15,6 @@ tracing.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
 async-trait = "0.1"
+serde.workspace = true
 
 [dev-dependencies]

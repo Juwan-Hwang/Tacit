@@ -5,5 +5,20 @@
 //! - 维护 block 级 expected_frontier 依赖等待。
 //! - 调度 Meta-Document 优先同步。
 //! - 处理 stale peer、手术式重入、恢复流程。
+//! - 双水位 GC 计算。
 //!
-//! Phase 0 占位：实际实现见后续 commit。
+//! 模块：
+//! - [`doc_store`]：文档状态管理（MetaDoc + BlockDocCache + 持久化协调）
+//! - [`pending`]：依赖等待队列
+//! - [`watermarks`]：双水位计算
+//! - [`engine`]：SyncEngine 实现
+
+pub mod doc_store;
+pub mod engine;
+pub mod pending;
+pub mod watermarks;
+
+pub use doc_store::DocStore;
+pub use engine::{DefaultSyncEngine, EngineConfig, SyncAction, SyncEngine};
+pub use pending::{PendingBlockFetch, PendingFetchQueue};
+pub use watermarks::WatermarkCalculator;
