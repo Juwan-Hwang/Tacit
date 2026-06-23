@@ -53,6 +53,9 @@ quinn = "0.11"
 # Noise 协议
 snow = { version = "0.10", features = ["default-resolver"] }
 
+# 签名
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 # FFI
 uniffi = "0.28"
 
