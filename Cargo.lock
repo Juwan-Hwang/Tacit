@@ -2326,9 +2326,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tacit-core",
  "tacit-transport",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
