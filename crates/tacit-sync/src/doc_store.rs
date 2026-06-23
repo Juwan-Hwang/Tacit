@@ -146,15 +146,13 @@ impl DocStore {
         if let Some(block) = self.cache.get(block_id) {
             return Ok(block);
         }
-        // 从 store 恢复
+        // 从 store 恢复：按 block_id 精确查找 snapshot（避免误读 meta snapshot）
         let conn = self.store.conn();
-        let (_, blob, _, _) = dao::get_latest_snapshot(&conn, doc_id)?
+        let (blob, _, _) = dao::get_snapshot(&conn, doc_id, &CheckpointId::new(block_id.as_str()))?
             .ok_or_else(|| CoreError::BlockNotFound {
                 doc_id: doc_id.to_string(),
                 block_id: block_id.to_string(),
             })?;
-        // 注意：snapshot_id 用 block_id，但 get_latest_snapshot 返回的是最新 snapshot
-        // 这里需要按 block_id 查找。简化：Phase 0 假设 block_id == snapshot_id。
         let block = BlockDoc::from_snapshot(block_id.clone(), &self.peer_id, &blob)?;
         let block = Arc::new(block);
         self.cache.insert(block_id.clone(), block.clone());

@@ -166,6 +166,35 @@ pub fn get_latest_snapshot(
     }
 }
 
+/// 按 doc_id + snapshot_id 精确查找快照。
+pub fn get_snapshot(
+    conn: &Connection,
+    doc_id: &DocId,
+    snapshot_id: &CheckpointId,
+) -> CoreResult<Option<(Vec<u8>, SnapshotKind, SystemTime)>> {
+    let mut stmt = conn
+        .prepare("SELECT snapshot_blob, snapshot_kind, created_at FROM document_snapshots WHERE doc_id = ?1 AND snapshot_id = ?2 ORDER BY created_at DESC LIMIT 1")
+        .map_err(store_err)?;
+    let row = stmt
+        .query_row(params![doc_id.as_str(), snapshot_id.as_str()], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()
+        .map_err(store_err)?;
+    match row {
+        Some((blob, kind, created)) => Ok(Some((
+            blob,
+            de_json(&kind).unwrap_or(SnapshotKind::Full),
+            from_millis(created),
+        ))),
+        None => Ok(None),
+    }
+}
+
 // ===== peer 表 =====
 
 pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {

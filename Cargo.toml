@@ -11,6 +11,7 @@ members = [
     "crates/tacit-transport-relay",
     "crates/tacit-sync",
     "crates/tacit-ffi",
+    "crates/tacit-tests",
 ]
 
 [workspace.package]
@@ -73,6 +74,9 @@ hex = "0.4"
 sha2 = "0.10"
 hmac = "0.12"
 rand = "0.8"
+
+# 测试
+proptest = "1"
 
 [profile.release]
 opt-level = 3

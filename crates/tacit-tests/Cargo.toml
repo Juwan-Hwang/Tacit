@@ -1,0 +1,27 @@
+[package]
+name = "tacit-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "混沌与跨平台集成测试、属性测试"
+publish = false
+
+[dependencies]
+tacit-core.workspace = true
+tacit-crdt.workspace = true
+tacit-store.workspace = true
+tacit-crypto.workspace = true
+tacit-transport.workspace = true
+tacit-transport-ble.workspace = true
+tacit-transport-quic.workspace = true
+tacit-transport-relay.workspace = true
+tacit-sync.workspace = true
+tacit-ffi.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
