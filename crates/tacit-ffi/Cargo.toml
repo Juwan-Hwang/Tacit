@@ -1,0 +1,28 @@
+[package]
+name = "tacit-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UniFFI API、命令总线、回调事件桥接"
+
+[dependencies]
+tacit-core.workspace = true
+tacit-crdt.workspace = true
+tacit-store.workspace = true
+tacit-sync.workspace = true
+tacit-transport.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]

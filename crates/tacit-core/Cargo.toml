@@ -1,0 +1,21 @@
+[package]
+name = "tacit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tacit 领域模型、错误、配置与共享类型"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+uuid.workspace = true
+hex.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]

@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tacit-core",
+    "crates/tacit-crdt",
+    "crates/tacit-store",
+    "crates/tacit-crypto",
+    "crates/tacit-transport",
+    "crates/tacit-transport-ble",
+    "crates/tacit-transport-quic",
+    "crates/tacit-transport-relay",
+    "crates/tacit-sync",
+    "crates/tacit-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96.0"
+license = "MIT OR Apache-2.0"
+authors = ["Tacit Contributors"]
+repository = "https://github.com/tacit/tacit"
+
+[workspace.dependencies]
+# 内部 crate 互相引用，统一在此声明版本
+tacit-core = { path = "crates/tacit-core" }
+tacit-crdt = { path = "crates/tacit-crdt" }
+tacit-store = { path = "crates/tacit-store" }
+tacit-crypto = { path = "crates/tacit-crypto" }
+tacit-transport = { path = "crates/tacit-transport" }
+tacit-transport-ble = { path = "crates/tacit-transport-ble" }
+tacit-transport-quic = { path = "crates/tacit-transport-quic" }
+tacit-transport-relay = { path = "crates/tacit-transport-relay" }
+tacit-sync = { path = "crates/tacit-sync" }
+tacit-ffi = { path = "crates/tacit-ffi" }
+
+# 错误处理与日志（全 workspace 统一）
+thiserror = "1.0"
+tracing = "0.1"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# CRDT 内核
+loro = "1"
+
+# 持久化
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# QUIC 传输
+quinn = "0.11"
+
+# Noise 协议
+snow = { version = "0.10", features = ["default-resolver"] }
+
+# FFI
+uniffi = "0.28"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 工具类
+bytes = { version = "1", features = ["serde"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+dashmap = "5"
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+sha2 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

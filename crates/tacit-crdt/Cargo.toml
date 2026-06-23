@@ -1,0 +1,20 @@
+[package]
+name = "tacit-crdt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Loro 封装、Meta-Document、BlockDoc、Frontier/Diff/Snapshot 接口"
+
+[dependencies]
+tacit-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+loro.workspace = true
+
+[dev-dependencies]

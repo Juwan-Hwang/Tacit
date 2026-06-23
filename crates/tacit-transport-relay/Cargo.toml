@@ -1,0 +1,23 @@
+[package]
+name = "tacit-transport-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Relay 协议客户端/服务端、admission gate"
+
+[dependencies]
+tacit-core.workspace = true
+tacit-transport.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]

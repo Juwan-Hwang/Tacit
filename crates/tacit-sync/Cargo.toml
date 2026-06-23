@@ -1,0 +1,24 @@
+[package]
+name = "tacit-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "调度器、push/pull、依赖等待、GC、stale 追赶"
+
+[dependencies]
+tacit-core.workspace = true
+tacit-crdt.workspace = true
+tacit-store.workspace = true
+tacit-transport.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]

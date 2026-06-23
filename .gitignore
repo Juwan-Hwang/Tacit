@@ -1,0 +1,36 @@
+# Rust 构建产物
+/target
+**/target
+
+# Cargo 锁文件：库项目保留，应用项目可按需。Tacit 是应用级 workspace，保留锁文件以利于可复现构建
+# 如需忽略，取消下一行注释
+# Cargo.lock
+
+# 编辑器/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统杂项
+.DS_Store
+Thumbs.db
+
+# 本地环境与密钥
+.env
+.env.local
+*.pem
+*.key
+
+# 本地数据库与运行时数据
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# 日志
+*.log
+logs/

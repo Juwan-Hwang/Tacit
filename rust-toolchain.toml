@@ -1,0 +1,4 @@
+[toolchain]
+# Tacit workspace 使用 stable 通道，保证团队与 CI 构建一致
+channel = "stable"
+profile = "default"

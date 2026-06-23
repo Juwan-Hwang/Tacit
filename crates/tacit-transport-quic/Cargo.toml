@@ -1,0 +1,22 @@
+[package]
+name = "tacit-transport-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "LAN/WAN QUIC 适配、连接状态、fast-resume"
+
+[dependencies]
+tacit-core.workspace = true
+tacit-transport.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
