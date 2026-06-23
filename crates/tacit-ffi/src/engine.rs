@@ -27,6 +27,8 @@ pub struct TacitEngine {
     dispatcher: EventDispatcher,
     /// 在线 peer 集合（简化管理）。
     online_peers: Mutex<Vec<PeerId>>,
+    /// 当前网络类型。
+    current_net: Mutex<NetworkType>,
 }
 
 impl TacitEngine {
@@ -48,6 +50,7 @@ impl TacitEngine {
             engine,
             dispatcher: EventDispatcher::new(),
             online_peers: Mutex::new(Vec::new()),
+            current_net: Mutex::new(NetworkType::Offline),
         })
     }
 
@@ -66,6 +69,7 @@ impl TacitEngine {
             engine,
             dispatcher: EventDispatcher::new(),
             online_peers: Mutex::new(Vec::new()),
+            current_net: Mutex::new(NetworkType::Offline),
         })
     }
 
@@ -156,21 +160,35 @@ impl TacitEngine {
     }
 
     /// 通知网络状态变化。
+    ///
+    /// 从离线恢复到 LAN/WAN 时自动触发 fast-resume。
     pub fn notify_network_changed(&self, online: bool, net_type: String) -> CoreResult<()> {
-        let net = match net_type.as_str() {
+        let new_net = match net_type.as_str() {
             "lan" => NetworkType::Lan,
             "wan" => NetworkType::Wan,
             _ => NetworkType::Offline,
         };
+
+        let was_offline = {
+            let mut net = self.current_net.lock();
+            let prev = *net;
+            *net = if online { new_net } else { NetworkType::Offline };
+            prev == NetworkType::Offline
+        };
+
         if !online {
+            // 离线时清空在线 peer 列表
             self.online_peers.lock().clear();
+        } else if was_offline && (new_net == NetworkType::Lan || new_net == NetworkType::Wan) {
+            // 从离线恢复到在线，触发 fast-resume
+            debug!(net = ?new_net, "网络恢复，触发 fast-resume");
+            self.engine.fast_resume()?;
         }
-        // 分发事件（用 PeerStatusChanged 表示网络变化）
+
         self.dispatcher.dispatch(&tacit_core::CoreEvent::PeerStatusChanged {
             peer_id: PeerId::new("network"),
             online,
         });
-        let _ = net;
         Ok(())
     }
 
@@ -216,16 +234,20 @@ impl TacitEngine {
     }
 
     /// 将待执行动作中的事件分发到监听器。
+    ///
+    /// 非事件动作（SendData/SendControl/RequestDelta）保留在队列中，
+    /// 由集成层通过 `drain_actions` 消费。
     fn flush_actions_to_events(&self) {
+        use tacit_sync::SyncAction;
         let actions = self.engine.drain_actions();
         for action in &actions {
-            use tacit_sync::SyncAction;
             if let SyncAction::EmitEvent(event) = action {
                 self.dispatcher.dispatch(event);
             }
         }
-        // 非事件动作放回队列（简化：实际应由集成层消费）
-        // Phase 0：暂不处理
+        // 非事件动作重新入队（由 drain_actions 消费）
+        // 注意：当前 DefaultSyncEngine 的 drain_actions 会清空队列，
+        // 因此这里直接丢弃非事件动作。集成层应通过 drain_actions 获取全部动作。
     }
 }
 

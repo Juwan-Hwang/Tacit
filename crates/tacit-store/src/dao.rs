@@ -305,6 +305,45 @@ pub fn best_anchor(conn: &Connection) -> CoreResult<Option<PeerId>> {
     Ok(anchor.map(|p| p.peer_id))
 }
 
+/// 更新 peer 的 last_seen_at 和 last_endpoint（轻量更新，不需要整体 upsert）。
+pub fn mark_peer_seen(
+    conn: &Connection,
+    peer_id: &PeerId,
+    endpoint: Option<&Endpoint>,
+    now: SystemTime,
+) -> CoreResult<()> {
+    conn.execute(
+        "UPDATE peers SET last_seen_at = ?1, last_endpoint = ?2 WHERE peer_id = ?3",
+        params![
+            to_millis(now),
+            endpoint.map(ser_json).as_deref(),
+            peer_id.as_str(),
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 列出所有可作为 relay 的 trusted peer。
+pub fn list_relay_candidates(conn: &Connection) -> CoreResult<Vec<PeerId>> {
+    let peers = list_peers(conn)?;
+    Ok(peers
+        .into_iter()
+        .filter(|p| p.trust_state == TrustState::Trusted && p.capabilities.can_relay)
+        .map(|p| p.peer_id)
+        .collect())
+}
+
+/// 将 peer 信任状态降级为 Revoked。
+pub fn revoke_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<()> {
+    conn.execute(
+        "UPDATE peers SET trust_state = ?1 WHERE peer_id = ?2",
+        params![ser_json(&TrustState::Revoked), peer_id.as_str()],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 // ===== ack 表 =====
 
 pub fn upsert_ack(conn: &Connection, ack: &AckSummary) -> CoreResult<()> {

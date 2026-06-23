@@ -2441,6 +2441,8 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "parking_lot",
+ "serde_json",
+ "sha2",
  "tacit-core",
  "tacit-crdt",
  "tacit-store",

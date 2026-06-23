@@ -10,8 +10,9 @@ pub mod store;
 
 pub use dao::{
     best_anchor, get_ack, get_doc, get_latest_checkpoint, get_latest_snapshot, get_peer,
-    insert_checkpoint, insert_snapshot, list_docs, list_peers, list_pending_blocks,
-    upsert_ack, upsert_block_sync_state, upsert_doc, upsert_peer, upsert_transport_stats,
+    get_snapshot, insert_checkpoint, insert_snapshot, list_docs, list_peers,
+    list_pending_blocks, list_relay_candidates, mark_peer_seen, revoke_peer, upsert_ack,
+    upsert_block_sync_state, upsert_doc, upsert_peer, upsert_transport_stats,
     BlockSyncStateRecord, CheckpointRecord, DocRecord, TransportStatsRecord,
 };
 pub use store::Store;
