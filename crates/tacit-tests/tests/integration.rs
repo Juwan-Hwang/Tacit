@@ -532,8 +532,8 @@ fn noise_handshake_and_encrypted_sync() {
     use tacit_crypto::{DeviceIdentity, NoiseHandshake, sign, verify};
 
     // 两个设备身份
-    let id1 = DeviceIdentity::generate();
-    let id2 = DeviceIdentity::generate();
+    let id1 = DeviceIdentity::generate().unwrap();
+    let id2 = DeviceIdentity::generate().unwrap();
 
     // Noise 握手
     let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();

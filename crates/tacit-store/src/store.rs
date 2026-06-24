@@ -76,6 +76,44 @@ impl Store {
     }
 }
 
+/// 事务执行器：封装 Store::transaction，提供批量操作接口。
+///
+/// 蓝图第 255 行要求 TxnExecutor 组件。
+/// 用于需要原子性的多步操作（如双缓冲快照安装、checkpoint + snapshot 联合写入）。
+#[derive(Clone)]
+pub struct TxnExecutor {
+    store: Store,
+}
+
+impl TxnExecutor {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// 在事务中执行操作。
+    ///
+    /// 事务内所有操作要么全部成功，要么全部回滚。
+    pub fn execute<F, T>(&self, f: F) -> CoreResult<T>
+    where
+        F: FnOnce(&Connection) -> CoreResult<T>,
+    {
+        self.store.transaction(f)
+    }
+
+    /// 批量写入：在单个事务中执行多个写入操作。
+    pub fn batch_write<F>(&self, f: F) -> CoreResult<()>
+    where
+        F: FnOnce(&Connection) -> CoreResult<()>,
+    {
+        self.store.transaction(f)
+    }
+
+    /// 获取底层 Store 引用。
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+}
+
 /// 建表 SQL。对应蓝图 7.1 推荐表结构。
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS documents (

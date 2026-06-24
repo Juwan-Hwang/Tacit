@@ -33,7 +33,7 @@ mod tests {
 
     #[test]
     fn sign_and_verify() {
-        let id = DeviceIdentity::generate();
+        let id = DeviceIdentity::generate().unwrap();
         let msg = b"hello tacit";
         let sig = sign(&id, msg);
         let pubkey = id.public_key();
@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered() {
-        let id = DeviceIdentity::generate();
+        let id = DeviceIdentity::generate().unwrap();
         let msg = b"hello tacit";
         let sig = sign(&id, msg);
         let pubkey = id.public_key();
@@ -52,8 +52,8 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_key() {
-        let id1 = DeviceIdentity::generate();
-        let id2 = DeviceIdentity::generate();
+        let id1 = DeviceIdentity::generate().unwrap();
+        let id2 = DeviceIdentity::generate().unwrap();
         let msg = b"hello tacit";
         let sig = sign(&id1, msg);
         // 用错误的公钥验证

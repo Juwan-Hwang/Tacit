@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tacit_core::{CoreError, CoreResult, NetworkType, PeerId, PresenceHint};
-use tacit_transport::TransportManager;
+use tacit_core::{CoreError, CoreResult, DataFrame, NetworkType, PeerId, PresenceHint, Priority};
+use tacit_transport::{SyncTransport, TransportManager, PathPreference, ControlMsg};
 use tracing::{debug, warn};
 
 use crate::presence::BlePresence;
@@ -29,10 +29,28 @@ impl BleTransport {
 }
 
 #[async_trait]
-impl TransportManager for BleTransport {
-    async fn broadcast_presence(&self, hint: PresenceHint) -> CoreResult<()> {
-        debug!(group_id = %hint.group_id, "广播 presence");
-        self.presence.broadcast(&hint)
+impl SyncTransport for BleTransport {
+    async fn send_data(
+        &self,
+        _peer_id: &PeerId,
+        _frame: DataFrame,
+        _priority: Priority,
+        _preferred_path: PathPreference,
+    ) -> CoreResult<()> {
+        Err(CoreError::Transport("BLE 不承担数据面".into()))
+    }
+
+    async fn send_control(
+        &self,
+        _peer_id: &PeerId,
+        _msg: ControlMsg,
+        _priority: Priority,
+    ) -> CoreResult<()> {
+        Err(CoreError::Transport("BLE 不承担控制面".into()))
+    }
+
+    async fn reconnect_peer(&self, _peer_id: &PeerId) -> CoreResult<()> {
+        Err(CoreError::Transport("BLE 不支持数据面重连".into()))
     }
 
     async fn notify_network_changed(&self, online: bool, _net_type: NetworkType) -> CoreResult<()> {
@@ -43,12 +61,13 @@ impl TransportManager for BleTransport {
         }
         Ok(())
     }
+}
 
-    async fn reconnect_peer(&self, _peer_id: &PeerId) -> CoreResult<()> {
-        // BLE 不承担数据面，重连由 QUIC/relay 处理
-        Err(CoreError::Transport(
-            "BLE 不支持数据面重连".into(),
-        ))
+#[async_trait]
+impl TransportManager for BleTransport {
+    async fn broadcast_presence(&self, hint: PresenceHint) -> CoreResult<()> {
+        debug!(group_id = %hint.group_id, "广播 presence");
+        self.presence.broadcast(&hint)
     }
 }
 
@@ -84,7 +103,7 @@ mod tests {
         let backend = Arc::new(MockPresenceBackend::new());
         let presence = Arc::new(BlePresence::new(backend));
         let transport = BleTransport::new(presence);
-        let result = transport.reconnect_peer(&PeerId::new("p1")).await;
+        let result = SyncTransport::reconnect_peer(&transport, &PeerId::new("p1")).await;
         assert!(result.is_err());
     }
 
@@ -95,8 +114,7 @@ mod tests {
         let transport = BleTransport::new(presence);
         transport.broadcast_presence(hint()).await.unwrap();
         assert!(backend.is_broadcasting());
-        transport
-            .notify_network_changed(false, NetworkType::Offline)
+        SyncTransport::notify_network_changed(&transport, false, NetworkType::Offline)
             .await
             .unwrap();
         assert!(!backend.is_broadcasting());

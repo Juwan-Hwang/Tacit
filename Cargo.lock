@@ -2479,7 +2479,10 @@ dependencies = [
  "bytes",
  "parking_lot",
  "serde",
+ "serde_json",
+ "sha2",
  "tacit-core",
+ "tacit-store",
  "thiserror 1.0.69",
  "tracing",
 ]

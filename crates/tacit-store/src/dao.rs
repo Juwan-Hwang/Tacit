@@ -195,6 +195,20 @@ pub fn get_snapshot(
     }
 }
 
+/// 按 doc_id + snapshot_id 删除快照（用于双缓冲安装的回滚）。
+pub fn delete_snapshot(
+    conn: &Connection,
+    doc_id: &DocId,
+    snapshot_id: &CheckpointId,
+) -> CoreResult<()> {
+    conn.execute(
+        "DELETE FROM document_snapshots WHERE doc_id = ?1 AND snapshot_id = ?2",
+        params![doc_id.as_str(), snapshot_id.as_str()],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 // ===== peer 表 =====
 
 pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
@@ -556,6 +570,291 @@ pub fn get_latest_checkpoint(conn: &Connection, doc_id: &DocId) -> CoreResult<Op
         .optional()
         .map_err(store_err)?;
     Ok(row)
+}
+
+/// 列出指定 doc 的所有 checkpoint（按创建时间降序）。
+pub fn list_checkpoints_by_doc(
+    conn: &Connection,
+    doc_id: &DocId,
+) -> CoreResult<Vec<CheckpointRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT doc_id, checkpoint_id, shallow_snapshot_blob, frontier, state_hash, created_at FROM checkpoint_log WHERE doc_id = ?1 ORDER BY created_at DESC")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![doc_id.as_str()], |r| {
+            let hash: Vec<u8> = r.get(4)?;
+            let mut state_hash = [0u8; 32];
+            if hash.len() == 32 {
+                state_hash.copy_from_slice(&hash);
+            }
+            Ok(CheckpointRecord {
+                doc_id: DocId::new(r.get::<_, String>(0)?),
+                checkpoint_id: CheckpointId::new(r.get::<_, String>(1)?),
+                shallow_snapshot_blob: r.get::<_, Vec<u8>>(2)?,
+                frontier: de_frontier(&r.get::<_, String>(3)?),
+                state_hash,
+                created_at: from_millis(r.get::<_, i64>(5)?),
+            })
+        })
+        .map_err(store_err)?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(store_err)?);
+    }
+    Ok(result)
+}
+
+/// 删除指定 checkpoint 记录（用于 GC）。
+pub fn delete_checkpoint(
+    conn: &Connection,
+    doc_id: &DocId,
+    checkpoint_id: &CheckpointId,
+) -> CoreResult<()> {
+    conn.execute(
+        "DELETE FROM checkpoint_log WHERE doc_id = ?1 AND checkpoint_id = ?2",
+        params![doc_id.as_str(), checkpoint_id.as_str()],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 删除指定 doc 下所有早于 keep_checkpoint_id 的 snapshot（用于 GC）。
+///
+/// 保留与 keep_checkpoint_id 关联的 snapshot，删除其他旧 snapshot。
+pub fn delete_old_snapshots(
+    conn: &Connection,
+    doc_id: &DocId,
+    keep_prefix: &str,
+) -> CoreResult<u64> {
+    // 删除 snapshot_id 不以 keep_prefix 开头的 snapshot
+    let deleted = conn.execute(
+        "DELETE FROM document_snapshots WHERE doc_id = ?1 AND snapshot_id NOT LIKE ?2",
+        params![doc_id.as_str(), format!("{}%", keep_prefix)],
+    )
+    .map_err(store_err)?;
+    Ok(deleted as u64)
+}
+
+// ===== sync_log 表 =====
+
+/// sync_log 记录。对应 store-and-forward 的传输日志。
+#[derive(Debug, Clone)]
+pub struct SyncLogRecord {
+    pub entry_id: String,
+    pub doc_id: DocId,
+    pub delta_id: String,
+    pub recipient_peer_id: PeerId,
+    pub delivered_at: Option<SystemTime>,
+    pub acknowledged_at: Option<SystemTime>,
+    pub channel: String,
+}
+
+/// 插入 sync_log 记录。
+pub fn insert_sync_log(conn: &Connection, rec: &SyncLogRecord) -> CoreResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_log
+         (entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            rec.entry_id,
+            rec.doc_id.as_str(),
+            rec.delta_id,
+            rec.recipient_peer_id.as_str(),
+            rec.delivered_at.map(to_millis),
+            rec.acknowledged_at.map(to_millis),
+            rec.channel,
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 标记已投递。
+pub fn mark_delivered(conn: &Connection, entry_id: &str, at: SystemTime) -> CoreResult<()> {
+    conn.execute(
+        "UPDATE sync_log SET delivered_at = ?1 WHERE entry_id = ?2",
+        params![to_millis(at), entry_id],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 标记已确认。
+pub fn mark_acknowledged(conn: &Connection, entry_id: &str, at: SystemTime) -> CoreResult<()> {
+    conn.execute(
+        "UPDATE sync_log SET acknowledged_at = ?1 WHERE entry_id = ?2",
+        params![to_millis(at), entry_id],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 列出未投递的 sync_log（store-and-forward 重发）。
+pub fn list_undelivered(conn: &Connection, peer_id: &PeerId) -> CoreResult<Vec<SyncLogRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND delivered_at IS NULL")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![peer_id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (eid, did, delta, rid, deliv, ack, chan) = r.map_err(store_err)?;
+        out.push(SyncLogRecord {
+            entry_id: eid,
+            doc_id: DocId::new(did),
+            delta_id: delta,
+            recipient_peer_id: PeerId::new(rid),
+            delivered_at: deliv.map(from_millis),
+            acknowledged_at: ack.map(from_millis),
+            channel: chan,
+        });
+    }
+    Ok(out)
+}
+
+/// 列出未确认的 sync_log。
+pub fn list_unacknowledged(conn: &Connection, peer_id: &PeerId) -> CoreResult<Vec<SyncLogRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND acknowledged_at IS NULL")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![peer_id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (eid, did, delta, rid, deliv, ack, chan) = r.map_err(store_err)?;
+        out.push(SyncLogRecord {
+            entry_id: eid,
+            doc_id: DocId::new(did),
+            delta_id: delta,
+            recipient_peer_id: PeerId::new(rid),
+            delivered_at: deliv.map(from_millis),
+            acknowledged_at: ack.map(from_millis),
+            channel: chan,
+        });
+    }
+    Ok(out)
+}
+
+/// 清理已确认的 sync_log（GC）。
+pub fn cleanup_acknowledged(conn: &Connection, older_than_ms: i64) -> CoreResult<()> {
+    conn.execute(
+        "DELETE FROM sync_log WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ?1",
+        params![older_than_ms],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+// ===== transport_stats 查询 + EMA 更新 =====
+
+/// 查询单条 transport_stats。
+pub fn get_transport_stats(
+    conn: &Connection,
+    peer_id: &PeerId,
+    channel: &str,
+) -> CoreResult<Option<TransportStatsRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT peer_id, channel, success_ema, avg_latency_ms, updated_at FROM transport_stats WHERE peer_id = ?1 AND channel = ?2")
+        .map_err(store_err)?;
+    let row = stmt
+        .query_row(params![peer_id.as_str(), channel], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })
+        .optional()
+        .map_err(store_err)?;
+    match row {
+        Some((pid, chan, ema, lat, updated)) => Ok(Some(TransportStatsRecord {
+            peer_id: PeerId::new(pid),
+            channel: chan,
+            success_ema: ema,
+            avg_latency_ms: lat,
+            updated_at: from_millis(updated),
+        })),
+        None => Ok(None),
+    }
+}
+
+/// 列出所有 transport_stats。
+pub fn list_transport_stats(conn: &Connection) -> CoreResult<Vec<TransportStatsRecord>> {
+    let mut stmt = conn
+        .prepare("SELECT peer_id, channel, success_ema, avg_latency_ms, updated_at FROM transport_stats")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TransportStatsRecord {
+                peer_id: PeerId::new(r.get::<_, String>(0)?),
+                channel: r.get::<_, String>(1)?,
+                success_ema: r.get::<_, f64>(2)?,
+                avg_latency_ms: r.get::<_, i64>(3)?,
+                updated_at: from_millis(r.get::<_, i64>(4)?),
+            })
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(store_err)?);
+    }
+    Ok(out)
+}
+
+/// EMA 更新：读取现有值，计算指数移动平均，写入新值。
+///
+/// `success`：true=1.0, false=0.0
+/// `latency_ms`：本次延迟
+/// `alpha`：平滑系数（0.0 ~ 1.0）
+pub fn update_transport_ema(
+    conn: &Connection,
+    peer_id: &PeerId,
+    channel: &str,
+    success: bool,
+    latency_ms: i64,
+    alpha: f64,
+) -> CoreResult<()> {
+    let existing = get_transport_stats(conn, peer_id, channel)?;
+    let (old_ema, old_latency) = match existing {
+        Some(r) => (r.success_ema, r.avg_latency_ms as f64),
+        None => (0.0, 0.0),
+    };
+    let success_val = if success { 1.0 } else { 0.0 };
+    let new_ema = alpha * success_val + (1.0 - alpha) * old_ema;
+    let new_latency = alpha * latency_ms as f64 + (1.0 - alpha) * old_latency;
+    let rec = TransportStatsRecord {
+        peer_id: peer_id.clone(),
+        channel: channel.to_string(),
+        success_ema: new_ema,
+        avg_latency_ms: new_latency as i64,
+        updated_at: SystemTime::now(),
+    };
+    upsert_transport_stats(conn, &rec)?;
+    Ok(())
 }
 
 // ===== 辅助 =====

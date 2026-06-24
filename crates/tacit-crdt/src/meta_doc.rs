@@ -49,6 +49,7 @@ impl MetaDoc {
         &self.doc_id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn loro_doc(&self) -> &LoroDoc {
         &self.doc
     }
@@ -109,6 +110,56 @@ impl MetaDoc {
             doc_id: self.doc_id.to_string(),
             block_id: block_id.to_string(),
         })
+    }
+
+    /// 物理删除 block（从 list 中移除）。
+    ///
+    /// 注意：通常应使用 `soft_delete` 标记删除，仅在 compaction 确认安全后
+    /// 才调用此方法物理移除。
+    pub fn remove_block(&self, block_id: &BlockId) -> CoreResult<()> {
+        let list = self.list();
+        for i in 0..list.len() {
+            if let Some(ValueOrContainer::Value(LoroValue::String(s))) = list.get(i) {
+                if let Ok(record) = serde_json::from_str::<BlockRecord>(s.as_str()) {
+                    if record.block_id == *block_id {
+                        list.delete(i, 1)
+                            .map_err(|e| CoreError::Crdt(format!("MetaDoc 删除失败: {e}")))?;
+                        self.doc.commit();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(CoreError::BlockNotFound {
+            doc_id: self.doc_id.to_string(),
+            block_id: block_id.to_string(),
+        })
+    }
+
+    /// 移动 block 到新位置（调整 block 顺序）。
+    ///
+    /// `from` 和 `to` 是目标位置索引（基于当前 active block 列表）。
+    pub fn move_block(&self, from: usize, to: usize) -> CoreResult<()> {
+        let list = self.list();
+        let len = list.len();
+        if from >= len {
+            return Err(CoreError::BlockNotFound {
+                doc_id: self.doc_id.to_string(),
+                block_id: format!("index={from}"),
+            });
+        }
+        if to >= len {
+            return Err(CoreError::InvalidFrontier(format!(
+                "目标位置越界: to={to}, len={len}"
+            )));
+        }
+        if from == to {
+            return Ok(());
+        }
+        list.mov(from, to)
+            .map_err(|e| CoreError::Crdt(format!("MetaDoc move 失败: {e}")))?;
+        self.doc.commit();
+        Ok(())
     }
 
     /// 列出所有 block 元信息（含已 soft-deleted）。

@@ -57,6 +57,14 @@ impl DocStore {
         &self.store
     }
 
+    /// 获取文档的 kind（从 documents 表读取，避免硬编码）。
+    fn doc_kind(&self, doc_id: &DocId) -> CoreResult<String> {
+        let conn = self.store.conn();
+        let rec = dao::get_doc(&conn, doc_id)?
+            .ok_or_else(|| CoreError::DocNotFound(doc_id.to_string()))?;
+        Ok(rec.kind)
+    }
+
     /// 创建新文档。
     pub fn create_doc(&self, doc_id: DocId, kind: &str) -> CoreResult<()> {
         let meta = MetaDoc::new(doc_id.clone(), &self.peer_id)?;
@@ -110,31 +118,43 @@ impl DocStore {
     ) -> CoreResult<()> {
         let meta = self.open_doc(doc_id)?;
         // 1. 创建 BlockDoc 并导出初始 snapshot
-        let block = BlockDoc::new(block_id.clone(), &self.peer_id)?;
+        let block = BlockDoc::new(block_id.clone(), kind, &self.peer_id)?;
         let snap = block.export_snapshot()?;
-        // 2. 持久化 block snapshot（用 block_id 作为 snapshot_id）
-        let conn = self.store.conn();
-        dao::insert_snapshot(
-            &conn,
-            doc_id,
-            &CheckpointId::new(block_id.as_str()),
-            &snap,
-            tacit_core::SnapshotKind::Full,
-            SystemTime::now(),
-        )?;
-        // 3. 更新 MetaDoc
+        // 2. 更新 MetaDoc（内存操作，不持锁）
         meta.add_block(block_id.clone(), kind)?;
+        let meta_snap = meta.export_snapshot()?;
         let frontier = meta.frontier()?;
-        // 4. 更新 doc frontier
-        dao::upsert_doc(
-            &conn,
-            &dao::DocRecord {
-                doc_id: doc_id.clone(),
-                kind: "note".to_string(),
-                current_frontier: frontier,
-                updated_at: SystemTime::now(),
-            },
-        )?;
+        // 3. 预取 doc kind（避免在持锁期间再次获取锁导致死锁）
+        let doc_kind = self.doc_kind(doc_id)?;
+        // 4. 在单事务中原子写入：block snapshot + meta snapshot + doc frontier
+        self.store.transaction(|conn| {
+            dao::insert_snapshot(
+                conn,
+                doc_id,
+                &CheckpointId::new(block_id.as_str()),
+                &snap,
+                tacit_core::SnapshotKind::Full,
+                SystemTime::now(),
+            )?;
+            dao::insert_snapshot(
+                conn,
+                doc_id,
+                &CheckpointId::new("meta"),
+                &meta_snap,
+                tacit_core::SnapshotKind::Full,
+                SystemTime::now(),
+            )?;
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: doc_id.clone(),
+                    kind: doc_kind,
+                    current_frontier: frontier,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            Ok(())
+        })?;
         // 5. 放入 cache
         self.cache.insert(block_id, Arc::new(block));
         Ok(())
@@ -153,7 +173,16 @@ impl DocStore {
                 doc_id: doc_id.to_string(),
                 block_id: block_id.to_string(),
             })?;
-        let block = BlockDoc::from_snapshot(block_id.clone(), &self.peer_id, &blob)?;
+        drop(conn);
+        // 从 MetaDoc 查找 block kind
+        let meta = self.open_doc(doc_id)?;
+        let kind = meta
+            .list_blocks()?
+            .into_iter()
+            .find(|b| b.block_id == *block_id)
+            .map(|b| b.kind)
+            .unwrap_or(BlockKind::Text);
+        let block = BlockDoc::from_snapshot(block_id.clone(), kind, &self.peer_id, &blob)?;
         let block = Arc::new(block);
         self.cache.insert(block_id.clone(), block.clone());
         Ok(block)
@@ -170,29 +199,34 @@ impl DocStore {
         let result = block.apply_edit(edit_bytes)?;
         // 持久化 block snapshot（写放大防御：Phase 0 简化为每次都写）
         let snap = block.export_snapshot()?;
-        let conn = self.store.conn();
-        dao::insert_snapshot(
-            &conn,
-            doc_id,
-            &CheckpointId::new(block_id.as_str()),
-            &snap,
-            tacit_core::SnapshotKind::Full,
-            SystemTime::now(),
-        )?;
         // 更新 doc frontier（取 meta 与 block 的并集）
         let meta = self.open_doc(doc_id)?;
         let meta_frontier = meta.frontier()?;
         let mut frontier = meta_frontier;
         frontier.merge(&result.new_frontier);
-        dao::upsert_doc(
-            &conn,
-            &dao::DocRecord {
-                doc_id: doc_id.clone(),
-                kind: "note".to_string(),
-                current_frontier: frontier,
-                updated_at: SystemTime::now(),
-            },
-        )?;
+        // 预取 doc kind（避免在持锁期间再次获取锁导致死锁）
+        let doc_kind = self.doc_kind(doc_id)?;
+        // 在单事务中原子写入 block snapshot + doc frontier
+        self.store.transaction(|conn| {
+            dao::insert_snapshot(
+                conn,
+                doc_id,
+                &CheckpointId::new(block_id.as_str()),
+                &snap,
+                tacit_core::SnapshotKind::Full,
+                SystemTime::now(),
+            )?;
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: doc_id.clone(),
+                    kind: doc_kind,
+                    current_frontier: frontier,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            Ok(())
+        })?;
         Ok(result)
     }
 
@@ -228,26 +262,30 @@ impl DocStore {
         if result.changed {
             // 持久化 meta snapshot
             let snap = meta.export_snapshot()?;
-            let conn = self.store.conn();
-            dao::insert_snapshot(
-                &conn,
-                doc_id,
-                &CheckpointId::new("meta"),
-                &snap,
-                tacit_core::SnapshotKind::Full,
-                SystemTime::now(),
-            )?;
-            // 更新 doc frontier
             let frontier = meta.frontier()?;
-            dao::upsert_doc(
-                &conn,
-                &dao::DocRecord {
-                    doc_id: doc_id.clone(),
-                    kind: "note".to_string(),
-                    current_frontier: frontier,
-                    updated_at: SystemTime::now(),
-                },
-            )?;
+            // 预取 doc kind（避免在持锁期间再次获取锁导致死锁）
+            let doc_kind = self.doc_kind(doc_id)?;
+            // 在单事务中原子写入 meta snapshot + doc frontier
+            self.store.transaction(|conn| {
+                dao::insert_snapshot(
+                    conn,
+                    doc_id,
+                    &CheckpointId::new("meta"),
+                    &snap,
+                    tacit_core::SnapshotKind::Full,
+                    SystemTime::now(),
+                )?;
+                dao::upsert_doc(
+                    conn,
+                    &dao::DocRecord {
+                        doc_id: doc_id.clone(),
+                        kind: doc_kind,
+                        current_frontier: frontier,
+                        updated_at: SystemTime::now(),
+                    },
+                )?;
+                Ok(())
+            })?;
         }
         Ok(result)
     }
@@ -325,16 +363,64 @@ impl DocStore {
         let meta = self.open_doc(doc_id)?;
         meta.soft_delete(block_id)?;
         let frontier = meta.frontier()?;
-        let conn = self.store.conn();
-        dao::upsert_doc(
-            &conn,
-            &dao::DocRecord {
-                doc_id: doc_id.clone(),
-                kind: "note".to_string(),
-                current_frontier: frontier,
-                updated_at: SystemTime::now(),
-            },
-        )?;
+        // 持久化 MetaDoc snapshot（确保删除状态可恢复）
+        let meta_snap = meta.export_snapshot()?;
+        // 预取 doc kind（避免在持锁期间再次获取锁导致死锁）
+        let doc_kind = self.doc_kind(doc_id)?;
+        self.store.transaction(|conn| {
+            dao::insert_snapshot(
+                conn,
+                doc_id,
+                &CheckpointId::new("meta"),
+                &meta_snap,
+                tacit_core::SnapshotKind::Full,
+                SystemTime::now(),
+            )?;
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: doc_id.clone(),
+                    kind: doc_kind,
+                    current_frontier: frontier,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            Ok(())
+        })?;
         Ok(())
+    }
+
+    /// 获取文档渲染模型：返回视口内 block 的渲染数据。
+    ///
+    /// 若 `viewport` 为 None，返回所有活跃 block。
+    /// 用于 UI 层渲染文档内容。
+    pub fn get_render_model(
+        &self,
+        doc_id: &DocId,
+        viewport: Option<tacit_core::Viewport>,
+    ) -> CoreResult<tacit_core::RenderModel> {
+        let blocks = self.list_active_blocks(doc_id)?;
+        let selected: Vec<_> = match viewport {
+            Some(vp) => blocks
+                .into_iter()
+                .skip(vp.start_block)
+                .take(vp.block_count)
+                .collect(),
+            None => blocks,
+        };
+        let mut renders = Vec::with_capacity(selected.len());
+        for block_rec in selected {
+            let block = self.get_block(doc_id, &block_rec.block_id)?;
+            let render_bytes = block.export_render_bytes()?;
+            renders.push(tacit_core::BlockRender {
+                block_id: block_rec.block_id,
+                kind: block_rec.kind,
+                render_bytes: bytes::Bytes::from(render_bytes),
+            });
+        }
+        Ok(tacit_core::RenderModel {
+            doc_id: doc_id.clone(),
+            blocks: renders,
+        })
     }
 }

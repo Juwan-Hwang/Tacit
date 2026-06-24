@@ -37,8 +37,8 @@ proptest! {
         let block_id = BlockId::new("b1");
 
         // peer A 编辑
-        let a = BlockDoc::new(block_id.clone(), &pid(1)).unwrap();
-        let mut a_frontier = a.frontier().unwrap();
+        let a = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(1)).unwrap();
+        let a_frontier = a.frontier().unwrap();
         for chunk in &chunks_a {
             a.apply_edit(chunk.as_bytes()).unwrap();
         }
@@ -46,7 +46,7 @@ proptest! {
         let a_final = a.export_render_bytes().unwrap();
 
         // peer B 编辑（独立实例，从 A 的初始 frontier 开始）
-        let b = BlockDoc::new(block_id.clone(), &pid(2)).unwrap();
+        let b = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(2)).unwrap();
         // B 从空状态开始，先导入 A 的完整 snapshot
         let a_snap = a.export_snapshot().unwrap();
         b.import(&a_snap).unwrap();
@@ -58,13 +58,13 @@ proptest! {
         let b_final = b.export_render_bytes().unwrap();
 
         // 第三方 C：以两种不同顺序导入 A 的 delta 和 B 的 delta
-        let c1 = BlockDoc::new(block_id.clone(), &pid(3)).unwrap();
+        let c1 = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(3)).unwrap();
         c1.import(&a_snap).unwrap();
         c1.import(&a_delta).unwrap();
         c1.import(&b_delta).unwrap();
         let c1_render = c1.export_render_bytes().unwrap();
 
-        let c2 = BlockDoc::new(block_id.clone(), &pid(4)).unwrap();
+        let c2 = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(4)).unwrap();
         c2.import(&a_snap).unwrap();
         // 乱序：先 B 后 A 的 delta
         c2.import(&b_delta).unwrap();
@@ -87,13 +87,13 @@ proptest! {
         chunks in arb_text_sequence(),
     ) {
         let block_id = BlockId::new("b1");
-        let a = BlockDoc::new(block_id.clone(), &pid(1)).unwrap();
+        let a = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(1)).unwrap();
         for chunk in &chunks {
             a.apply_edit(chunk.as_bytes()).unwrap();
         }
         let snap = a.export_snapshot().unwrap();
 
-        let b = BlockDoc::new(block_id.clone(), &pid(2)).unwrap();
+        let b = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(2)).unwrap();
         let r1 = b.import(&snap).unwrap();
         prop_assert!(r1.changed, "首次导入应改变状态");
         let render_after_first = b.export_render_bytes().unwrap();
@@ -157,7 +157,7 @@ proptest! {
         let block_id = BlockId::new("b1");
 
         // 原始 block：先编辑 before 部分
-        let original = BlockDoc::new(block_id.clone(), &pid(1)).unwrap();
+        let original = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(1)).unwrap();
         for chunk in &chunks_before {
             original.apply_edit(chunk.as_bytes()).unwrap();
         }
@@ -174,7 +174,7 @@ proptest! {
         let tail_delta = original.export_delta_since(&checkpoint_frontier).unwrap();
 
         // 重建：从 checkpoint 恢复，再导入 tail delta
-        let restored = BlockDoc::from_snapshot(block_id.clone(), &pid(2), &checkpoint).unwrap();
+        let restored = BlockDoc::from_snapshot(block_id.clone(), BlockKind::Text, &pid(2), &checkpoint).unwrap();
         restored.import(&tail_delta).unwrap();
         let restored_render = restored.export_render_bytes().unwrap();
 
@@ -190,7 +190,7 @@ proptest! {
         rounds in prop::collection::vec(arb_text_sequence(), 1..4),
     ) {
         let block_id = BlockId::new("b1");
-        let original = BlockDoc::new(block_id.clone(), &pid(1)).unwrap();
+        let original = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(1)).unwrap();
 
         let mut last_snapshot = original.export_snapshot().unwrap();
         let mut last_frontier = original.frontier().unwrap();
@@ -210,7 +210,7 @@ proptest! {
         let original_render = original.export_render_bytes().unwrap();
 
         // 重建：从最新 snapshot 恢复
-        let restored = BlockDoc::from_snapshot(block_id.clone(), &pid(2), &last_snapshot).unwrap();
+        let restored = BlockDoc::from_snapshot(block_id.clone(), BlockKind::Text, &pid(2), &last_snapshot).unwrap();
         let restored_render = restored.export_render_bytes().unwrap();
 
         // 从最新 snapshot 恢复应直接得到最终状态

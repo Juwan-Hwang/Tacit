@@ -233,21 +233,34 @@ impl TacitEngine {
         self.engine.process_pending(Instant::now())
     }
 
+    /// 触发 Hot-Path 模式（Apple 设备短暂唤醒）。
+    pub fn trigger_hot_path(&self) {
+        self.engine.trigger_hot_path();
+    }
+
+    /// 退出 Hot-Path 模式。
+    pub fn exit_hot_path(&self) {
+        self.engine.exit_hot_path();
+    }
+
+    /// 获取 telemetry 快照（JSON 字符串）。
+    pub fn get_telemetry_snapshot(&self) -> CoreResult<String> {
+        let snap = self.engine.telemetry().snapshot();
+        serde_json::to_string(&snap)
+            .map_err(|e| CoreError::Serialize(e.to_string()))
+    }
+
     /// 将待执行动作中的事件分发到监听器。
     ///
-    /// 非事件动作（SendData/SendControl/RequestDelta）保留在队列中，
-    /// 由集成层通过 `drain_actions` 消费。
+    /// 仅取出 EmitEvent 动作进行分发，非事件动作（SendData/SendControl/RequestDelta）
+    /// 保留在引擎队列中，由集成层通过 `drain_actions` 消费。
     fn flush_actions_to_events(&self) {
-        use tacit_sync::SyncAction;
-        let actions = self.engine.drain_actions();
-        for action in &actions {
-            if let SyncAction::EmitEvent(event) = action {
+        let events = self.engine.drain_events();
+        for action in &events {
+            if let tacit_sync::SyncAction::EmitEvent(event) = action {
                 self.dispatcher.dispatch(event);
             }
         }
-        // 非事件动作重新入队（由 drain_actions 消费）
-        // 注意：当前 DefaultSyncEngine 的 drain_actions 会清空队列，
-        // 因此这里直接丢弃非事件动作。集成层应通过 drain_actions 获取全部动作。
     }
 }
 

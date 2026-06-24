@@ -58,17 +58,18 @@ pub struct DeviceIdentity {
 
 impl DeviceIdentity {
     /// 生成新身份。
-    pub fn generate() -> Self {
+    ///
+    /// 返回 Result 而非 panic，以便调用方在极端情况（如系统熵源不可用）下优雅降级。
+    pub fn generate() -> CoreResult<Self> {
         let mut rng = OsRng;
         let signing_key = SigningKey::generate(&mut rng);
         // 用 snow 生成 X25519 密钥对
-        let kp = snow::Builder::new(
-            "Noise_XX_25519_ChaChaPoly_BLAKE2s"
-                .parse()
-                .expect("解析 Noise 参数"),
-        )
-        .generate_keypair()
-        .expect("生成 X25519 密钥对");
+        let params = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+            .parse()
+            .map_err(|e| CoreError::Crypto(format!("解析 Noise 参数失败: {e}")))?;
+        let kp = snow::Builder::new(params)
+            .generate_keypair()
+            .map_err(|e| CoreError::Crypto(format!("生成 X25519 密钥对失败: {e}")))?;
         let static_kp = StaticKeypair {
             private: {
                 let mut arr = [0u8; 32];
@@ -81,10 +82,10 @@ impl DeviceIdentity {
                 arr
             },
         };
-        Self {
+        Ok(Self {
             signing_key,
             static_kp,
-        }
+        })
     }
 
     /// 从已有密钥恢复（用于从持久化恢复）。
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn generate_identity() {
-        let id = DeviceIdentity::generate();
+        let id = DeviceIdentity::generate().unwrap();
         let pid = id.peer_id();
         assert!(!pid.as_str().is_empty());
         assert_eq!(id.public_key().len(), 32);
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn peer_pubkey_roundtrip() {
-        let id = DeviceIdentity::generate();
+        let id = DeviceIdentity::generate().unwrap();
         let pubkey = id.public_key();
         let peer_pub = PeerPubkey(pubkey);
         let hex = peer_pub.to_hex();
@@ -156,7 +157,7 @@ mod tests {
 
     #[test]
     fn restore_from_keys() {
-        let id = DeviceIdentity::generate();
+        let id = DeviceIdentity::generate().unwrap();
         let sk = id.signing_key_bytes();
         let static_kp = id.static_keypair().clone();
         let restored = DeviceIdentity::from_keys(&sk, static_kp).unwrap();

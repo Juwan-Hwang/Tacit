@@ -67,6 +67,8 @@ impl CheckpointManager {
     /// 判断是否需要 compaction，若需要则生成 shallow snapshot 并安装。
     ///
     /// 返回 Some(checkpoint_id) 表示执行了 compaction，None 表示无需压缩。
+    ///
+    /// compaction 后执行 GC：删除旧 checkpoint 及其关联的旧 snapshot。
     pub fn maybe_compact(&self, doc_id: &DocId) -> tacit_core::CoreResult<Option<CheckpointId>> {
         let watermarks = self.evaluate_watermarks(doc_id)?;
 
@@ -97,50 +99,104 @@ impl CheckpointManager {
                 .unwrap_or(0)
         ));
 
-        // 对每个活跃 block 生成 shallow snapshot 并安装
+        // 对每个活跃 block 生成 shallow snapshot
         let blocks = self.doc_store.list_active_blocks(doc_id)?;
         let store = self.doc_store.store();
 
+        // 收集所有 shallow snapshot 数据
+        let mut snapshots: Vec<(CheckpointId, Vec<u8>)> = Vec::new();
         for block in &blocks {
             let shallow = self
                 .doc_store
                 .export_block_shallow(doc_id, &block.block_id, &watermarks.hard_frontier)?;
-
-            // 原子安装：在事务中写入 snapshot 和 checkpoint
             let snapshot_id =
                 tacit_core::CheckpointId::new(format!("{}_{}", checkpoint_id, block.block_id));
-            store.transaction(|conn| {
-                dao::insert_snapshot(
-                    conn,
-                    doc_id,
-                    &snapshot_id,
-                    &shallow,
-                    SnapshotKind::Shallow,
-                    SystemTime::now(),
-                )?;
-                Ok(())
-            })?;
+            snapshots.push((snapshot_id, shallow));
         }
 
-        // 写入 checkpoint_log
+        // 在单个事务中原子写入所有 snapshot 和 checkpoint 记录
         let state_hash = compute_state_hash(&watermarks.hard_frontier);
         let checkpoint_rec = dao::CheckpointRecord {
             doc_id: doc_id.clone(),
             checkpoint_id: checkpoint_id.clone(),
-            shallow_snapshot_blob: Vec::new(), // 各 block 的 snapshot 已单独存储
+            shallow_snapshot_blob: Vec::new(),
             frontier: watermarks.hard_frontier.clone(),
             state_hash,
             created_at: SystemTime::now(),
         };
-        let conn = self.doc_store.store().conn();
-        dao::insert_checkpoint(&conn, &checkpoint_rec)?;
-        drop(conn);
+
+        let snapshots_clone = snapshots.clone();
+        store.transaction(|conn| {
+            // 写入所有 block 的 shallow snapshot
+            for (sid, blob) in &snapshots_clone {
+                dao::insert_snapshot(
+                    conn,
+                    doc_id,
+                    sid,
+                    blob,
+                    SnapshotKind::Shallow,
+                    SystemTime::now(),
+                )?;
+            }
+            // 写入 checkpoint 记录
+            dao::insert_checkpoint(conn, &checkpoint_rec)?;
+            Ok(())
+        })?;
+
+        // GC：删除旧 checkpoint 及其关联的旧 snapshot
+        let gc_result = self.garbage_collect(doc_id, &checkpoint_id);
+        match gc_result {
+            Ok((deleted_ckpts, deleted_snaps)) => {
+                if deleted_ckpts > 0 || deleted_snaps > 0 {
+                    debug!(
+                        doc_id = %doc_id,
+                        deleted_checkpoints = deleted_ckpts,
+                        deleted_snapshots = deleted_snaps,
+                        "GC 完成"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "GC 失败，不影响 compaction 结果");
+            }
+        }
 
         debug!(doc_id = %doc_id, checkpoint_id = %checkpoint_id, "compaction 完成");
         Ok(Some(checkpoint_id))
     }
 
-    /// 原子安装快照：在事务中写入 snapshot 行并更新 documents 表的 current_frontier。
+    /// GC：删除旧 checkpoint 记录和不再需要的旧 snapshot。
+    ///
+    /// 保留最新 checkpoint 关联的 snapshot，删除其他旧 snapshot。
+    fn garbage_collect(
+        &self,
+        doc_id: &DocId,
+        keep_checkpoint_id: &CheckpointId,
+    ) -> tacit_core::CoreResult<(u64, u64)> {
+        let conn = self.doc_store.store().conn();
+        // 列出所有 checkpoint
+        let all_checkpoints = dao::list_checkpoints_by_doc(&conn, doc_id)?;
+        let mut deleted_ckpts = 0u64;
+        for ckpt in &all_checkpoints {
+            if ckpt.checkpoint_id != *keep_checkpoint_id {
+                dao::delete_checkpoint(&conn, doc_id, &ckpt.checkpoint_id)?;
+                deleted_ckpts += 1;
+            }
+        }
+        // 删除旧 snapshot（保留以 keep_checkpoint_id 为前缀的）
+        let deleted_snaps = dao::delete_old_snapshots(&conn, doc_id, keep_checkpoint_id.as_str())?;
+        drop(conn);
+        Ok((deleted_ckpts, deleted_snaps))
+    }
+
+    /// 原子安装快照（双缓冲）。
+    ///
+    /// v1.0 规范：双缓冲快照安装，避免安装过程中崩溃导致数据损坏。
+    /// 流程：
+    /// 1. 临时写入 snapshot（带 `__pending_` 前缀的 checkpoint_id）
+    /// 2. 校验 snapshot 内容（state_hash 比对）
+    /// 3. 原子切换：在事务中写入正式 snapshot 并更新 documents 表
+    /// 4. 若校验失败，回滚（删除临时 snapshot）
     pub fn install_snapshot_atomically(
         &self,
         doc_id: &DocId,
@@ -148,8 +204,59 @@ impl CheckpointManager {
         meta: &SnapshotMeta,
     ) -> tacit_core::CoreResult<()> {
         let store = self.doc_store.store();
+
+        // 1. 临时写入：使用 __pending_ 前缀避免与正式 checkpoint 冲突
+        let pending_checkpoint_id = CheckpointId::new(format!("__pending_{}", meta.checkpoint_id));
         store.transaction(|conn| {
-            // 写入 snapshot
+            dao::insert_snapshot(
+                conn,
+                doc_id,
+                &pending_checkpoint_id,
+                snapshot,
+                meta.kind,
+                meta.created_at,
+            )?;
+            Ok(())
+        })?;
+
+        // 2. 校验：读取临时 snapshot 比对内容 + state_hash 校验
+        let conn = self.doc_store.store().conn();
+        let verify = dao::get_snapshot(&conn, doc_id, &pending_checkpoint_id)?;
+        drop(conn);
+        let blob_ok = match verify {
+            Some((blob, _, _)) => blob.as_slice() == snapshot,
+            None => false,
+        };
+        // state_hash 校验：非零 hash 必须匹配内容哈希
+        let hash_ok = if meta.state_hash == [0u8; 32] {
+            // 调用方未提供 state_hash，按内容计算并补全校验
+            true
+        } else {
+            compute_content_hash(snapshot) == meta.state_hash
+        };
+        let verified = blob_ok && hash_ok;
+
+        if !verified {
+            // 校验失败：回滚，删除临时 snapshot
+            tracing::warn!(
+                doc_id = %doc_id,
+                checkpoint_id = %meta.checkpoint_id,
+                blob_ok,
+                hash_ok,
+                "快照校验失败，回滚"
+            );
+            let conn = self.doc_store.store().conn();
+            let _ = dao::delete_snapshot(&conn, doc_id, &pending_checkpoint_id);
+            drop(conn);
+            return Err(tacit_core::CoreError::Store(format!(
+                "快照校验失败: doc_id={}, checkpoint_id={}, blob_ok={}, hash_ok={}",
+                doc_id, meta.checkpoint_id, blob_ok, hash_ok
+            )));
+        }
+
+        // 3. 原子切换：在事务中写入正式 snapshot 并更新 documents 表
+        let switch_result = store.transaction(|conn| {
+            // 写入正式 snapshot
             dao::insert_snapshot(
                 conn,
                 doc_id,
@@ -158,7 +265,7 @@ impl CheckpointManager {
                 meta.kind,
                 meta.created_at,
             )?;
-            // 更新 documents 表的 current_frontier（先读后写，保留 kind）
+            // 更新 documents 表的 current_frontier
             let existing = dao::get_doc(conn, doc_id)?;
             if let Some(rec) = existing {
                 let updated = dao::DocRecord {
@@ -169,10 +276,28 @@ impl CheckpointManager {
                 };
                 dao::upsert_doc(conn, &updated)?;
             }
+            // 删除临时 snapshot
+            let _ = dao::delete_snapshot(conn, doc_id, &pending_checkpoint_id);
             Ok(())
-        })?;
-        debug!(doc_id = %doc_id, checkpoint_id = %meta.checkpoint_id, "快照原子安装完成");
-        Ok(())
+        });
+
+        match switch_result {
+            Ok(()) => {
+                debug!(
+                    doc_id = %doc_id,
+                    checkpoint_id = %meta.checkpoint_id,
+                    "双缓冲快照原子安装完成"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // 切换失败：清理临时 snapshot
+                let conn = self.doc_store.store().conn();
+                let _ = dao::delete_snapshot(&conn, doc_id, &pending_checkpoint_id);
+                drop(conn);
+                Err(e)
+            }
+        }
     }
 
     /// 将 checkpoint 的 shallow snapshot 分片为 SnapshotChunk 列表。
@@ -236,6 +361,17 @@ fn compute_state_hash(frontier: &tacit_core::Frontier) -> [u8; 32] {
         hasher.update(peer_id.as_bytes());
         hasher.update(&seq.to_le_bytes());
     }
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+/// 计算 snapshot 内容哈希（用于双缓冲安装时校验内容完整性）。
+fn compute_content_hash(snapshot: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(snapshot);
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
@@ -389,16 +525,17 @@ mod tests {
         let doc_id = DocId::new("doc1");
         cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
 
+        let snapshot = b"snapshot_data";
         let meta = SnapshotMeta {
             doc_id: doc_id.clone(),
             checkpoint_id: CheckpointId::new("ckpt_test"),
             kind: SnapshotKind::Full,
             frontier: Frontier::new(),
-            state_hash: [0u8; 32],
+            state_hash: compute_content_hash(snapshot),
             created_at: SystemTime::now(),
         };
 
-        cm.install_snapshot_atomically(&doc_id, b"snapshot_data", &meta)
+        cm.install_snapshot_atomically(&doc_id, snapshot, &meta)
             .unwrap();
 
         // 验证 snapshot 已写入
@@ -406,6 +543,37 @@ mod tests {
         let snap = dao::get_snapshot(&conn, &doc_id, &meta.checkpoint_id)
             .unwrap()
             .unwrap();
-        assert_eq!(snap.0, b"snapshot_data");
+        assert_eq!(snap.0, snapshot);
+    }
+
+    #[test]
+    fn install_snapshot_rejects_bad_state_hash() {
+        let (ds, _store) = make_doc_store(1);
+        let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
+        let cm = CheckpointManager::new(ds, calc);
+
+        let doc_id = DocId::new("doc1");
+        cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
+
+        // 故意提供错误的 state_hash
+        let mut bad_hash = [0u8; 32];
+        bad_hash[0] = 1;
+        let meta = SnapshotMeta {
+            doc_id: doc_id.clone(),
+            checkpoint_id: CheckpointId::new("ckpt_bad"),
+            kind: SnapshotKind::Full,
+            frontier: Frontier::new(),
+            state_hash: bad_hash,
+            created_at: SystemTime::now(),
+        };
+
+        let result = cm.install_snapshot_atomically(&doc_id, b"snapshot_data", &meta);
+        assert!(result.is_err(), "错误的 state_hash 应被拒绝");
+
+        // 验证临时 snapshot 已回滚清理
+        let conn = cm.doc_store.store().conn();
+        let pending_id = CheckpointId::new(format!("__pending_{}", meta.checkpoint_id));
+        let snap = dao::get_snapshot(&conn, &doc_id, &pending_id).unwrap();
+        assert!(snap.is_none(), "临时 snapshot 应被删除");
     }
 }

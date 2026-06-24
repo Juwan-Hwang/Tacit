@@ -22,12 +22,15 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::Mutex;
 use tacit_core::{
     AckSummary, BlockId, ChangeEnvelope, CoreResult, DocId, Frontier, FrontierOps,
-    PeerId, PeerSummary, Priority, SyncReason,
+    PeerId, PeerSummary, Priority, SyncReason, TelemetryCollector,
 };
 use tacit_transport::{ControlMsg, PathPreference};
+use tracing::debug;
 
 use crate::doc_store::DocStore;
+use crate::hot_path::HotPathController;
 use crate::pending::{PendingBlockFetch, PendingFetchQueue};
+use crate::priority_queue::PriorityQueue;
 use crate::watermarks::WatermarkCalculator;
 
 /// 同步动作：SyncEngine 产生的待执行动作。
@@ -91,7 +94,9 @@ pub struct DefaultSyncEngine {
     pending: Arc<PendingFetchQueue>,
     watermarks: WatermarkCalculator,
     peer_states: Mutex<std::collections::HashMap<PeerId, PeerSyncState>>,
-    actions: Mutex<Vec<SyncAction>>,
+    actions: PriorityQueue,
+    telemetry: Arc<TelemetryCollector>,
+    hot_path: HotPathController,
     config: EngineConfig,
 }
 
@@ -128,24 +133,80 @@ impl DefaultSyncEngine {
             pending,
             watermarks,
             peer_states: Mutex::new(std::collections::HashMap::new()),
-            actions: Mutex::new(Vec::new()),
+            actions: PriorityQueue::new(),
+            telemetry: Arc::new(TelemetryCollector::default()),
+            hot_path: HotPathController::default(),
             config,
         }
     }
 
-    /// 取出所有待执行的 SyncAction。
+    /// 取出所有待执行的 SyncAction（按优先级排序）。
+    ///
+    /// Hot-Path 模式下仅返回控制类动作，数据类动作延后。
     pub fn drain_actions(&self) -> Vec<SyncAction> {
-        std::mem::take(&mut *self.actions.lock())
+        let all = self.actions.drain();
+        let (processable, deferred) = self.hot_path.partition(all);
+        // 延后的动作重新入队，等 Normal 模式时再处理
+        for a in deferred {
+            self.actions.push(a);
+        }
+        // 更新 telemetry backlog
+        self.telemetry
+            .set_backlog(self.actions.len() as u32, self.pending.len() as u32);
+        processable
+    }
+
+    /// 仅取出 EmitEvent 类型的动作，非事件动作保留在队列中。
+    ///
+    /// 用于 FFI 层在触发同步后立即分发事件给 UI 监听器，
+    /// 同时保留 SendData/SendControl/RequestDelta 等动作供集成层通过 drain_actions 消费。
+    pub fn drain_events(&self) -> Vec<SyncAction> {
+        let all = self.actions.drain();
+        let mut events = Vec::new();
+        for action in all {
+            if matches!(action, SyncAction::EmitEvent(_)) {
+                events.push(action);
+            } else {
+                // 非事件动作重新入队
+                self.actions.push(action);
+            }
+        }
+        // 更新 telemetry backlog
+        self.telemetry
+            .set_backlog(self.actions.len() as u32, self.pending.len() as u32);
+        events
     }
 
     /// 待执行动作数量。
     pub fn pending_actions(&self) -> usize {
-        self.actions.lock().len()
+        self.actions.len()
     }
 
     /// 依赖等待队列引用。
     pub fn pending_queue(&self) -> &Arc<PendingFetchQueue> {
         &self.pending
+    }
+
+    /// Telemetry 采集器引用。
+    pub fn telemetry(&self) -> &Arc<TelemetryCollector> {
+        &self.telemetry
+    }
+
+    /// Hot-Path 控制器引用。
+    pub fn hot_path(&self) -> &HotPathController {
+        &self.hot_path
+    }
+
+    /// 触发 Hot-Path 模式（设备短暂唤醒）。
+    pub fn trigger_hot_path(&self) {
+        debug!("触发 Hot-Path 模式");
+        self.hot_path.trigger_hot();
+    }
+
+    /// 退出 Hot-Path 模式，恢复正常处理。
+    pub fn exit_hot_path(&self) {
+        debug!("退出 Hot-Path 模式");
+        self.hot_path.enter_normal();
     }
 
     /// 处理依赖等待重试。
@@ -337,8 +398,9 @@ impl DefaultSyncEngine {
         Ok(())
     }
 
-    fn push_action(&self, action: SyncAction) {
-        self.actions.lock().push(action);
+    /// 推送动作到优先级队列。
+    pub(crate) fn push_action(&self, action: SyncAction) {
+        self.actions.push(action);
     }
 }
 
@@ -362,18 +424,24 @@ impl SyncEngine for DefaultSyncEngine {
                 },
             );
         }
-        // 发送 ack 摘要给 peer
-        self.push_action(SyncAction::SendControl {
-            peer_id: peer_id.clone(),
-            msg: ControlMsg::AckSummary(AckSummary {
-                peer_id: self.config.peer_id.clone(),
-                doc_id: DocId::new(""), // 由调用方填充
-                ack_checkpoint: None,
-                ack_frontier: summary.frontier,
-                updated_at: SystemTime::now(),
-            }),
-            priority: Priority::Medium,
-        });
+        // 对所有已知 doc 发送 ack 摘要给 peer
+        let docs = {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::list_docs(&conn)?
+        };
+        for doc in docs {
+            self.push_action(SyncAction::SendControl {
+                peer_id: peer_id.clone(),
+                msg: ControlMsg::AckSummary(AckSummary {
+                    peer_id: self.config.peer_id.clone(),
+                    doc_id: doc.doc_id.clone(),
+                    ack_checkpoint: None,
+                    ack_frontier: summary.frontier.clone(),
+                    updated_at: SystemTime::now(),
+                }),
+                priority: Priority::Medium,
+            });
+        }
         Ok(())
     }
 
@@ -382,9 +450,11 @@ impl SyncEngine for DefaultSyncEngine {
             peer_id: peer_id.clone(),
             reason,
         }));
-        // 对所有已知 doc 执行 push/pull
-        let conn = self.doc_store.store().conn();
-        let docs = tacit_store::dao::list_docs(&conn)?;
+        // 先收集 doc 列表再释放 conn 锁，避免 run_push_pull 内部再次获取 conn 导致死锁
+        let docs = {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::list_docs(&conn)?
+        };
         for doc in docs {
             self.run_push_pull(&peer_id, &doc.doc_id)?;
         }
@@ -395,20 +465,9 @@ impl SyncEngine for DefaultSyncEngine {
     }
 
     fn fast_resume(&self) -> CoreResult<()> {
-        // 从 store 恢复所有 doc 状态
-        let conn = self.doc_store.store().conn();
-        let docs = tacit_store::dao::list_docs(&conn)?;
-        for doc in docs {
-            // 打开 doc 触发恢复
-            self.doc_store.open_doc(&doc.doc_id)?;
-            // 列出 block，恢复 cache
-            if let Ok(blocks) = self.doc_store.list_active_blocks(&doc.doc_id) {
-                for block in blocks {
-                    // 触发 block 加载（从 store 恢复到 cache）
-                    let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
-                }
-            }
-        }
+        // 首屏恢复策略：Meta-Document 骨架 → 可见 block → 活跃文档剩余 block → 冷文档追赶
+        let coord = crate::recovery::RecoveryCoordinator::new(self.doc_store.clone());
+        coord.first_screen_recovery(self, None)?;
         Ok(())
     }
 }

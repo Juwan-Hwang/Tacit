@@ -46,8 +46,8 @@ mod tests {
     use crate::noise::NoiseHandshake;
 
     fn establish_session() -> (Session, Session) {
-        let id1 = DeviceIdentity::generate();
-        let id2 = DeviceIdentity::generate();
+        let id1 = DeviceIdentity::generate().unwrap();
+        let id2 = DeviceIdentity::generate().unwrap();
 
         let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
         let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();

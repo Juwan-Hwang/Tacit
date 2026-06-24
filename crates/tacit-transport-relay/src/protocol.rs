@@ -40,6 +40,14 @@ pub enum RelayMessage {
         from_peer_id: String,
         data: Vec<u8>,
     },
+    /// peer 上线通知（relay 推送给已注册客户端）。
+    PeerOnline { peer_id: String },
+    /// peer 下线通知（relay 推送给已注册客户端）。
+    PeerOffline { peer_id: String },
+    /// 心跳（客户端定时发送，relay 回复 Pong）。
+    Ping,
+    /// 心跳响应。
+    Pong,
 }
 
 impl RelayMessage {

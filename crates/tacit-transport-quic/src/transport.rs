@@ -9,13 +9,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use quinn::{Connection, Endpoint};
 use tacit_core::{CoreError, CoreResult, DataFrame, NetworkType, PeerId, Priority};
-use tacit_transport::{ControlMsg, PathPreference, SyncTransport};
+use tacit_transport::{
+    encode_control, encode_data, ControlMsg, PathPreference, SyncTransport, TransportEvent,
+};
 use tracing::{debug, warn};
 
 use crate::config::{generate_self_signed_cert, make_client_config, make_server_config};
+
+/// 接收数据回调类型。
+type DataHandler = Arc<RwLock<Option<Box<dyn Fn(TransportEvent) + Send + Sync>>>>;
 
 /// QuicTransport 配置。
 #[derive(Debug, Clone)]
@@ -52,6 +57,8 @@ pub struct QuicTransport {
     cert: rustls::pki_types::CertificateDer<'static>,
     /// 可更新的 client config（trust_cert 时更新）
     client_config: Arc<parking_lot::RwLock<quinn::ClientConfig>>,
+    /// 接收数据回调（由集成层注入）。
+    data_handler: DataHandler,
     config: QuicTransportConfig,
 }
 
@@ -87,8 +94,16 @@ impl QuicTransport {
             peer_addrs: Arc::new(Mutex::new(HashMap::new())),
             cert,
             client_config: Arc::new(parking_lot::RwLock::new(client_config)),
+            data_handler: Arc::new(RwLock::new(None)),
             config,
         })
+    }
+
+    /// 设置接收数据回调。
+    ///
+    /// 收到的 DataFrame / ControlMsg 会通过此回调上报给集成层（如 SyncEngine）。
+    pub fn set_data_handler(&self, handler: impl Fn(TransportEvent) + Send + Sync + 'static) {
+        *self.data_handler.write() = Some(Box::new(handler));
     }
 
     /// 获取本端证书（用于让对端信任）。
@@ -177,14 +192,16 @@ impl QuicTransport {
 
     /// 启动接收循环（后台 task）。
     ///
-    /// 接收到的数据通过回调处理。
-    /// Phase 0/1：简化为日志，实际由集成层注入回调。
+    /// 接收到的数据通过 [`set_data_handler`](Self::set_data_handler) 注入的回调处理。
+    /// 若未设置回调，数据将被丢弃并记录警告。
     pub fn start_accept_loop(&self) {
         let endpoint = self.endpoint.clone();
+        let data_handler = self.data_handler.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 debug!(remote = %incoming.remote_address(), "收到入站连接");
-                // 每个连接独立 task，完成握手后保持存活
+                let handler = data_handler.clone();
+                // 每个连接独立 task
                 tokio::spawn(async move {
                     let conn = match incoming.await {
                         Ok(c) => c,
@@ -194,23 +211,61 @@ impl QuicTransport {
                         }
                     };
                     debug!(remote = %conn.remote_address(), "握手完成");
-                    // Phase 0/1：仅保持连接存活，不处理数据
-                    // 实际由集成层注入回调处理 uni/bi stream
+                    let remote_peer = conn.remote_address().to_string();
                     loop {
                         match conn.accept_uni().await {
                             Ok(mut stream) => {
-                                // 读取并丢弃数据（Phase 0 简化）
-                                let mut buf = vec![0u8; 4096];
-                                loop {
-                                    match stream.read(&mut buf).await {
-                                        Ok(Some(0)) | Ok(None) => break,
-                                        Ok(Some(_)) => {}
-                                        Err(e) => {
-                                            debug!(error = %e, "读取失败");
-                                            break;
+                                let handler = handler.clone();
+                                let peer_str = remote_peer.clone();
+                                tokio::spawn(async move {
+                                    // 读取完整帧
+                                    let mut buf = Vec::new();
+                                    let mut chunk = vec![0u8; 4096];
+                                    loop {
+                                        match stream.read(&mut chunk).await {
+                                            Ok(Some(0)) | Ok(None) => break,
+                                            Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                                            Err(e) => {
+                                                debug!(error = %e, "读取失败");
+                                                break;
+                                            }
                                         }
                                     }
-                                }
+                                    if buf.is_empty() {
+                                        return;
+                                    }
+                                    // 尝试解码为 DataFrame 或 ControlMsg
+                                    let event = if let Ok(wire) =
+                                        tacit_transport::decode_data(&buf)
+                                    {
+                                        Some(TransportEvent::Data {
+                                            peer_id: PeerId::new(&peer_str),
+                                            frame: wire.to_data_frame(),
+                                        })
+                                    } else if let Ok((msg, _sid)) =
+                                        tacit_transport::decode_control(&buf)
+                                    {
+                                        Some(TransportEvent::Control {
+                                            peer_id: PeerId::new(&peer_str),
+                                            msg,
+                                        })
+                                    } else {
+                                        warn!(
+                                            len = buf.len(),
+                                            "无法解码收到的数据帧，丢弃"
+                                        );
+                                        None
+                                    };
+                                    // 调用回调
+                                    if let Some(event) = event {
+                                        let handler = handler.read();
+                                        if let Some(h) = handler.as_ref() {
+                                            h(event);
+                                        } else {
+                                            debug!("未设置 data_handler，丢弃收到的数据");
+                                        }
+                                    }
+                                });
                             }
                             Err(e) => {
                                 debug!(error = %e, "连接关闭");
@@ -223,13 +278,22 @@ impl QuicTransport {
         });
     }
 
-    /// 发送原始字节到 peer。
-    async fn send_bytes(&self, peer_id: &PeerId, bytes: &[u8]) -> CoreResult<()> {
+    /// 发送原始字节到 peer，并设置 stream 优先级。
+    async fn send_bytes(&self, peer_id: &PeerId, bytes: &[u8], priority: Priority) -> CoreResult<()> {
         let conn = self.get_or_connect(peer_id).await?;
         let mut stream = conn
             .open_uni()
             .await
             .map_err(|e| CoreError::Transport(format!("打开 stream 失败: {e}")))?;
+        // 映射 Priority 到 QUIC stream 优先级（0=最高, 255=最低）
+        let quic_priority = match priority {
+            Priority::High => 0,
+            Priority::Medium => 128,
+            Priority::Low => 255,
+        };
+        stream
+            .set_priority(quic_priority)
+            .map_err(|e| CoreError::Transport(format!("设置 stream 优先级失败: {e}")))?;
         stream
             .write_all(bytes)
             .await
@@ -239,6 +303,28 @@ impl QuicTransport {
             .map_err(|e| CoreError::Transport(format!("finish 失败: {e}")))?;
         Ok(())
     }
+
+    /// 健康检查：验证所有已连接 peer 的连接存活性。
+    ///
+    /// 返回不可用 peer 列表（连接已关闭或不可达）。
+    pub async fn health_check(&self) -> Vec<PeerId> {
+        let conns = self.connections.lock().clone();
+        let mut dead = Vec::new();
+        for (peer_id, conn) in conns {
+            // quinn Connection 提供 close_reason 判断存活性
+            if conn.close_reason().is_some() {
+                dead.push(peer_id);
+            }
+        }
+        // 清理失效连接
+        if !dead.is_empty() {
+            let mut conns = self.connections.lock();
+            for p in &dead {
+                conns.remove(p);
+            }
+        }
+        dead
+    }
 }
 
 #[async_trait]
@@ -247,24 +333,33 @@ impl SyncTransport for QuicTransport {
         &self,
         peer_id: &PeerId,
         frame: DataFrame,
-        _priority: Priority,
+        priority: Priority,
         _preferred_path: PathPreference,
     ) -> CoreResult<()> {
-        // 序列化 DataFrame 为字节
-        let bytes = serde_json::to_vec(&frame)
-            .map_err(|e| CoreError::Serialize(e.to_string()))?;
-        self.send_bytes(peer_id, &bytes).await
+        // 使用 frame_codec 二进制编码（v1.0 规范第 13.3 节）
+        let bytes = encode_data(
+            &frame.doc_id,
+            &frame.actor_id,
+            frame.seq,
+            frame.kind,
+            &frame.payload,
+            tacit_core::BatchFlag::Single,
+            [0u8; 8],
+        );
+        self.send_bytes(peer_id, &bytes, priority).await
     }
 
     async fn send_control(
         &self,
         peer_id: &PeerId,
         msg: ControlMsg,
-        _priority: Priority,
+        priority: Priority,
     ) -> CoreResult<()> {
-        let bytes = serde_json::to_vec(&msg)
-            .map_err(|e| CoreError::Serialize(e.to_string()))?;
-        self.send_bytes(peer_id, &bytes).await
+        // 使用 frame_codec 二进制编码（v1.0 规范第 13.2 节）
+        let session_id: u64 = 0; // session_id 由握手层管理，此处用 0 占位
+        let bytes = encode_control(&msg, session_id)
+            .map_err(|e| CoreError::Serialize(format!("控制帧编码失败: {e}")))?;
+        self.send_bytes(peer_id, &bytes, priority).await
     }
 
     async fn reconnect_peer(&self, peer_id: &PeerId) -> CoreResult<()> {

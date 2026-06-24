@@ -10,11 +10,14 @@ description = "Transport trait、通道抽象、事件定义、preferred_path hi
 
 [dependencies]
 tacit-core.workspace = true
+tacit-store.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
 async-trait = "0.1"
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]

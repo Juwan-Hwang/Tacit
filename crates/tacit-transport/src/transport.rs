@@ -58,16 +58,14 @@ pub trait SyncTransport: Send + Sync {
 
 /// 高层传输管理接口（蓝图定义）。
 ///
-/// 负责连接池、presence 广播、网络变化通知。
+/// 继承 [`SyncTransport`]，统一管理 BLE、QUIC、relay 通道。
+/// 负责连接池、presence 广播、网络变化通知、发送路径选择。
 /// 由 tacit-ffi 或集成层持有，协调多个传输实现。
+///
+/// 注意：`notify_network_changed` 和 `reconnect_peer` 继承自 `SyncTransport`，
+/// 不在此 trait 重复声明，避免方法歧义。
 #[async_trait]
-pub trait TransportManager: Send + Sync {
+pub trait TransportManager: SyncTransport {
     /// 广播 presence。
     async fn broadcast_presence(&self, hint: PresenceHint) -> CoreResult<()>;
-
-    /// 通知网络变化。
-    async fn notify_network_changed(&self, online: bool, net_type: NetworkType) -> CoreResult<()>;
-
-    /// 重连 peer。
-    async fn reconnect_peer(&self, peer_id: &PeerId) -> CoreResult<()>;
 }
