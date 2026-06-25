@@ -16,6 +16,9 @@ use crate::control::{
 };
 use crate::ControlMsg as CMsg;
 
+/// 最大允许的帧大小（16 MiB），防止恶意对端发送超大帧导致内存耗尽。
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 /// 将 ControlMsg 编码为 ControlFrame 二进制格式。
 pub fn encode_control(msg: &CMsg, session_id: u64) -> Result<Vec<u8>, FrameError> {
     let (ctrl_type, payload) = control_msg_to_tlv(msg)?;
@@ -24,7 +27,12 @@ pub fn encode_control(msg: &CMsg, session_id: u64) -> Result<Vec<u8>, FrameError
 }
 
 /// 从二进制数据解码 ControlMsg。
+///
+/// 超过 [`MAX_FRAME_SIZE`] 的帧返回 [`FrameError::FrameTooLarge`]。
 pub fn decode_control(data: &[u8]) -> Result<(CMsg, u64), FrameError> {
+    if data.len() > MAX_FRAME_SIZE {
+        return Err(FrameError::FrameTooLarge(data.len()));
+    }
     let frame = ControlFrame::decode(data)?;
     let msg = tlv_to_control_msg(frame.ctrl_type, &frame.payload)?;
     Ok((msg, frame.session_id))
@@ -53,7 +61,12 @@ pub fn encode_data(
 }
 
 /// 从二进制数据解码为 DataFrameWire。
+///
+/// 超过 [`MAX_FRAME_SIZE`] 的帧返回 [`FrameError::FrameTooLarge`]。
 pub fn decode_data(data: &[u8]) -> Result<DataFrameWire, FrameError> {
+    if data.len() > MAX_FRAME_SIZE {
+        return Err(FrameError::FrameTooLarge(data.len()));
+    }
     DataFrameWire::decode(data)
 }
 

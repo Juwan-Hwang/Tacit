@@ -192,6 +192,9 @@ fn taci_core_frame_error_to_core(e: &FrameError) -> tacit_core::CoreError {
         FrameError::VersionMismatch(v) => {
             CoreError::Deserialize(format!("版本不兼容: {v}"))
         }
+        FrameError::FrameTooLarge(size) => {
+            CoreError::Deserialize(format!("帧过大: {size} 字节，超过最大限制"))
+        }
     }
 }
 

@@ -10,6 +10,7 @@
 //! - [`BluerBackend`]（feature `linux-bluez`）：Linux bluez 真实 BLE 后端。
 
 pub mod backend;
+pub mod platform;
 pub mod presence;
 pub mod transport;
 
@@ -17,6 +18,10 @@ pub mod transport;
 pub mod bluer_backend;
 
 pub use backend::{DiscoveryEvent, MockPresenceBackend, PresenceBackend};
+pub use platform::{
+    clear_platform_backend, get_platform_backend, has_platform_backend, require_platform_backend,
+    set_platform_backend, PlatformBackendFactory,
+};
 pub use presence::BlePresence;
 pub use transport::BleTransport;
 

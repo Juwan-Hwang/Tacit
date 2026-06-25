@@ -359,7 +359,11 @@ impl CheckpointManager {
     }
 }
 
-/// 计算 frontier 的简单 state hash（用于校验，非密码学安全）。
+/// 计算 frontier 的一致性校验 hash。
+///
+/// 注意：此 hash 仅对 frontier 的 (peer_id, seq) 条目做 SHA256，
+/// 用于 checkpoint 记录的 frontier 一致性校验，**不是**文档内容的密码学完整性 hash。
+/// 文档内容的完整性由 Loro CRDT 内部版本机制保证。
 fn compute_state_hash(frontier: &tacit_core::Frontier) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

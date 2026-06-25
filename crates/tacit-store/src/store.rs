@@ -370,6 +370,9 @@ CREATE TABLE IF NOT EXISTS transport_stats (
 CREATE INDEX IF NOT EXISTS idx_snapshots_doc ON document_snapshots(doc_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_checkpoint_doc ON checkpoint_log(doc_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_acks_doc ON acks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_transport_stats_peer ON transport_stats(peer_id, channel);
+CREATE INDEX IF NOT EXISTS idx_sync_log_recipient ON sync_log(recipient_peer_id, delivered_at);
+CREATE INDEX IF NOT EXISTS idx_sync_log_ack ON sync_log(acknowledged_at);
 "#;
 
 #[cfg(test)]

@@ -455,6 +455,8 @@ pub enum FrameError {
     UnknownDataFrameKind(u8),
     #[error("版本不兼容: {0}")]
     VersionMismatch(u8),
+    #[error("帧过大: {0} 字节，超过最大限制")]
+    FrameTooLarge(usize),
 }
 
 // ===== 辅助函数 =====

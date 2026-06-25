@@ -1,0 +1,19 @@
+# Force LF line endings for all text files.
+# This project was authored on Linux and must stay LF-normalized
+# regardless of the host OS (Windows/macOS/Linux).
+
+* text=auto eol=lf
+
+# Explicitly enforce LF for source files
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+
+# Binary files
+*.png   binary
+*.jpg   binary
+*.ico   binary

@@ -338,7 +338,7 @@ impl QuicTransport {
                                     }
                                     let frame_len = u32::from_be_bytes(len_buf) as usize;
                                     // 限制最大帧大小，防止恶意大帧耗尽内存
-                                    if frame_len > 16 * 1024 * 1024 {
+                                    if frame_len > tacit_transport::MAX_FRAME_SIZE {
                                         warn!(frame_len, "帧过大，丢弃");
                                         return;
                                     }

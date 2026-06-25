@@ -3,25 +3,48 @@
 //! 封装 DAO 层的 peer CRUD，提供 mark_seen / relay_candidates / revoke_peer
 //! 等业务语义接口。所有操作直接走 Store 持久化，不维护内存缓存。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use parking_lot::Mutex;
 use tacit_core::{Endpoint, PeerId, PeerRecord};
 use tacit_store::{Store, dao};
 
 /// peer 管理注册表。
+///
+/// `best_anchor()` 结果缓存在内存中，仅在 peer 状态变更时失效，
+/// 避免每次调用都执行全量排序。
 pub struct PeerRegistry {
     store: Store,
+    /// 缓存的 anchor 选举结果。
+    anchor_cache: Mutex<Option<PeerId>>,
+    /// 缓存版本号：每次 upsert/mark_seen/revoke 时递增，用于检测缓存是否过期。
+    cache_generation: AtomicU64,
+    /// 生成 anchor_cache 时的版本号。若与 cache_generation 不一致则缓存过期。
+    cached_at_generation: AtomicU64,
 }
 
 impl PeerRegistry {
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            anchor_cache: Mutex::new(None),
+            cache_generation: AtomicU64::new(0),
+            cached_at_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// 使 anchor 缓存失效（在 peer 状态变更时调用）。
+    fn invalidate_anchor_cache(&self) {
+        self.cache_generation.fetch_add(1, Ordering::Release);
     }
 
     /// 新增或覆盖 peer 记录。
     pub fn upsert_peer(&self, peer: &PeerRecord) -> tacit_core::CoreResult<()> {
         let conn = self.store.conn();
-        dao::upsert_peer(&conn, peer)
+        dao::upsert_peer(&conn, peer)?;
+        self.invalidate_anchor_cache();
+        Ok(())
     }
 
     /// 查询单个 peer。
@@ -43,7 +66,9 @@ impl PeerRegistry {
         endpoint: Option<&Endpoint>,
     ) -> tacit_core::CoreResult<()> {
         let conn = self.store.conn();
-        dao::mark_peer_seen(&conn, peer_id, endpoint, SystemTime::now())
+        dao::mark_peer_seen(&conn, peer_id, endpoint, SystemTime::now())?;
+        self.invalidate_anchor_cache();
+        Ok(())
     }
 
     /// 更新 peer 的 success_ema（指数移动平均成功率）。
@@ -62,14 +87,29 @@ impl PeerRegistry {
             let new_value = p.success_ema * (1.0 - ALPHA) + if success { 1.0 } else { 0.0 } * ALPHA;
             p.success_ema = new_value.clamp(0.0, 1.0);
             dao::upsert_peer(&conn, &p)?;
+            self.invalidate_anchor_cache();
         }
         Ok(())
     }
 
     /// 选举最佳 Anchor。
+    ///
+    /// 结果缓存在内存中，仅在 peer 状态变更时重新计算。
     pub fn best_anchor(&self) -> tacit_core::CoreResult<Option<PeerId>> {
+        // 检查缓存是否有效
+        let current_gen = self.cache_generation.load(Ordering::Acquire);
+        let cached_gen = self.cached_at_generation.load(Ordering::Acquire);
+        if current_gen == cached_gen {
+            return Ok(self.anchor_cache.lock().clone());
+        }
+        // 缓存过期，重新计算
         let conn = self.store.conn();
-        dao::best_anchor(&conn)
+        let result = dao::best_anchor(&conn)?;
+        // 更新缓存
+        *self.anchor_cache.lock() = result.clone();
+        self.cached_at_generation
+            .store(current_gen, Ordering::Release);
+        Ok(result)
     }
 
     /// 列出所有可作为 relay 的 trusted peer。
@@ -81,7 +121,9 @@ impl PeerRegistry {
     /// 吊销 peer，将 trust_state 降级为 Revoked。
     pub fn revoke_peer(&self, peer_id: &PeerId) -> tacit_core::CoreResult<()> {
         let conn = self.store.conn();
-        dao::revoke_peer(&conn, peer_id)
+        dao::revoke_peer(&conn, peer_id)?;
+        self.invalidate_anchor_cache();
+        Ok(())
     }
 }
 

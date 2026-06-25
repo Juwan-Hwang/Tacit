@@ -86,7 +86,12 @@ impl WatermarkCalculator {
     }
 
     /// 计算所有 ack 的交集 frontier（逐 peer 取较小 seq）。
-    /// 只有所有 ack 都包含的 peer 才会出现在结果中。
+    ///
+    /// 语义：只有所有 active ack 都覆盖的 peer 才会出现在结果中。
+    /// 若某个 active ack 的 frontier 不包含 peer X，则 peer X 不会出现在
+    /// hard frontier 中——因为该 peer 的进度尚未被所有 active 设备确认，
+    /// 不能安全压缩。这确保 hard frontier 只包含"无争议压缩"的安全 seq，
+    /// 低频设备回归时通过 checkpoint 追赶或手术式重入兜底。
     fn intersection_frontier(acks: &[&AckSummary]) -> Frontier {
         if acks.is_empty() {
             return Frontier::new();

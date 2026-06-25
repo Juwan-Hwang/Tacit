@@ -235,6 +235,8 @@ impl RecoveryCoordinator {
 
         // 2. 可见 block（视口内）
         stages.push(FirstScreenStage::VisibleBlocks);
+        // 记录已加载的 (doc_id, block_id) 集合，避免后续阶段重复加载
+        let mut loaded_blocks: std::collections::HashSet<(DocId, BlockId)> = std::collections::HashSet::new();
         if let Some(vp) = viewport {
             for doc in &docs {
                 let blocks = self.doc_store.list_active_blocks(&doc.doc_id)?;
@@ -244,8 +246,8 @@ impl RecoveryCoordinator {
                     .take(vp.block_count)
                     .collect();
                 for block in visible {
-                    // 触发 block 加载
                     let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
+                    loaded_blocks.insert((doc.doc_id.clone(), block.block_id.clone()));
                 }
                 engine.push_action(SyncAction::EmitEvent(
                     tacit_core::CoreEvent::SyncProgress {
@@ -261,15 +263,20 @@ impl RecoveryCoordinator {
                 let blocks = self.doc_store.list_active_blocks(&doc.doc_id)?;
                 for block in blocks {
                     let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
+                    loaded_blocks.insert((doc.doc_id.clone(), block.block_id.clone()));
                 }
             }
         }
 
-        // 3. 活跃文档剩余 block（已在视口加载之外）
+        // 3. 活跃文档剩余 block（跳过已加载的视口内 block）
         stages.push(FirstScreenStage::ActiveDocRemaining);
         for doc in &docs {
             let blocks = self.doc_store.list_active_blocks(&doc.doc_id)?;
             for block in blocks {
+                // 跳过第 2 阶段已加载的 block，避免重复 I/O
+                if loaded_blocks.contains(&(doc.doc_id.clone(), block.block_id.clone())) {
+                    continue;
+                }
                 let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
             }
             engine.push_action(SyncAction::EmitEvent(

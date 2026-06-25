@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 hex.workspace = true
+once_cell = "1"
 # 可选：Linux bluez BLE 后端
 bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
 tokio-util = { version = "0.7", optional = true }

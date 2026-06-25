@@ -8,7 +8,7 @@
 //! - 指数回退到上限，例如 2s。
 //! - 到达上限后不报致命错误，降级为后台静默拉取。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -62,8 +62,15 @@ struct PendingKey {
 }
 
 /// 依赖等待队列。
+///
+/// 使用双索引结构实现 O(log n) 的 drain_ready：
+/// - `entries`: HashMap<PendingKey, PendingBlockFetch> 存储完整条目
+/// - `time_index`: BTreeMap<Instant, Vec<PendingKey>> 按到期时间索引
+///
+/// drain_ready 时只需 BTreeMap::split_off 即可取出所有到期条目，无需遍历全部。
 pub struct PendingFetchQueue {
-    inner: Mutex<HashMap<PendingKey, PendingBlockFetch>>,
+    entries: Mutex<HashMap<PendingKey, PendingBlockFetch>>,
+    time_index: Mutex<BTreeMap<Instant, Vec<PendingKey>>>,
     backoff_init: Duration,
     backoff_max: Duration,
     /// 降级为后台静默拉取后的重试间隔（比 backoff_max 更长，减少资源消耗）。
@@ -77,7 +84,8 @@ impl PendingFetchQueue {
     /// 创建队列。
     pub fn new(backoff_init: Duration, backoff_max: Duration) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            entries: Mutex::new(HashMap::new()),
+            time_index: Mutex::new(BTreeMap::new()),
             backoff_init,
             backoff_max,
             // 后台静默拉取间隔：默认 30s，远大于 backoff_max，减少资源消耗
@@ -101,26 +109,35 @@ impl PendingFetchQueue {
     /// 入队一个 block 拉取请求。
     pub fn enqueue(&self, fetch: PendingBlockFetch) {
         let key = fetch.key();
-        self.inner.lock().insert(key, fetch);
+        let retry_at = fetch.retry_at;
+        self.entries.lock().insert(key.clone(), fetch);
+        self.time_index
+            .lock()
+            .entry(retry_at)
+            .or_default()
+            .push(key);
     }
 
     /// 取出到期且需要重试的条目。
+    ///
+    /// 使用 BTreeMap::split_off 实现 O(log n) 提取，无需遍历全部条目。
     pub fn drain_ready(&self, now: Instant) -> Vec<PendingBlockFetch> {
-        let mut inner = self.inner.lock();
-        let mut ready = Vec::new();
-        let mut to_requeue = Vec::new();
-        for (key, fetch) in inner.drain() {
-            if fetch.retry_at <= now {
-                ready.push(fetch);
-            } else {
-                to_requeue.push((key, fetch));
-            }
-        }
-        // 把未到期的放回
-        for (key, fetch) in to_requeue {
-            inner.insert(key, fetch);
-        }
-        ready
+        // split_off 返回 >= now 的部分，我们保留它，取走 < now 的部分
+        let due_keys: Vec<PendingKey> = {
+            let mut time_index = self.time_index.lock();
+            let remaining = time_index.split_off(&now);
+            // split_off 后 time_index 只含 < now 的条目，用 mem::take 取出所有权
+            let due = std::mem::take(&mut *time_index);
+            // 把 >= now 的放回
+            *time_index = remaining;
+            due.into_iter().flat_map(|(_, keys)| keys).collect()
+        };
+        // 从 entries 中取出对应的完整条目
+        let mut entries = self.entries.lock();
+        due_keys
+            .into_iter()
+            .filter_map(|key| entries.remove(&key))
+            .collect()
     }
 
     /// 计算下一次退避时长。
@@ -160,7 +177,13 @@ impl PendingFetchQueue {
         };
         fetch.retry_at = now + backoff;
         let key = fetch.key();
-        self.inner.lock().insert(key, fetch);
+        let retry_at = fetch.retry_at;
+        self.entries.lock().insert(key.clone(), fetch);
+        self.time_index
+            .lock()
+            .entry(retry_at)
+            .or_default()
+            .push(key);
     }
 
     /// 移除条目（拉取成功或不再需要时调用）。
@@ -170,7 +193,16 @@ impl PendingFetchQueue {
             block_id: block_id.clone(),
             peer_id: peer_id.clone(),
         };
-        self.inner.lock().remove(&key);
+        // 从 entries 中移除，同时尝试从 time_index 中清理
+        if let Some(fetch) = self.entries.lock().remove(&key) {
+            let retry_at = fetch.retry_at;
+            if let Some(vec) = self.time_index.lock().get_mut(&retry_at) {
+                vec.retain(|k| k != &key);
+                if vec.is_empty() {
+                    self.time_index.lock().remove(&retry_at);
+                }
+            }
+        }
     }
 
     /// 查询某条目是否存在及其重试次数。
@@ -180,7 +212,7 @@ impl PendingFetchQueue {
             block_id: block_id.clone(),
             peer_id: peer_id.clone(),
         };
-        self.inner.lock().get(&key).map(|f| f.retries)
+        self.entries.lock().get(&key).map(|f| f.retries)
     }
 
     /// 查询某条目的当前退避阶段。
@@ -190,7 +222,7 @@ impl PendingFetchQueue {
             block_id: block_id.clone(),
             peer_id: peer_id.clone(),
         };
-        self.inner
+        self.entries
             .lock()
             .get(&key)
             .map(|f| f.phase)
@@ -199,12 +231,12 @@ impl PendingFetchQueue {
 
     /// 当前队列长度。
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.entries.lock().len()
     }
 
     /// 队列是否为空。
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().is_empty()
+        self.entries.lock().is_empty()
     }
 }
 

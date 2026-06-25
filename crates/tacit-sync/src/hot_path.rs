@@ -27,19 +27,53 @@ pub enum HotPathMode {
     Normal,
 }
 
+/// 设备类型：不同平台的唤醒窗口差异较大。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceProfile {
+    /// iOS：后台唤醒窗口极短（1-3 秒），系统启发式调度。
+    Ios,
+    /// Android：前台服务可保持较长连接，但后台仍受限。
+    Android,
+    /// Desktop：无需 Hot-Path 限制，可始终 Normal 模式。
+    Desktop,
+}
+
+impl Default for DeviceProfile {
+    fn default() -> Self {
+        Self::Desktop
+    }
+}
+
 /// Hot-Path 控制器配置。
 #[derive(Debug, Clone, Copy)]
 pub struct HotPathConfig {
     /// Hot 模式持续时间窗口。超过此时间自动切换到 Normal。
     pub hot_window: Duration,
+    /// 设备类型，用于确定默认 hot_window。
+    pub device_profile: DeviceProfile,
+}
+
+impl HotPathConfig {
+    /// 根据设备类型创建配置，自动选择合适的 hot_window。
+    pub fn for_device(profile: DeviceProfile) -> Self {
+        let hot_window = match profile {
+            // iOS 后台唤醒窗口典型 1-3 秒，保守取 3 秒
+            DeviceProfile::Ios => Duration::from_secs(3),
+            // Android 后台窗口稍长，取 5 秒
+            DeviceProfile::Android => Duration::from_secs(5),
+            // Desktop 不需要 Hot-Path 限制，但仍提供默认值供统一接口
+            DeviceProfile::Desktop => Duration::from_secs(5),
+        };
+        Self {
+            hot_window,
+            device_profile: profile,
+        }
+    }
 }
 
 impl Default for HotPathConfig {
     fn default() -> Self {
-        // 默认 5 秒：Apple 设备短暂唤醒窗口典型值
-        Self {
-            hot_window: Duration::from_secs(5),
-        }
+        Self::for_device(DeviceProfile::default())
     }
 }
 

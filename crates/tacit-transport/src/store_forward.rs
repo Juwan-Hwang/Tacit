@@ -86,17 +86,29 @@ impl StoreAndForward {
         dao::list_unacknowledged(&conn, peer_id)
     }
 
-    /// 清理已确认的消息（定期 GC 调用）。
-    pub fn cleanup_acknowledged(&self) -> CoreResult<usize> {
+    /// 清理已确认的 sync_log 记录（定期 GC 调用）。
+    ///
+    /// 只删除 `retention_secs` 秒之前已确认的记录，保留近期记录供审计与故障排查。
+    /// 若 `retention_secs` 为 0，则立即清理所有已确认记录。
+    pub fn cleanup_acknowledged(&self, retention_secs: u64) -> CoreResult<usize> {
+        let cutoff_ms = if retention_secs == 0 {
+            i64::MAX
+        } else {
+            let now_ms = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            now_ms - (retention_secs as i64 * 1000)
+        };
         let conn = self.store.conn();
         let count = conn
             .execute(
-                "DELETE FROM sync_log WHERE acknowledged_at IS NOT NULL",
-                [],
+                "DELETE FROM sync_log WHERE acknowledged_at IS NOT NULL AND acknowledged_at < ?1",
+                [cutoff_ms],
             )
             .map_err(|e| tacit_core::CoreError::Store(e.to_string()))?;
         if count > 0 {
-            info!(cleaned = count, "清理已确认的 sync_log 记录");
+            info!(cleaned = count, retention_secs, "清理已确认的 sync_log 记录");
         }
         Ok(count)
     }
@@ -179,7 +191,7 @@ mod tests {
         saf.mark_delivered("e1").unwrap();
         saf.mark_acknowledged("e1").unwrap();
 
-        let cleaned = saf.cleanup_acknowledged().unwrap();
+        let cleaned = saf.cleanup_acknowledged(0).unwrap();
         assert_eq!(cleaned, 1);
 
         let unacked = saf.list_unacknowledged(&pid(2)).unwrap();

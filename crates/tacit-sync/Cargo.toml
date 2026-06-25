@@ -24,3 +24,8 @@ sha2.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sync_benchmarks"
+harness = false
