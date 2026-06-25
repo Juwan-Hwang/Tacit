@@ -11,17 +11,21 @@ description = "Relay 协议客户端/服务端、admission gate"
 [dependencies]
 tacit-core.workspace = true
 tacit-transport.workspace = true
+tacit-transport-quic.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true
+quinn.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 async-trait = "0.1"
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

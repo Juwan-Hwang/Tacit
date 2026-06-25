@@ -43,7 +43,7 @@ tracing = "0.1"
 tokio = { version = "1", features = ["full"] }
 
 # CRDT 内核
-loro = "1"
+loro = "=1.13.6"
 
 # 持久化
 rusqlite = { version = "0.31", features = ["bundled"] }

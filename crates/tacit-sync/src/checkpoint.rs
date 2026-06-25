@@ -116,10 +116,17 @@ impl CheckpointManager {
 
         // 在单个事务中原子写入所有 snapshot 和 checkpoint 记录
         let state_hash = compute_state_hash(&watermarks.hard_frontier);
+        // 将所有 block 的 shallow snapshot 按顺序拼接成一个 blob，
+        // 存入 CheckpointRecord.shallow_snapshot_blob，使 chunk_snapshot
+        // 可直接从 checkpoint 记录取数据，无需 fallback 前缀扫描。
+        let shallow_snapshot_blob: Vec<u8> = snapshots
+            .iter()
+            .flat_map(|(_, blob)| blob.iter().copied())
+            .collect();
         let checkpoint_rec = dao::CheckpointRecord {
             doc_id: doc_id.clone(),
             checkpoint_id: checkpoint_id.clone(),
-            shallow_snapshot_blob: Vec::new(),
+            shallow_snapshot_blob,
             frontier: watermarks.hard_frontier.clone(),
             state_hash,
             created_at: SystemTime::now(),
@@ -273,6 +280,7 @@ impl CheckpointManager {
                     kind: rec.kind,
                     current_frontier: meta.frontier.clone(),
                     updated_at: meta.created_at,
+                    current_snapshot_id: Some(meta.checkpoint_id.to_string()),
                 };
                 dao::upsert_doc(conn, &updated)?;
             }
@@ -514,6 +522,64 @@ mod tests {
         // 所有分片数据拼接应能还原原始 blob
         let total_size: usize = chunks.iter().map(|c| c.data.len()).sum();
         assert!(total_size > 0);
+    }
+
+    /// 验证 maybe_compact 后 CheckpointRecord.shallow_snapshot_blob 被填充，
+    /// chunk_snapshot 直接从 checkpoint 记录取数据（不走 fallback 前缀扫描）。
+    #[test]
+    fn maybe_compact_fills_shallow_snapshot_blob() {
+        let (ds, _store) = make_doc_store(1);
+        let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
+        let cm = CheckpointManager::new(ds, calc).with_params(1, 1024);
+
+        let doc_id = DocId::new("doc1");
+        let block_id = BlockId::new("b1");
+        cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
+        cm.doc_store
+            .create_block(&doc_id, block_id.clone(), BlockKind::Text)
+            .unwrap();
+        cm.doc_store
+            .apply_local_edit(&doc_id, &block_id, b"hello")
+            .unwrap();
+
+        // 写入 ack 使 hard_frontier 非空
+        let conn = cm.doc_store.store().conn();
+        dao::upsert_ack(
+            &conn,
+            &AckSummary {
+                peer_id: pid(1),
+                doc_id: doc_id.clone(),
+                ack_checkpoint: None,
+                ack_frontier: cm
+                    .doc_store
+                    .block_frontier(&doc_id, &block_id)
+                    .unwrap(),
+                updated_at: SystemTime::now(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let ckpt_id = cm.maybe_compact(&doc_id).unwrap().unwrap();
+
+        // 验证 CheckpointRecord.shallow_snapshot_blob 不为空
+        let conn = cm.doc_store.store().conn();
+        let ckpt = dao::get_latest_checkpoint(&conn, &doc_id).unwrap().unwrap();
+        drop(conn);
+        assert!(
+            !ckpt.shallow_snapshot_blob.is_empty(),
+            "shallow_snapshot_blob 应在 maybe_compact 后填充"
+        );
+
+        // 验证 chunk_snapshot 直接从 shallow_snapshot_blob 取数据：
+        // 分片总大小应等于 shallow_snapshot_blob 长度
+        let chunks = cm.chunk_snapshot(&doc_id, &ckpt_id).unwrap();
+        let total_size: usize = chunks.iter().map(|c| c.data.len()).sum();
+        assert_eq!(
+            total_size,
+            ckpt.shallow_snapshot_blob.len(),
+            "chunk_snapshot 应直接从 shallow_snapshot_blob 取数据"
+        );
     }
 
     #[test]

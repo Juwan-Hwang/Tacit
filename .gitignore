@@ -34,3 +34,7 @@ Thumbs.db
 # 日志
 *.log
 logs/
+
+# 内部设计文档（不上传到公开仓库）
+Tacit-v1.0-FINAL.md
+Tacit-crate-blueprint-FINAL.md

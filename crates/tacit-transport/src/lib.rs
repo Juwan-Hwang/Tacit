@@ -19,6 +19,7 @@ pub mod control;
 pub mod event;
 pub mod frame_codec;
 pub mod mdns;
+pub mod multiplexer;
 pub mod negotiation;
 pub mod snapshot_reassembly;
 pub mod store_forward;
@@ -35,6 +36,7 @@ pub use frame_codec::{
     encode_discovery,
 };
 pub use mdns::{DiscoveredPeer, MdnsDiscovery, MDNS_SERVICE_TYPE};
+pub use multiplexer::{ChannelKind, TransportMultiplexer};
 pub use negotiation::CapabilityNegotiator;
 pub use snapshot_reassembly::SnapshotReassembler;
 pub use store_forward::StoreAndForward;

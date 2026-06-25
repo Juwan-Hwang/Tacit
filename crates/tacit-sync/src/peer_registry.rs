@@ -46,6 +46,26 @@ impl PeerRegistry {
         dao::mark_peer_seen(&conn, peer_id, endpoint, SystemTime::now())
     }
 
+    /// 更新 peer 的 success_ema（指数移动平均成功率）。
+    ///
+    /// `success` 为 true 表示本次同步成功，false 表示失败。
+    /// EMA 平滑因子 α=0.3，公式：ema = ema * (1-α) + success * α
+    pub fn update_success_ema(
+        &self,
+        peer_id: &PeerId,
+        success: bool,
+    ) -> tacit_core::CoreResult<()> {
+        const ALPHA: f64 = 0.3;
+        let conn = self.store.conn();
+        let peer = dao::get_peer(&conn, peer_id)?;
+        if let Some(mut p) = peer {
+            let new_value = p.success_ema * (1.0 - ALPHA) + if success { 1.0 } else { 0.0 } * ALPHA;
+            p.success_ema = new_value.clamp(0.0, 1.0);
+            dao::upsert_peer(&conn, &p)?;
+        }
+        Ok(())
+    }
+
     /// 选举最佳 Anchor。
     pub fn best_anchor(&self) -> tacit_core::CoreResult<Option<PeerId>> {
         let conn = self.store.conn();
@@ -81,6 +101,7 @@ mod tests {
             last_endpoint: None,
             nat_capability: NatCapability::Unknown,
             relay_hint: None,
+            success_ema: 1.0,
         }
     }
 

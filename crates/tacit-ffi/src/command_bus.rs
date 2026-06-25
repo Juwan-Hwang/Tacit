@@ -127,13 +127,16 @@ impl Default for CommandBus {
 }
 
 /// 命令总线错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandBusError {
     /// 队列已满。
+    #[error("命令队列已满")]
     QueueFull,
     /// 队列已断开。
+    #[error("命令队列已断开")]
     Disconnected,
     /// 发送超时。
+    #[error("命令发送超时")]
     Timeout,
 }
 

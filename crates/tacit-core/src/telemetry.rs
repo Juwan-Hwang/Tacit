@@ -155,6 +155,7 @@ impl TelemetryCollector {
 
     /// 获取完整快照。
     pub fn snapshot(&self) -> TelemetrySnapshot {
+        tracing::debug!("生成 telemetry 快照");
         let inner = self.inner.lock();
         TelemetrySnapshot {
             sync_lag: inner.sync_lag.clone(),

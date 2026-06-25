@@ -73,12 +73,6 @@ impl BlockDoc {
         &self.peer_id
     }
 
-    /// 获取底层 LoroDoc 引用（供同 crate 内部使用）。
-    #[allow(dead_code)]
-    pub(crate) fn loro_doc(&self) -> &LoroDoc {
-        &self.doc
-    }
-
     /// 当前状态 frontier。
     pub fn frontier(&self) -> CoreResult<Frontier> {
         frontiers_to_frontier(&self.doc.state_frontiers())
@@ -145,8 +139,11 @@ impl BlockDoc {
         let kvs: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(json_str)
             .map_err(|e| CoreError::Crdt(format!("JSON 解析失败: {e}")))?;
         for (k, v) in kvs {
-            let value: LoroValue = serde_json::from_str(&serde_json::to_string(&v).unwrap_or_default())
-                .map_err(|e| CoreError::Crdt(format!("JSON 值转换失败: {e}")))?;
+            let value: LoroValue = serde_json::from_str(
+                &serde_json::to_string(&v)
+                    .map_err(|e| CoreError::Crdt(format!("JSON 序列化失败: {e}")))?,
+            )
+            .map_err(|e| CoreError::Crdt(format!("JSON 值转换失败: {e}")))?;
             map.insert(&k, value)
                 .map_err(|e| CoreError::Crdt(format!("Map 插入失败: {e}")))?;
         }
@@ -156,6 +153,46 @@ impl BlockDoc {
             new_frontier,
             has_delta: true,
         })
+    }
+
+    /// Todo 块：更新指定索引处待办项的完成状态。
+    ///
+    /// 将 LoroList 中指定索引的元素反序列化为 JSON 对象，
+    /// 更新 `completed` 字段后用 delete + insert 替换原元素
+    /// （LoroList 无 set 方法，delete + insert 是等价操作）。
+    pub fn apply_todo_update(&self, index: usize, completed: bool) -> CoreResult<()> {
+        let list = self.doc.get_list(ROOT_CONTAINER);
+        let old = list
+            .get(index)
+            .ok_or_else(|| CoreError::Crdt(format!("Todo 索引超出范围: {index}")))?;
+        let ValueOrContainer::Value(loro_val) = old else {
+            return Err(CoreError::Crdt(format!(
+                "Todo 索引 {index} 处的元素不是值类型"
+            )));
+        };
+        // LoroValue -> serde_json::Value
+        let mut json: serde_json::Value = serde_json::to_value(&loro_val)
+            .map_err(|e| CoreError::Crdt(format!("JSON 序列化失败: {e}")))?;
+        let obj = json.as_object_mut().ok_or_else(|| {
+            CoreError::Crdt(format!("Todo 索引 {index} 处的元素不是 JSON 对象"))
+        })?;
+        obj.insert(
+            "completed".to_string(),
+            serde_json::Value::Bool(completed),
+        );
+        // serde_json::Value -> LoroValue
+        let new_val: LoroValue = serde_json::from_str(
+            &serde_json::to_string(&json)
+                .map_err(|e| CoreError::Crdt(format!("JSON 序列化失败: {e}")))?,
+        )
+        .map_err(|e| CoreError::Crdt(format!("JSON 值转换失败: {e}")))?;
+        // 用 delete + insert 替换原元素
+        list.delete(index, 1)
+            .map_err(|e| CoreError::Crdt(format!("List 删除失败: {e}")))?;
+        list.insert(index, new_val)
+            .map_err(|e| CoreError::Crdt(format!("List 插入失败: {e}")))?;
+        self.doc.commit();
+        Ok(())
     }
 
     /// 获取 Text 容器。
@@ -293,6 +330,41 @@ mod tests {
         let items: Vec<serde_json::Value> = serde_json::from_slice(&render).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["text"], "buy milk");
+    }
+
+    #[test]
+    fn todo_update_toggles_completed() {
+        let block = BlockDoc::new(BlockId::new("b1"), BlockKind::Todo, &pid(1)).unwrap();
+        let item = serde_json::json!({"text": "buy milk", "completed": false});
+        block
+            .apply_edit(serde_json::to_vec(&item).unwrap().as_slice())
+            .unwrap();
+
+        // 标记为完成
+        block.apply_todo_update(0, true).unwrap();
+        let render = block.export_render_bytes().unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&render).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["completed"], true);
+        assert_eq!(items[0]["text"], "buy milk");
+
+        // 取消完成
+        block.apply_todo_update(0, false).unwrap();
+        let render = block.export_render_bytes().unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&render).unwrap();
+        assert_eq!(items[0]["completed"], false);
+    }
+
+    #[test]
+    fn todo_update_out_of_range_errors() {
+        let block = BlockDoc::new(BlockId::new("b1"), BlockKind::Todo, &pid(1)).unwrap();
+        let item = serde_json::json!({"text": "task", "completed": false});
+        block
+            .apply_edit(serde_json::to_vec(&item).unwrap().as_slice())
+            .unwrap();
+        // 索引越界应返回错误
+        let result = block.apply_todo_update(5, true);
+        assert!(result.is_err());
     }
 
     #[test]

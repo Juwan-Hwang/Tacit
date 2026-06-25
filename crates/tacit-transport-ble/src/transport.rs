@@ -80,6 +80,7 @@ mod tests {
     fn hint() -> PresenceHint {
         PresenceHint {
             group_id: "g1".into(),
+            device_id: "device-transport".into(),
             capabilities: AnchorCapabilities {
                 can_anchor: true,
                 can_relay: false,

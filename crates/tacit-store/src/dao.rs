@@ -14,7 +14,7 @@ use tacit_core::{
 // ===== 序列化辅助 =====
 
 fn ser_frontier(f: &Frontier) -> String {
-    serde_json::to_string(f).unwrap_or_else(|_| "{}".into())
+    serde_json::to_string(f).expect("Frontier 序列化不应失败")
 }
 
 fn de_frontier(s: &str) -> Frontier {
@@ -47,17 +47,19 @@ pub struct DocRecord {
     pub doc_id: DocId,
     pub kind: String,
     pub current_frontier: Frontier,
+    pub current_snapshot_id: Option<String>,
     pub updated_at: SystemTime,
 }
 
 pub fn upsert_doc(conn: &Connection, rec: &DocRecord) -> CoreResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO documents (doc_id, kind, current_frontier, updated_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO documents (doc_id, kind, current_frontier, current_snapshot_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             rec.doc_id.as_str(),
             rec.kind,
             ser_frontier(&rec.current_frontier),
+            rec.current_snapshot_id.as_deref(),
             to_millis(rec.updated_at),
         ],
     )
@@ -67,7 +69,7 @@ pub fn upsert_doc(conn: &Connection, rec: &DocRecord) -> CoreResult<()> {
 
 pub fn get_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Option<DocRecord>> {
     let mut stmt = conn
-        .prepare("SELECT doc_id, kind, current_frontier, updated_at FROM documents WHERE doc_id = ?1")
+        .prepare("SELECT doc_id, kind, current_frontier, current_snapshot_id, updated_at FROM documents WHERE doc_id = ?1")
         .map_err(store_err)?;
     let row = stmt
         .query_row(params![doc_id.as_str()], |r| {
@@ -75,16 +77,18 @@ pub fn get_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Option<DocRecord
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         })
         .optional()
         .map_err(store_err)?;
     match row {
-        Some((id, kind, frontier, updated)) => Ok(Some(DocRecord {
+        Some((id, kind, frontier, snap_id, updated)) => Ok(Some(DocRecord {
             doc_id: DocId::new(id),
             kind,
             current_frontier: de_frontier(&frontier),
+            current_snapshot_id: snap_id,
             updated_at: from_millis(updated),
         })),
         None => Ok(None),
@@ -93,7 +97,7 @@ pub fn get_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Option<DocRecord
 
 pub fn list_docs(conn: &Connection) -> CoreResult<Vec<DocRecord>> {
     let mut stmt = conn
-        .prepare("SELECT doc_id, kind, current_frontier, updated_at FROM documents ORDER BY updated_at DESC")
+        .prepare("SELECT doc_id, kind, current_frontier, current_snapshot_id, updated_at FROM documents ORDER BY updated_at DESC")
         .map_err(store_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -101,7 +105,8 @@ pub fn list_docs(conn: &Connection) -> CoreResult<Vec<DocRecord>> {
                 doc_id: DocId::new(r.get::<_, String>(0)?),
                 kind: r.get::<_, String>(1)?,
                 current_frontier: de_frontier(&r.get::<_, String>(2)?),
-                updated_at: from_millis(r.get::<_, i64>(3)?),
+                current_snapshot_id: r.get::<_, Option<String>>(3)?,
+                updated_at: from_millis(r.get::<_, i64>(4)?),
             })
         })
         .map_err(store_err)?;
@@ -214,8 +219,8 @@ pub fn delete_snapshot(
 pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO peers
-         (peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             peer.peer_id.as_str(),
             peer.device_pubkey,
@@ -226,6 +231,7 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
             peer.last_endpoint.as_ref().map(ser_json).as_deref(),
             ser_json(&peer.nat_capability),
             peer.relay_hint.as_ref().map(|p| p.as_str()),
+            peer.success_ema,
         ],
     )
     .map_err(store_err)?;
@@ -234,7 +240,7 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
 
 pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRecord>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint FROM peers WHERE peer_id = ?1")
+        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema FROM peers WHERE peer_id = ?1")
         .map_err(store_err)?;
     let row = stmt
         .query_row(params![peer_id.as_str()], |r| {
@@ -248,12 +254,13 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, String>(7)?,
                 r.get::<_, Option<String>>(8)?,
+                r.get::<_, f64>(9)?,
             ))
         })
         .optional()
         .map_err(store_err)?;
     match row {
-        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay)) => Ok(Some(PeerRecord {
+        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema)) => Ok(Some(PeerRecord {
             peer_id: PeerId::new(id),
             device_pubkey: pubkey,
             capabilities: de_json(&caps).unwrap_or_default(),
@@ -263,6 +270,7 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
             last_endpoint: endpoint.and_then(|s| de_json(&s)),
             nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
             relay_hint: relay.map(PeerId::new),
+            success_ema: ema,
         })),
         None => Ok(None),
     }
@@ -270,7 +278,7 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
 
 pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint FROM peers")
+        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema FROM peers")
         .map_err(store_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -284,12 +292,13 @@ pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, String>(7)?,
                 r.get::<_, Option<String>>(8)?,
+                r.get::<_, f64>(9)?,
             ))
         })
         .map_err(store_err)?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay) = r.map_err(store_err)?;
+        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema) = r.map_err(store_err)?;
         out.push(PeerRecord {
             peer_id: PeerId::new(id),
             device_pubkey: pubkey,
@@ -300,12 +309,23 @@ pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
             last_endpoint: endpoint.and_then(|s| de_json::<Endpoint>(&s)),
             nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
             relay_hint: relay.map(PeerId::new),
+            success_ema: ema,
         });
     }
     Ok(out)
 }
 
-/// 选举最佳 Anchor。排序键：anchor_priority desc, last_seen_at desc, peer_id asc。
+/// NAT 能力排序权重（值越大越优）。
+fn nat_rank(nat: &NatCapability) -> u8 {
+    match nat {
+        NatCapability::Direct => 3,
+        NatCapability::Cone => 2,
+        NatCapability::Symmetric => 1,
+        NatCapability::Unknown => 0,
+    }
+}
+
+/// 选举最佳 Anchor。排序键：anchor_priority desc, nat_capability desc, success_ema desc, last_seen_at desc, peer_id asc。
 /// 仅返回 trusted 且 can_anchor 的 peer。
 pub fn best_anchor(conn: &Connection) -> CoreResult<Option<PeerId>> {
     let peers = list_peers(conn)?;
@@ -313,8 +333,13 @@ pub fn best_anchor(conn: &Connection) -> CoreResult<Option<PeerId>> {
         .into_iter()
         .filter(|p| p.trust_state == TrustState::Trusted && p.capabilities.can_anchor)
         .max_by(|a, b| {
-            (a.anchor_priority, a.last_seen_at)
-                .cmp(&(b.anchor_priority, b.last_seen_at))
+            // 5 键排序：anchor_priority desc, nat_capability desc, success_ema desc, last_seen_at desc, peer_id asc
+            // max_by 中 a.cmp(&b) = Greater 表示 a > b，即 a 更优
+            a.anchor_priority.cmp(&b.anchor_priority)
+                .then(nat_rank(&a.nat_capability).cmp(&nat_rank(&b.nat_capability)))
+                .then(a.success_ema.partial_cmp(&b.success_ema).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.last_seen_at.cmp(&b.last_seen_at))
+                .then(b.peer_id.as_str().cmp(a.peer_id.as_str()))
         });
     Ok(anchor.map(|p| p.peer_id))
 }
@@ -621,15 +646,27 @@ pub fn delete_checkpoint(
 /// 删除指定 doc 下所有早于 keep_checkpoint_id 的 snapshot（用于 GC）。
 ///
 /// 保留与 keep_checkpoint_id 关联的 snapshot，删除其他旧 snapshot。
+///
+/// 注意：keep_prefix 中的 LIKE 通配符（`%`、`_`、`\`）会被转义，
+/// 避免前缀中含特殊字符时误匹配。
 pub fn delete_old_snapshots(
     conn: &Connection,
     doc_id: &DocId,
     keep_prefix: &str,
 ) -> CoreResult<u64> {
+    // 对 keep_prefix 中的 LIKE 通配符进行反斜杠转义：
+    //   % → \%   （匹配字面百分号）
+    //   _ → \_   （匹配字面下划线）
+    //   \ → \\   （转义符自身先转义，避免影响后续转义）
+    let escaped = keep_prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     // 删除 snapshot_id 不以 keep_prefix 开头的 snapshot
+    // 使用 ESCAPE '\' 子句启用反斜杠作为转义字符
     let deleted = conn.execute(
-        "DELETE FROM document_snapshots WHERE doc_id = ?1 AND snapshot_id NOT LIKE ?2",
-        params![doc_id.as_str(), format!("{}%", keep_prefix)],
+        "DELETE FROM document_snapshots WHERE doc_id = ?1 AND snapshot_id NOT LIKE ?2 ESCAPE '\\'",
+        params![doc_id.as_str(), format!("{}%", escaped)],
     )
     .map_err(store_err)?;
     Ok(deleted as u64)

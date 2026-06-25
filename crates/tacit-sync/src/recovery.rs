@@ -89,8 +89,12 @@ impl RecoveryCoordinator {
 
     /// 检测 peer 是否 stale：peer frontier 是否落在本地 shallow snapshot 剪裁点之前。
     ///
-    /// 简化判定：若 peer frontier 为空或本地 meta frontier 不覆盖 peer frontier，
-    /// 则认为 peer stale。
+    /// 判定逻辑：
+    /// 1. 若 peer frontier 为空，视为全新 peer，需要完整恢复
+    /// 2. 获取本地最新 checkpoint 的 frontier（即 shallow snapshot 剪裁点）
+    /// 3. 若 peer frontier 的任何 seq 小于 checkpoint frontier 的对应 seq，
+    ///    说明 peer 落在剪裁点之前，需要 shallow snapshot 恢复
+    /// 4. 若无 checkpoint 记录，退化为 meta frontier 覆盖判定
     pub fn is_peer_stale(
         &self,
         doc_id: &DocId,
@@ -100,11 +104,31 @@ impl RecoveryCoordinator {
             // 空 frontier 视为全新 peer，需要完整恢复
             return Ok(true);
         }
-        let local_meta = self.doc_store.meta_frontier(doc_id)?;
-        // 若本地 meta 不覆盖 peer frontier，说明 peer 有本地没有的旧数据
-        // 但更准确的判定应基于 shallow snapshot 的剪裁点
-        // 这里简化：若 peer 的任意 seq 比本地小，则可能 stale
-        Ok(!local_meta.covers(peer_frontier))
+
+        // 获取本地最新 checkpoint 的 frontier（shallow snapshot 剪裁点）
+        let conn = self.doc_store.store().conn();
+        let checkpoint = tacit_store::dao::get_latest_checkpoint(&conn, doc_id)?;
+        drop(conn);
+
+        if let Some(ckpt) = checkpoint {
+            // 检查 peer frontier 是否落在 checkpoint frontier 之前
+            // 即 peer 的任何 seq < checkpoint 的对应 seq
+            for (peer_id_str, peer_seq) in peer_frontier.entries() {
+                let peer_id = PeerId::new(peer_id_str);
+                if let Some(ckpt_seq) = ckpt.frontier.get(&peer_id) {
+                    if peer_seq < ckpt_seq {
+                        // peer 落在剪裁点之前，需要 shallow snapshot 恢复
+                        return Ok(true);
+                    }
+                }
+            }
+            // peer frontier 不落后于 checkpoint frontier
+            Ok(false)
+        } else {
+            // 无 checkpoint 记录，退化为 meta frontier 覆盖判定
+            let local_meta = self.doc_store.meta_frontier(doc_id)?;
+            Ok(!local_meta.covers(peer_frontier))
+        }
     }
 
     /// 执行 stale peer 恢复流程。
@@ -162,6 +186,7 @@ impl RecoveryCoordinator {
                 doc_id: doc_id.clone(),
                 block_id: Some(block.block_id.clone()),
                 since: stale_frontier.clone(),
+                priority: Priority::High,
             });
         }
 
@@ -178,53 +203,6 @@ impl RecoveryCoordinator {
 
         state.stage = RecoveryStage::Done;
         Ok(state)
-    }
-
-    /// 手术式重入：备份旧本地状态 → 提取本地增量 → 拉取最新 shallow snapshot 重建 → 重新应用本地增量。
-    ///
-    /// 当 peer 发来的 delta 与本地状态冲突时调用。
-    /// `stale_frontier`：本地最后一次与远端同步的 frontier，用于提取本地独有增量。
-    pub fn surgical_reentry(
-        &self,
-        doc_id: &DocId,
-        block_id: &BlockId,
-        remote_snapshot: &[u8],
-        stale_frontier: &Frontier,
-    ) -> CoreResult<Vec<u8>> {
-        info!(
-            doc_id = %doc_id,
-            block_id = %block_id,
-            "执行手术式重入"
-        );
-
-        // 1. 备份旧本地状态
-        let backup = self.doc_store.export_block_snapshot(doc_id, block_id)?;
-        warn!(
-            doc_id = %doc_id,
-            block_id = %block_id,
-            backup_size = backup.len(),
-            "已备份旧本地状态"
-        );
-
-        // 2. 提取本地自 stale_frontier 以来的独有增量（local-only delta）
-        let local_delta = self.doc_store.export_block_delta(doc_id, block_id, stale_frontier)?;
-
-        // 3. 用远端 shallow snapshot 重建本地 block（CRDT import 会合并而非覆盖）
-        self.doc_store.import_block(doc_id, block_id, remote_snapshot)?;
-
-        // 4. 将本地独有增量重新应用到新基线（CRDT 合并语义自动处理冲突）
-        if !local_delta.is_empty() {
-            debug!(
-                doc_id = %doc_id,
-                block_id = %block_id,
-                local_delta_size = local_delta.len(),
-                "重新应用本地增量到新基线"
-            );
-            self.doc_store.import_block(doc_id, block_id, &local_delta)?;
-        }
-
-        // 5. 返回备份供审计/回滚
-        Ok(backup)
     }
 
     /// 首屏恢复策略：按优先级恢复文档状态。
@@ -305,7 +283,34 @@ impl RecoveryCoordinator {
 
         // 4. 冷文档追赶（后台低优先级）
         stages.push(FirstScreenStage::ColdDocCatchup);
-        // 冷文档追赶通过定期 sync 触发，这里仅标记阶段
+        // 遍历所有文档，为每个冷文档向在线 peer 请求 delta（Priority::Low）。
+        // 冷文档追赶以低优先级入队，确保不阻塞前面阶段的热数据同步。
+        let online_peers = engine.online_peers();
+        if !online_peers.is_empty() {
+            let doc_ids = self.doc_store.list_doc_ids()?;
+            for doc_id in &doc_ids {
+                // 本地 meta frontier 作为 since（请求此之后的增量）；
+                // 若文档尚无 meta（刚创建），用空 frontier 兜底
+                let since = self
+                    .doc_store
+                    .meta_frontier(doc_id)
+                    .unwrap_or_default();
+                for peer_id in &online_peers {
+                    engine.push_action(SyncAction::RequestDelta {
+                        peer_id: peer_id.clone(),
+                        doc_id: doc_id.clone(),
+                        block_id: None,
+                        since: since.clone(),
+                        priority: Priority::Low,
+                    });
+                }
+            }
+            debug!(
+                docs = doc_ids.len(),
+                peers = online_peers.len(),
+                "冷文档追赶已入队低优 RequestDelta"
+            );
+        }
 
         stages.push(FirstScreenStage::Done);
         for doc in &docs {
@@ -323,10 +328,93 @@ impl RecoveryCoordinator {
     }
 }
 
+/// 手术式重入结果。
+#[derive(Debug)]
+pub struct SurgicalReentryResult {
+    /// 备份的旧本地状态（供审计/回滚）。
+    pub backup: Vec<u8>,
+    /// 是否发生了冲突（local_delta 非空）。
+    pub had_conflict: bool,
+    /// 合并后的 block 数据。
+    pub merged_data: Vec<u8>,
+}
+
+/// 手术式重入：备份旧本地状态 → 提取本地增量 → 拉取最新 shallow snapshot 重建 → 重新应用本地增量。
+///
+/// 当 peer 发来的 delta 与本地状态冲突时调用。
+/// `stale_frontier`：本地最后一次与远端同步的 frontier，用于提取本地独有增量。
+///
+/// 返回 `SurgicalReentryResult`，包含备份、是否发生冲突、合并后的数据。
+/// 调用方应根据 `had_conflict` 产生 `ConflictMerged` 事件通知 UI。
+pub fn surgical_reentry(
+    doc_store: &DocStore,
+    doc_id: &DocId,
+    block_id: &BlockId,
+    remote_snapshot: &[u8],
+    stale_frontier: &Frontier,
+) -> CoreResult<SurgicalReentryResult> {
+    info!(
+        doc_id = %doc_id,
+        block_id = %block_id,
+        "执行手术式重入"
+    );
+
+    // 1. 备份旧本地状态
+    let backup = doc_store.export_block_snapshot(doc_id, block_id)?;
+    warn!(
+        doc_id = %doc_id,
+        block_id = %block_id,
+        backup_size = backup.len(),
+        "已备份旧本地状态"
+    );
+
+    // 2. 提取本地自 stale_frontier 以来的独有增量（local-only delta）
+    let local_delta = doc_store.export_block_delta(doc_id, block_id, stale_frontier)?;
+    let had_conflict = !local_delta.is_empty();
+
+    // 3. 用远端 shallow snapshot 重建本地 block（CRDT import 会合并而非覆盖）
+    doc_store.import_block(doc_id, block_id, remote_snapshot)?;
+
+    // 4. 将本地独有增量重新应用到新基线（CRDT 合并语义自动处理冲突）
+    if had_conflict {
+        debug!(
+            doc_id = %doc_id,
+            block_id = %block_id,
+            local_delta_size = local_delta.len(),
+            "检测到本地增量，重新应用到新基线（可能发生冲突合并）"
+        );
+        doc_store.import_block(doc_id, block_id, &local_delta)?;
+    }
+
+    // 5. 导出合并后的最终数据
+    let merged_data = doc_store.export_block_snapshot(doc_id, block_id)?;
+
+    if had_conflict {
+        warn!(
+            doc_id = %doc_id,
+            block_id = %block_id,
+            "手术式重入完成，存在本地修改与远端 snapshot 的冲突，已通过 CRDT 语义合并"
+        );
+    } else {
+        info!(
+            doc_id = %doc_id,
+            block_id = %block_id,
+            "手术式重入完成，无冲突"
+        );
+    }
+
+    Ok(SurgicalReentryResult {
+        backup,
+        had_conflict,
+        merged_data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::EngineConfig;
+    use crate::engine::SyncEngine;
     use tacit_store::Store;
 
     fn pid(n: u64) -> PeerId {
@@ -423,9 +511,81 @@ mod tests {
         );
     }
 
+    /// 验证冷文档追赶阶段：有在线 peer 时，为每个文档生成 Priority::Low 的 RequestDelta。
+    #[test]
+    fn cold_doc_catchup_enqueues_low_priority_delta() {
+        let (coord, engine, doc_store) = make_env();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        // 标记一个 peer 在线，使冷文档追赶能生成 RequestDelta
+        engine
+            .on_peer_summary(
+                pid(2),
+                tacit_core::PeerSummary {
+                    peer_id: pid(2),
+                    online: true,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+        // 清空 on_peer_summary 产生的动作
+        let _ = engine.drain_actions();
+
+        // 执行首屏恢复
+        coord.first_screen_recovery(&engine, None).unwrap();
+
+        let actions = engine.drain_actions();
+        // 应有 Priority::Low 的 RequestDelta（冷文档追赶）
+        let has_low_delta = actions.iter().any(|a| {
+            matches!(
+                a,
+                SyncAction::RequestDelta {
+                    priority: Priority::Low,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_low_delta,
+            "冷文档追赶应产生 Priority::Low 的 RequestDelta"
+        );
+    }
+
+    /// 验证无在线 peer 时冷文档追赶不产生 RequestDelta（不报错，静默跳过）。
+    #[test]
+    fn cold_doc_catchup_no_peer_skips() {
+        let (coord, engine, doc_store) = make_env();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        // 无在线 peer
+
+        coord.first_screen_recovery(&engine, None).unwrap();
+
+        let actions = engine.drain_actions();
+        // 不应有 RequestDelta（无在线 peer，冷文档追赶跳过）
+        let has_delta = actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::RequestDelta { .. }));
+        assert!(
+            !has_delta,
+            "无在线 peer 时不应产生 RequestDelta"
+        );
+    }
+
     #[test]
     fn surgical_reentry_backups_and_restores() {
-        let (coord, _engine, doc_store) = make_env();
+        let (_coord, _engine, doc_store) = make_env();
         let block_id = BlockId::new("b1");
         doc_store
             .create_block(&DocId::new("d1"), block_id.clone(), tacit_core::BlockKind::Text)
@@ -444,9 +604,18 @@ mod tests {
             .export_block_snapshot(&DocId::new("d1"), &block_id)
             .unwrap();
 
-        let backup = coord
-            .surgical_reentry(&DocId::new("d1"), &block_id, &remote_snap, &stale_frontier)
-            .unwrap();
-        assert!(!backup.is_empty());
+        let result = super::surgical_reentry(
+            &doc_store,
+            &DocId::new("d1"),
+            &block_id,
+            &remote_snap,
+            &stale_frontier,
+        )
+        .unwrap();
+        assert!(!result.backup.is_empty());
+        assert!(!result.merged_data.is_empty());
+        // had_conflict 取决于 CRDT 实现：如果 stale_frontier 恰好是当前 frontier，
+        // local_delta 为空则无冲突；否则有冲突（CRDT 内部状态差异）。
+        // 此处只验证函数正常返回，不断言 had_conflict 的具体值。
     }
 }

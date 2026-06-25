@@ -14,15 +14,34 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tacit_core::{BlockId, DocId, Frontier, PeerId};
 
+/// 退避阶段：区分正常重试与降级后的后台静默拉取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffPhase {
+    /// 正常指数退避阶段。
+    Normal,
+    /// 到达退避上限后降级为后台静默拉取（更长间隔，不报错）。
+    Background,
+}
+
 /// 依赖等待条目。
 #[derive(Debug, Clone)]
 pub struct PendingBlockFetch {
     pub doc_id: DocId,
     pub block_id: BlockId,
     pub expected_frontier: Frontier,
+    /// 本地已观测到的 frontier（用于增量拉取，避免每次从头拉取）。
+    pub observed_frontier: Frontier,
     pub peer_id: PeerId,
     pub retry_at: Instant,
     pub retries: u32,
+    /// 当前退避阶段。
+    pub phase: BackoffPhase,
+}
+
+impl Default for BackoffPhase {
+    fn default() -> Self {
+        BackoffPhase::Normal
+    }
 }
 
 impl PendingBlockFetch {
@@ -47,6 +66,11 @@ pub struct PendingFetchQueue {
     inner: Mutex<HashMap<PendingKey, PendingBlockFetch>>,
     backoff_init: Duration,
     backoff_max: Duration,
+    /// 降级为后台静默拉取后的重试间隔（比 backoff_max 更长，减少资源消耗）。
+    background_interval: Duration,
+    /// 进入 Background 阶段前的最大正常重试次数。
+    /// 达到此次数后切换到 Background 阶段。
+    max_normal_retries: u32,
 }
 
 impl PendingFetchQueue {
@@ -56,7 +80,22 @@ impl PendingFetchQueue {
             inner: Mutex::new(HashMap::new()),
             backoff_init,
             backoff_max,
+            // 后台静默拉取间隔：默认 30s，远大于 backoff_max，减少资源消耗
+            background_interval: Duration::from_secs(30),
+            // 正常阶段最大重试次数：backoff 到达 max 后再重试若干次即降级
+            max_normal_retries: 5,
         }
+    }
+
+    /// 自定义后台静默拉取间隔和降级阈值。
+    pub fn with_background_params(
+        mut self,
+        background_interval: Duration,
+        max_normal_retries: u32,
+    ) -> Self {
+        self.background_interval = background_interval;
+        self.max_normal_retries = max_normal_retries;
+        self
     }
 
     /// 入队一个 block 拉取请求。
@@ -97,9 +136,28 @@ impl PendingFetchQueue {
     }
 
     /// 重新入队（重试次数 +1，更新 retry_at）。
+    ///
+    /// 当正常阶段重试次数达到 `max_normal_retries` 后，降级为 Background 阶段：
+    /// 使用更长的重试间隔（`background_interval`），不再报错或快速重试。
     pub fn requeue(&self, mut fetch: PendingBlockFetch, now: Instant) {
         fetch.retries = fetch.retries.saturating_add(1);
-        let backoff = self.next_backoff(fetch.retries);
+        let backoff = if fetch.phase == BackoffPhase::Background {
+            // 已在后台静默拉取阶段，使用固定长间隔
+            self.background_interval
+        } else if fetch.retries >= self.max_normal_retries {
+            // 达到降级阈值，切换到 Background 阶段
+            fetch.phase = BackoffPhase::Background;
+            tracing::debug!(
+                doc_id = %fetch.doc_id,
+                block_id = %fetch.block_id,
+                retries = fetch.retries,
+                "依赖等待降级为后台静默拉取"
+            );
+            self.background_interval
+        } else {
+            // 正常指数退避
+            self.next_backoff(fetch.retries)
+        };
         fetch.retry_at = now + backoff;
         let key = fetch.key();
         self.inner.lock().insert(key, fetch);
@@ -125,6 +183,20 @@ impl PendingFetchQueue {
         self.inner.lock().get(&key).map(|f| f.retries)
     }
 
+    /// 查询某条目的当前退避阶段。
+    pub fn phase(&self, doc_id: &DocId, block_id: &BlockId, peer_id: &PeerId) -> BackoffPhase {
+        let key = PendingKey {
+            doc_id: doc_id.clone(),
+            block_id: block_id.clone(),
+            peer_id: peer_id.clone(),
+        };
+        self.inner
+            .lock()
+            .get(&key)
+            .map(|f| f.phase)
+            .unwrap_or(BackoffPhase::Normal)
+    }
+
     /// 当前队列长度。
     pub fn len(&self) -> usize {
         self.inner.lock().len()
@@ -144,25 +216,28 @@ mod tests {
         PeerId(n.to_string())
     }
 
+    fn make_fetch(doc: &str, block: &str, peer: u64, retry_at: Instant) -> PendingBlockFetch {
+        PendingBlockFetch {
+            doc_id: DocId::new(doc),
+            block_id: BlockId::new(block),
+            expected_frontier: Frontier::new(),
+            observed_frontier: Frontier::new(),
+            peer_id: pid(peer),
+            retry_at,
+            retries: 0,
+            phase: BackoffPhase::Normal,
+        }
+    }
+
     #[test]
     fn enqueue_and_drain_ready() {
         let q = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
         let now = Instant::now();
+        q.enqueue(make_fetch("d1", "b1", 1, now));
         q.enqueue(PendingBlockFetch {
-            doc_id: DocId::new("d1"),
-            block_id: BlockId::new("b1"),
-            expected_frontier: Frontier::new(),
-            peer_id: pid(1),
-            retry_at: now,
-            retries: 0,
-        });
-        q.enqueue(PendingBlockFetch {
-            doc_id: DocId::new("d1"),
             block_id: BlockId::new("b2"),
-            expected_frontier: Frontier::new(),
-            peer_id: pid(1),
             retry_at: now + Duration::from_secs(1),
-            retries: 0,
+            ..make_fetch("d1", "b2", 1, now)
         });
         // 只有 b1 到期
         let ready = q.drain_ready(now);
@@ -188,15 +263,7 @@ mod tests {
     fn requeue_increments_retries() {
         let q = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
         let now = Instant::now();
-        let fetch = PendingBlockFetch {
-            doc_id: DocId::new("d1"),
-            block_id: BlockId::new("b1"),
-            expected_frontier: Frontier::new(),
-            peer_id: pid(1),
-            retry_at: now,
-            retries: 0,
-        };
-        q.enqueue(fetch);
+        q.enqueue(make_fetch("d1", "b1", 1, now));
         let ready = q.drain_ready(now);
         assert_eq!(ready.len(), 1);
         q.requeue(ready.into_iter().next().unwrap(), now);
@@ -207,16 +274,40 @@ mod tests {
     fn remove_entry() {
         let q = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
         let now = Instant::now();
-        q.enqueue(PendingBlockFetch {
-            doc_id: DocId::new("d1"),
-            block_id: BlockId::new("b1"),
-            expected_frontier: Frontier::new(),
-            peer_id: pid(1),
-            retry_at: now,
-            retries: 0,
-        });
+        q.enqueue(make_fetch("d1", "b1", 1, now));
         assert_eq!(q.len(), 1);
         q.remove(&DocId::new("d1"), &BlockId::new("b1"), &pid(1));
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn degrades_to_background_after_max_retries() {
+        let q = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2))
+            .with_background_params(Duration::from_secs(10), 3);
+        let mut now = Instant::now();
+        q.enqueue(make_fetch("d1", "b1", 1, now));
+
+        // 正常阶段重试 3 次，每次推进时间以确保 drain_ready 能取到
+        for _ in 0..3 {
+            let ready = q.drain_ready(now);
+            q.requeue(ready.into_iter().next().unwrap(), now);
+            // 推进时间超过 backoff_max，确保下一次 drain_ready 能取到
+            now += Duration::from_secs(5);
+        }
+        // 第 3 次重试后 retries=3，达到阈值，应降级为 Background
+        assert_eq!(
+            q.phase(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)),
+            BackoffPhase::Background
+        );
+
+        // 降级后 retry_at 应使用 background_interval（10s），推进时间确保能取到
+        now += Duration::from_secs(10);
+        let ready = q.drain_ready(now);
+        q.requeue(ready.into_iter().next().unwrap(), now);
+        // 验证仍在 Background 阶段
+        assert_eq!(
+            q.phase(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)),
+            BackoffPhase::Background
+        );
     }
 }

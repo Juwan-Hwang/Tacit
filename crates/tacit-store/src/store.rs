@@ -4,10 +4,14 @@
 //! 获取连接后操作。快照安装通过事务保证原子性。
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use parking_lot::Mutex;
 use rusqlite::Connection;
-use tacit_core::CoreResult;
+use tacit_core::{CheckpointId, CoreError, CoreResult, DocId, Frontier, SnapshotKind};
+
+use sha2::Digest;
+use crate::dao;
 
 /// SQLite 持久化存储。
 #[derive(Clone)]
@@ -25,7 +29,8 @@ impl Store {
         let conn = Connection::open(path)
             .map_err(|e| tacit_core::CoreError::Store(format!("打开数据库失败: {e}")))?;
         // 开启 WAL 与外键约束，提升并发与数据完整性。
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        // busy_timeout=5000 避免多进程访问时立即报 locked。
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
             .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| tacit_core::CoreError::Store(format!("建表失败: {e}")))?;
@@ -40,6 +45,8 @@ impl Store {
     pub fn open_memory() -> CoreResult<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| tacit_core::CoreError::Store(format!("打开内存数据库失败: {e}")))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+            .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| tacit_core::CoreError::Store(format!("建表失败: {e}")))?;
         Ok(Self {
@@ -55,17 +62,31 @@ impl Store {
     }
 
     /// 在事务中执行操作。
+    ///
+    /// # 警告：死锁风险
+    /// `parking_lot::Mutex` 不可重入。**禁止**在已通过 [`conn`](Self::conn) 持有锁时
+    /// 调用本方法，否则会死锁。如需在已持有锁时执行事务，请使用
+    /// [`transaction_with_conn`](Self::transaction_with_conn)。
+    ///
+    /// 本方法使用 `try_lock` 检测重入：如果锁已被占用（可能是当前线程已持有），
+    /// 立即返回错误而非阻塞，从而避免死锁。
     pub fn transaction<F, T>(&self, f: F) -> CoreResult<T>
     where
         F: FnOnce(&Connection) -> CoreResult<T>,
     {
-        let conn = self.conn();
+        // 死锁检测：parking_lot::Mutex 不可重入。
+        // try_lock 在锁已被占用时（含当前线程重入）返回 None，借此提前失败而非死锁。
+        let conn = self.inner.conn.try_lock().ok_or_else(|| {
+            CoreError::Store(
+                "transaction() 锁已被占用：可能当前线程已持有 conn() 锁（会死锁）。请改用 transaction_with_conn()".into(),
+            )
+        })?;
         conn.execute_batch("BEGIN")
-            .map_err(|e| tacit_core::CoreError::Store(format!("BEGIN 失败: {e}")))?;
+            .map_err(|e| CoreError::Store(format!("BEGIN 失败: {e}")))?;
         match f(&conn) {
             Ok(v) => {
                 conn.execute_batch("COMMIT")
-                    .map_err(|e| tacit_core::CoreError::Store(format!("COMMIT 失败: {e}")))?;
+                    .map_err(|e| CoreError::Store(format!("COMMIT 失败: {e}")))?;
                 Ok(v)
             }
             Err(e) => {
@@ -73,6 +94,157 @@ impl Store {
                 Err(e)
             }
         }
+    }
+
+    /// 在外部传入的连接上执行事务。
+    ///
+    /// 适用于调用方已通过 [`conn`](Self::conn) 持有锁的场景，避免
+    /// [`transaction`](Self::transaction) 的重入死锁。调用方负责锁的生命周期。
+    ///
+    /// # 参数
+    /// - `conn`: 外部持有的连接引用（调用方负责锁的生命周期）
+    /// - `f`: 事务体，接收同一连接引用
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let conn = store.conn();
+    /// store.transaction_with_conn(&conn, |conn| {
+    ///     dao::upsert_doc(conn, &rec)?;
+    ///     Ok(())
+    /// })?;
+    /// ```
+    pub fn transaction_with_conn<F, T>(&self, conn: &Connection, f: F) -> CoreResult<T>
+    where
+        F: FnOnce(&Connection) -> CoreResult<T>,
+    {
+        conn.execute_batch("BEGIN")
+            .map_err(|e| CoreError::Store(format!("BEGIN 失败: {e}")))?;
+        match f(conn) {
+            Ok(v) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| CoreError::Store(format!("COMMIT 失败: {e}")))?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// 原子安装快照（双缓冲便捷方法）。
+    ///
+    /// 封装蓝图要求的双缓冲 4 步流程，保证快照安装的原子性与崩溃安全性：
+    /// 1. 在事务中写入临时 snapshot（snapshot_id 带 `__pending_` 前缀）
+    /// 2. 校验 snapshot 内容的 SHA256 与 state_hash 字节一致
+    /// 3. 原子切换：更新 `documents.current_frontier` + 删除旧的 pending snapshot
+    /// 4. 提交事务
+    ///
+    /// 使用现有的 dao 函数（[`dao::insert_snapshot`], [`dao::upsert_doc`], [`dao::delete_snapshot`]）。
+    ///
+    /// # 参数
+    /// - `doc_id`: 文档 ID
+    /// - `snapshot`: 快照二进制内容（不能为空）
+    /// - `state_hash`: 状态哈希（32 字节 SHA256，同时用作 pending snapshot_id 的唯一后缀）
+    /// - `frontier`: 新的版本向量，写入 `documents.current_frontier`
+    /// - `snapshot_kind`: 快照类型字符串（`"Full"` 或 `"Shallow"`，其他值按 `Full` 处理）
+    pub fn install_snapshot_atomically(
+        &self,
+        doc_id: &str,
+        snapshot: &[u8],
+        state_hash: &str,
+        frontier: &Frontier,
+        snapshot_kind: &str,
+    ) -> CoreResult<()> {
+        // 前置校验：snapshot 不能为空
+        if snapshot.is_empty() {
+            return Err(CoreError::Store(
+                "install_snapshot_atomically: snapshot 不能为空".into(),
+            ));
+        }
+
+        let doc_id = DocId::new(doc_id);
+        // 解析 snapshot_kind 字符串为枚举
+        let kind = match snapshot_kind {
+            "Shallow" | "shallow" => SnapshotKind::Shallow,
+            _ => SnapshotKind::Full,
+        };
+        let hash_hex = if state_hash.is_empty() {
+            hex::encode(sha2::Sha256::digest(snapshot))
+        } else {
+            state_hash.to_string()
+        };
+        // 临时 snapshot_id 带 __pending_ 前缀，用于双缓冲标记
+        let pending_id = CheckpointId::new(format!("__pending_{}", hash_hex));
+        let now = SystemTime::now();
+
+        // 获取连接锁，通过 transaction_with_conn 执行事务（避免 transaction 重入检测）
+        let conn = self.conn();
+        self.transaction_with_conn(&conn, |conn| {
+            // 1. 查找旧 pending snapshot
+            let old_pending = dao::get_latest_snapshot(conn, &doc_id)?
+                .map(|(id, _, _, _)| id)
+                .filter(|id| id.as_str().starts_with("__pending_"));
+
+            // 2. 写入临时 pending snapshot
+            dao::insert_snapshot(conn, &doc_id, &pending_id, snapshot, kind, now)?;
+
+            // 3. 校验 snapshot 内容完整性：计算 SHA256 并与 state_hash 比对
+            let stored = dao::get_snapshot(conn, &doc_id, &pending_id)?;
+            let blob_ok = stored.as_ref().map(|(blob, _, _)| blob.as_slice() == snapshot).unwrap_or(false);
+            let hash_ok = if state_hash.is_empty() {
+                true
+            } else {
+                let computed_hash = {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(snapshot);
+                    let result = hasher.finalize();
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&result);
+                    hash
+                };
+                let expected_hash: Option<[u8; 32]> = hex::decode(state_hash)
+                    .ok()
+                    .filter(|v| v.len() == 32)
+                    .map(|v| {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&v);
+                        arr
+                    });
+                if let Some(expected) = expected_hash {
+                    computed_hash == expected
+                } else {
+                    false
+                }
+            };
+            if !blob_ok || !hash_ok {
+                // 校验失败：删除临时 snapshot 并回滚（事务会自动回滚）
+                let _ = dao::delete_snapshot(conn, &doc_id, &pending_id);
+                return Err(CoreError::Store(format!(
+                    "快照校验失败: blob_ok={}, hash_ok={}", blob_ok, hash_ok
+                )));
+            }
+
+            // 4. 原子切换：更新 documents.current_frontier + current_snapshot_id
+            let existing = dao::get_doc(conn, &doc_id)?;
+            let doc_kind = existing.as_ref().map(|d| d.kind.clone()).unwrap_or_else(|| "note".to_string());
+            let current_snapshot_id = Some(pending_id.as_str().to_string());
+            dao::upsert_doc(conn, &dao::DocRecord {
+                doc_id: doc_id.clone(),
+                kind: doc_kind,
+                current_frontier: frontier.clone(),
+                current_snapshot_id,
+                updated_at: now,
+            })?;
+
+            // 5. 删除旧 pending snapshot
+            if let Some(old_id) = old_pending {
+                dao::delete_snapshot(conn, &doc_id, &old_id)?;
+            }
+
+            Ok(())
+        })
     }
 }
 
@@ -117,10 +289,11 @@ impl TxnExecutor {
 /// 建表 SQL。对应蓝图 7.1 推荐表结构。
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS documents (
-    doc_id            TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL,
-    current_frontier  TEXT NOT NULL,
-    updated_at        INTEGER NOT NULL
+    doc_id               TEXT PRIMARY KEY,
+    kind                 TEXT NOT NULL,
+    current_frontier     TEXT NOT NULL,
+    current_snapshot_id  TEXT,
+    updated_at           INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS document_snapshots (
@@ -161,7 +334,8 @@ CREATE TABLE IF NOT EXISTS peers (
     last_seen_at     INTEGER NOT NULL,
     last_endpoint    TEXT,
     nat_capability   TEXT NOT NULL,
-    relay_hint       TEXT
+    relay_hint       TEXT,
+    success_ema      REAL NOT NULL DEFAULT 1.0
 );
 
 CREATE TABLE IF NOT EXISTS acks (
@@ -202,6 +376,7 @@ CREATE INDEX IF NOT EXISTS idx_acks_doc ON acks(doc_id);
 mod tests {
     use super::*;
     use crate::dao;
+    use sha2::{Digest, Sha256};
     use tacit_core::{
         AnchorCapabilities, Frontier, NatCapability, PeerId, SnapshotKind, TrustState,
     };
@@ -209,6 +384,14 @@ mod tests {
 
     fn pid(s: &str) -> PeerId {
         PeerId(s.into())
+    }
+
+    /// 计算内容的 SHA256 哈希。
+    fn content_hash(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        hex::encode(result)
     }
 
     #[test]
@@ -219,6 +402,7 @@ mod tests {
             doc_id: tacit_core::DocId::new("d1"),
             kind: "note".into(),
             current_frontier: Frontier::from_iter([(pid("1"), 5)]),
+            current_snapshot_id: None,
             updated_at: SystemTime::now(),
         };
         dao::upsert_doc(&conn, &rec).unwrap();
@@ -247,6 +431,7 @@ mod tests {
             last_endpoint: Some(tacit_core::Endpoint::new("127.0.0.1", 8080)),
             nat_capability: NatCapability::Direct,
             relay_hint: None,
+            success_ema: 1.0,
         };
         dao::upsert_peer(&conn, &peer).unwrap();
         let got = dao::get_peer(&conn, &pid("1")).unwrap().unwrap();
@@ -290,6 +475,7 @@ mod tests {
                     doc_id: tacit_core::DocId::new("d1"),
                     kind: "note".into(),
                     current_frontier: Frontier::new(),
+                    current_snapshot_id: None,
                     updated_at: SystemTime::now(),
                 },
             )?;
@@ -300,5 +486,175 @@ mod tests {
         let conn = store.conn();
         let got = dao::get_doc(&conn, &tacit_core::DocId::new("d1")).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn transaction_with_conn_works() {
+        // 验证 transaction_with_conn 能在外部持有锁时正常执行事务
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let r: CoreResult<()> = store.transaction_with_conn(&conn, |conn| {
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: tacit_core::DocId::new("d1"),
+                    kind: "note".into(),
+                    current_frontier: Frontier::new(),
+                    current_snapshot_id: None,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            Ok(())
+        });
+        assert!(r.is_ok());
+        // 验证写入成功
+        let got = dao::get_doc(&conn, &tacit_core::DocId::new("d1")).unwrap();
+        assert!(got.is_some());
+    }
+
+    #[test]
+    fn transaction_with_conn_rollback() {
+        // 验证 transaction_with_conn 在失败时正确回滚
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let r: CoreResult<()> = store.transaction_with_conn(&conn, |conn| {
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: tacit_core::DocId::new("d1"),
+                    kind: "note".into(),
+                    current_frontier: Frontier::new(),
+                    current_snapshot_id: None,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            Err(tacit_core::CoreError::Internal("模拟失败".into()))
+        });
+        assert!(r.is_err());
+        // 回滚后不应存在
+        let got = dao::get_doc(&conn, &tacit_core::DocId::new("d1")).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn transaction_detects_reentrant_deadlock() {
+        // 验证 transaction() 在已持有 conn() 锁时返回错误而非死锁
+        let store = Store::open_memory().unwrap();
+        let _conn = store.conn(); // 持有锁
+        let result: CoreResult<()> = store.transaction(|_| Ok(()));
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("transaction_with_conn"),
+            "错误信息应引导使用 transaction_with_conn: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_snapshot_atomically_basic() {
+        // 验证完整的双缓冲安装流程
+        let store = Store::open_memory().unwrap();
+        // 先创建文档
+        {
+            let conn = store.conn();
+            dao::upsert_doc(
+                &conn,
+                &dao::DocRecord {
+                    doc_id: tacit_core::DocId::new("doc1"),
+                    kind: "note".into(),
+                    current_frontier: Frontier::new(),
+                    updated_at: SystemTime::now(),
+                    current_snapshot_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let snapshot = b"snapshot_payload";
+        let hash = content_hash(snapshot);
+        let frontier = Frontier::from_iter([(pid("1"), 10)]);
+        store
+            .install_snapshot_atomically("doc1", snapshot, &hash, &frontier, "Full")
+            .unwrap();
+
+        // 验证 pending snapshot 已写入
+        let conn = store.conn();
+        let pending_id = tacit_core::CheckpointId::new(format!("__pending_{}", hash));
+        let snap = dao::get_snapshot(&conn, &tacit_core::DocId::new("doc1"), &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap.0, snapshot);
+
+        // 验证 documents.current_frontier 已更新
+        let doc = dao::get_doc(&conn, &tacit_core::DocId::new("doc1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.current_frontier, frontier);
+    }
+
+    #[test]
+    fn install_snapshot_atomically_rejects_empty() {
+        // 验证空 snapshot 被拒绝
+        let store = Store::open_memory().unwrap();
+        let hash = content_hash(b"unused");
+        let r = store.install_snapshot_atomically(
+            "doc1",
+            b"",
+            &hash,
+            &Frontier::new(),
+            "Full",
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn install_snapshot_atomically_cleans_old_pending() {
+        // 验证安装新快照时清理旧的 pending snapshot
+        let store = Store::open_memory().unwrap();
+        // 先创建文档
+        {
+            let conn = store.conn();
+            dao::upsert_doc(
+                &conn,
+                &dao::DocRecord {
+                    doc_id: tacit_core::DocId::new("doc1"),
+                    kind: "note".into(),
+                    current_frontier: Frontier::new(),
+                    updated_at: SystemTime::now(),
+                    current_snapshot_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // 第一次安装
+        let hash1 = content_hash(b"snap1");
+        store
+            .install_snapshot_atomically("doc1", b"snap1", &hash1, &Frontier::new(), "Full")
+            .unwrap();
+        // 第二次安装（应清理第一次的 pending）
+        let hash2 = content_hash(b"snap2");
+        store
+            .install_snapshot_atomically("doc1", b"snap2", &hash2, &Frontier::new(), "Full")
+            .unwrap();
+
+        let conn = store.conn();
+        // 旧的 pending 应被删除
+        let old_pending = dao::get_snapshot(
+            &conn,
+            &tacit_core::DocId::new("doc1"),
+            &tacit_core::CheckpointId::new(format!("__pending_{}", hash1)),
+        )
+        .unwrap();
+        assert!(old_pending.is_none(), "旧 pending snapshot 应被删除");
+        // 新的 pending 应存在
+        let new_pending = dao::get_snapshot(
+            &conn,
+            &tacit_core::DocId::new("doc1"),
+            &tacit_core::CheckpointId::new(format!("__pending_{}", hash2)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new_pending.0, b"snap2");
     }
 }

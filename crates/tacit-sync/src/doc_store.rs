@@ -10,7 +10,7 @@
 //! - 导出 delta/snapshot 供传输
 //! - 与 Store 协调持久化 frontier/snapshot
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -34,6 +34,9 @@ pub struct DocStore {
     cache: BlockDocCache,
     /// doc_id -> MetaDoc。常驻内存。
     metas: Mutex<HashMap<DocId, Arc<MetaDoc>>>,
+    /// 脏 block 集合：(doc_id, block_id) — 已编辑但未持久化 snapshot 的 block。
+    /// apply_local_edit 时标记，flush_dirty_blocks 时批量写入并清空。
+    dirty_blocks: Mutex<HashSet<(DocId, BlockId)>>,
 }
 
 impl DocStore {
@@ -44,6 +47,7 @@ impl DocStore {
             store,
             cache: BlockDocCache::new(cache_capacity),
             metas: Mutex::new(HashMap::new()),
+            dirty_blocks: Mutex::new(HashSet::new()),
         }
     }
 
@@ -79,6 +83,7 @@ impl DocStore {
                 kind: kind.to_string(),
                 current_frontier: frontier,
                 updated_at: SystemTime::now(),
+                current_snapshot_id: None,
             },
         )?;
         Ok(())
@@ -151,6 +156,7 @@ impl DocStore {
                     kind: doc_kind,
                     current_frontier: frontier,
                     updated_at: SystemTime::now(),
+                    current_snapshot_id: None,
                 },
             )?;
             Ok(())
@@ -189,6 +195,9 @@ impl DocStore {
     }
 
     /// 应用本地编辑到 block。
+    ///
+    /// 写放大优化：仅更新 frontier（轻量 DB 写），block snapshot 延迟到 flush_dirty_blocks 时批量写入。
+    /// 调用方应在同步前或定期调用 flush_dirty_blocks 确保持久化。
     pub fn apply_local_edit(
         &self,
         doc_id: &DocId,
@@ -197,25 +206,15 @@ impl DocStore {
     ) -> CoreResult<ApplyResult> {
         let block = self.get_block(doc_id, block_id)?;
         let result = block.apply_edit(edit_bytes)?;
-        // 持久化 block snapshot（写放大防御：Phase 0 简化为每次都写）
-        let snap = block.export_snapshot()?;
-        // 更新 doc frontier（取 meta 与 block 的并集）
+        // 更新 doc frontier（轻量 DB 写，仅更新 frontier 记录）
         let meta = self.open_doc(doc_id)?;
         let meta_frontier = meta.frontier()?;
         let mut frontier = meta_frontier;
         frontier.merge(&result.new_frontier);
         // 预取 doc kind（避免在持锁期间再次获取锁导致死锁）
         let doc_kind = self.doc_kind(doc_id)?;
-        // 在单事务中原子写入 block snapshot + doc frontier
+        // 仅更新 frontier，不写 block snapshot（延迟到 flush）
         self.store.transaction(|conn| {
-            dao::insert_snapshot(
-                conn,
-                doc_id,
-                &CheckpointId::new(block_id.as_str()),
-                &snap,
-                tacit_core::SnapshotKind::Full,
-                SystemTime::now(),
-            )?;
             dao::upsert_doc(
                 conn,
                 &dao::DocRecord {
@@ -223,11 +222,61 @@ impl DocStore {
                     kind: doc_kind,
                     current_frontier: frontier,
                     updated_at: SystemTime::now(),
+                    current_snapshot_id: None,
                 },
             )?;
             Ok(())
         })?;
+        // 标记 block 为脏（待 flush）
+        self.dirty_blocks
+            .lock()
+            .insert((doc_id.clone(), block_id.clone()));
         Ok(result)
+    }
+
+    /// 刷新所有脏 block：批量持久化 snapshot 并清空脏标记。
+    ///
+    /// 应在同步前或定期调用，确保编辑不丢失。
+    /// 返回刷新的 block 数量。
+    pub fn flush_dirty_blocks(&self) -> CoreResult<usize> {
+        let dirty: Vec<(DocId, BlockId)> = {
+            let mut dirty = self.dirty_blocks.lock();
+            if dirty.is_empty() {
+                return Ok(0);
+            }
+            dirty.drain().collect()
+        };
+
+        let count = dirty.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        // 批量写入所有脏 block 的 snapshot
+        self.store.transaction(|conn| {
+            for (doc_id, block_id) in &dirty {
+                if let Some(block) = self.cache.get(block_id) {
+                    let snap = block.export_snapshot()?;
+                    dao::insert_snapshot(
+                        conn,
+                        doc_id,
+                        &CheckpointId::new(block_id.as_str()),
+                        &snap,
+                        tacit_core::SnapshotKind::Full,
+                        SystemTime::now(),
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+
+        tracing::debug!(flushed = count, "已刷新脏 block snapshot");
+        Ok(count)
+    }
+
+    /// 检查是否有未持久化的脏 block。
+    pub fn has_dirty_blocks(&self) -> bool {
+        !self.dirty_blocks.lock().is_empty()
     }
 
     /// 导入远端 block delta/snapshot。
@@ -282,6 +331,7 @@ impl DocStore {
                         kind: doc_kind,
                         current_frontier: frontier,
                         updated_at: SystemTime::now(),
+                        current_snapshot_id: None,
                     },
                 )?;
                 Ok(())
@@ -352,6 +402,15 @@ impl DocStore {
         meta.list_blocks()
     }
 
+    /// 列出所有文档的 ID。
+    ///
+    /// 供首屏恢复冷文档追赶阶段遍历所有文档使用。
+    pub fn list_doc_ids(&self) -> CoreResult<Vec<DocId>> {
+        let conn = self.store.conn();
+        let docs = dao::list_docs(&conn)?;
+        Ok(docs.into_iter().map(|d| d.doc_id).collect())
+    }
+
     /// 列出文档的活跃 block（未删除）。
     pub fn list_active_blocks(&self, doc_id: &DocId) -> CoreResult<Vec<BlockRecord>> {
         let meta = self.open_doc(doc_id)?;
@@ -383,6 +442,7 @@ impl DocStore {
                     kind: doc_kind,
                     current_frontier: frontier,
                     updated_at: SystemTime::now(),
+                    current_snapshot_id: None,
                 },
             )?;
             Ok(())

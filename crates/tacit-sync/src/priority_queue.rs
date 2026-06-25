@@ -124,11 +124,14 @@ impl Default for PriorityQueue {
 }
 
 /// 从 SyncAction 推断其优先级。
+///
+/// `RequestDelta` 的优先级由调用方按场景指定（活跃同步 High / 冷文档追赶 Low），
+/// 其余动作按类型固定：SendData/SendControl 用自身 priority，EmitEvent 固定 Medium。
 fn action_priority(action: &SyncAction) -> Priority {
     match action {
         SyncAction::SendData { priority, .. } => *priority,
         SyncAction::SendControl { priority, .. } => *priority,
-        SyncAction::RequestDelta { .. } => Priority::High,
+        SyncAction::RequestDelta { priority, .. } => *priority,
         SyncAction::EmitEvent(_) => Priority::Medium,
     }
 }
@@ -143,6 +146,17 @@ mod tests {
         PeerId(n.to_string())
     }
 
+    /// 构造一个指定优先级的 RequestDelta 动作。
+    fn delta_action(peer: u64, doc: &str, priority: Priority) -> SyncAction {
+        SyncAction::RequestDelta {
+            peer_id: pid(peer),
+            doc_id: DocId::new(doc),
+            block_id: None,
+            since: tacit_core::Frontier::new(),
+            priority,
+        }
+    }
+
     #[test]
     fn high_priority_pops_first() {
         let q = PriorityQueue::new();
@@ -150,12 +164,7 @@ mod tests {
         q.push(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
             peer_id: pid(1),
         }));
-        q.push(SyncAction::RequestDelta {
-            peer_id: pid(1),
-            doc_id: DocId::new("d1"),
-            block_id: None,
-            since: tacit_core::Frontier::new(),
-        });
+        q.push(delta_action(1, "d1", Priority::High));
 
         let first = q.pop().unwrap();
         assert!(matches!(first, SyncAction::RequestDelta { .. }));
@@ -165,18 +174,8 @@ mod tests {
     fn same_priority_fifo() {
         let q = PriorityQueue::new();
         // 两个相同优先级（High）的 RequestDelta
-        q.push(SyncAction::RequestDelta {
-            peer_id: pid(1),
-            doc_id: DocId::new("d1"),
-            block_id: None,
-            since: tacit_core::Frontier::new(),
-        });
-        q.push(SyncAction::RequestDelta {
-            peer_id: pid(2),
-            doc_id: DocId::new("d2"),
-            block_id: None,
-            since: tacit_core::Frontier::new(),
-        });
+        q.push(delta_action(1, "d1", Priority::High));
+        q.push(delta_action(2, "d2", Priority::High));
 
         let first = q.pop().unwrap();
         if let SyncAction::RequestDelta { peer_id, .. } = first {
@@ -200,12 +199,7 @@ mod tests {
             }),
             priority: Priority::Medium,
         });
-        q.push(SyncAction::RequestDelta {
-            peer_id: pid(1),
-            doc_id: DocId::new("d1"),
-            block_id: None,
-            since: tacit_core::Frontier::new(),
-        });
+        q.push(delta_action(1, "d1", Priority::High));
 
         let drained = q.drain();
         assert_eq!(drained.len(), 2);
@@ -224,5 +218,76 @@ mod tests {
         }));
         assert!(!q.is_empty());
         assert_eq!(q.len(), 1);
+    }
+
+    /// 验证 Priority::Low 正确排序：Low 动作应排在 High 和 Medium 之后。
+    /// 此测试确保冷文档追赶 / checkpoint 类低优动作不会阻塞热数据。
+    #[test]
+    fn low_priority_pops_last() {
+        let q = PriorityQueue::new();
+        // 按 Low → High → Medium 顺序入队，期望弹出顺序为 High, Medium, Low
+        q.push(delta_action(1, "cold", Priority::Low));
+        q.push(delta_action(2, "hot", Priority::High));
+        q.push(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
+            peer_id: pid(3),
+        }));
+
+        let first = q.pop().unwrap();
+        assert!(
+            matches!(first, SyncAction::RequestDelta { priority: Priority::High, .. } ),
+            "High 应最先弹出"
+        );
+
+        let second = q.pop().unwrap();
+        assert!(
+            matches!(second, SyncAction::EmitEvent(_)),
+            "Medium（EmitEvent）应第二弹出"
+        );
+
+        let third = q.pop().unwrap();
+        assert!(
+            matches!(third, SyncAction::RequestDelta { priority: Priority::Low, .. } ),
+            "Low 应最后弹出"
+        );
+
+        assert!(q.pop().is_none(), "队列应为空");
+    }
+
+    /// 验证同优先级 Low 动作之间保持 FIFO 公平性。
+    #[test]
+    fn low_priority_fifo_order() {
+        let q = PriorityQueue::new();
+        q.push(delta_action(1, "cold1", Priority::Low));
+        q.push(delta_action(2, "cold2", Priority::Low));
+
+        let first = q.pop().unwrap();
+        if let SyncAction::RequestDelta { peer_id, priority, .. } = first {
+            assert_eq!(priority, Priority::Low);
+            assert_eq!(peer_id, pid(1), "同优先级 Low 应 FIFO");
+        } else {
+            panic!("期望 RequestDelta");
+        }
+    }
+
+    /// 验证 drain 对 Low/High 混合的正确排序。
+    #[test]
+    fn drain_low_after_high() {
+        let q = PriorityQueue::new();
+        q.push(delta_action(1, "cold", Priority::Low));
+        q.push(delta_action(2, "hot", Priority::High));
+        q.push(delta_action(3, "cold2", Priority::Low));
+
+        let drained = q.drain();
+        assert_eq!(drained.len(), 3);
+        // High 在前，两个 Low 在后（FIFO）
+        assert!(
+            matches!(drained[0], SyncAction::RequestDelta { priority: Priority::High, .. })
+        );
+        assert!(
+            matches!(drained[1], SyncAction::RequestDelta { priority: Priority::Low, .. })
+        );
+        assert!(
+            matches!(drained[2], SyncAction::RequestDelta { priority: Priority::Low, .. })
+        );
     }
 }

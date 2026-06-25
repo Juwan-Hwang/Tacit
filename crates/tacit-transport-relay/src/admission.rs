@@ -64,14 +64,30 @@ pub fn verify_proof(proof: &AdmissionProof, secret: &[u8], max_age_secs: u64) ->
         .map_err(|e| CoreError::Crypto(format!("HMAC 初始化失败: {e}")))?;
     mac.update(proof.peer_id.as_bytes());
     mac.update(&proof.timestamp_ms.to_be_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
+    let expected_bytes = mac.finalize().into_bytes();
 
-    // 常量时间比较
-    if expected != proof.signature {
+    // 解码客户端提供的签名为原始字节
+    let provided_bytes = hex::decode(&proof.signature).unwrap_or_default();
+
+    // 常量时间比较（防止时序攻击）
+    // 注意：不能直接用 String != 比较，那是短路比较，会泄露前缀信息
+    if !constant_time_eq(&expected_bytes, &provided_bytes) {
         return Err(CoreError::Crypto("proof 签名无效".into()));
     }
 
     Ok(())
+}
+
+/// 常量时间字节比较，防止时序攻击。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 pub mod command_bus;
 pub mod doc_executor;
 pub mod engine;
+pub mod error;
 pub mod event_bus;
 pub mod listener;
 pub mod runtime;
@@ -20,9 +21,10 @@ pub mod view;
 pub use command_bus::{Command, CommandBus, CommandBusError, CommandBuffer};
 pub use doc_executor::{DocActor, DocExecutorRegistry};
 pub use engine::TacitEngine;
+pub use error::TacitFfiError;
 pub use event_bus::{EventBus, EventFilter, SubscriptionId};
-pub use listener::TacitEventListener;
+pub use listener::{ForeignEventListener, TacitEventListener};
 pub use runtime::{RuntimeConfig, RuntimeState, RuntimeSupervisor};
-pub use view::{DocumentView, SyncStatus};
+pub use view::{DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus};
 
 uniffi::setup_scaffolding!();

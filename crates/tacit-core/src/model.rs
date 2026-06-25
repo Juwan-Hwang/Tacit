@@ -139,6 +139,8 @@ pub enum PathHint {
 pub struct PresenceHint {
     /// group_id。
     pub group_id: String,
+    /// 广播设备自身的标识（用于 DiscoveryFrame 的 device_id 字段）。
+    pub device_id: String,
     /// 设备能力位。
     pub capabilities: AnchorCapabilities,
     /// 可达端点（可选）。
@@ -146,7 +148,7 @@ pub struct PresenceHint {
 }
 
 /// peer 记录，对应 `peers` 表。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub peer_id: PeerId,
     /// 设备公钥（hex 或 base64）。
@@ -159,6 +161,8 @@ pub struct PeerRecord {
     pub nat_capability: NatCapability,
     /// relay hint：建议使用的 relay peer。
     pub relay_hint: Option<PeerId>,
+    /// 成功率指数移动平均（0.0 ~ 1.0），用于 Anchor 选举排序。
+    pub success_ema: f64,
 }
 
 /// peer 在线状态摘要。

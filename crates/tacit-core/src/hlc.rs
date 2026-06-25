@@ -64,6 +64,11 @@ impl Hlc {
     ///
     /// 取物理时间较大者；若相等则 logical 取较大者 + 1。
     pub fn receive(&mut self, remote: &Hlc) -> Hlc {
+        tracing::trace!(
+            remote_physical = remote.physical_ms,
+            remote_logical = remote.logical,
+            "HLC receive"
+        );
         let now = Self::wall_millis();
         let new_physical = self.physical_ms.max(remote.physical_ms).max(now);
         if new_physical == self.physical_ms && new_physical == remote.physical_ms {
@@ -80,16 +85,23 @@ impl Hlc {
         *self
     }
 
-    /// 转为 u64 紧凑表示（高 48 位物理时间，低 16 位 logical）。
+    /// 转为 u64 紧凑表示（高 44 位物理时间，低 20 位 logical）。
+    ///
+    /// 44 位物理时间覆盖到约 year 2525；20 位 logical 允许同一毫秒内
+    /// 1,048,576 次 tick，远超实际需求，避免 logical 截断丢数据。
     pub fn to_compact(&self) -> u64 {
-        ((self.physical_ms as u64) << 16) | (self.logical as u64 & 0xFFFF)
+        // 物理时间取低 44 位（当前时间戳远小于 2^44，不会溢出）
+        let physical = (self.physical_ms as u64) & 0xFFFFFFFFFFF; // 44 bits
+        // logical 取低 20 位（u32 最大值远大于 2^20，需检查溢出）
+        let logical = (self.logical as u64) & 0xFFFFF; // 20 bits
+        (physical << 20) | logical
     }
 
     /// 从紧凑表示解析。
     pub fn from_compact(v: u64) -> Self {
         Self {
-            physical_ms: (v >> 16) as i64,
-            logical: (v & 0xFFFF) as u32,
+            physical_ms: (v >> 20) as i64,
+            logical: (v & 0xFFFFF) as u32,
         }
     }
 }
@@ -184,6 +196,30 @@ mod tests {
         let hlc = Hlc {
             physical_ms: 123456,
             logical: 42,
+        };
+        let compact = hlc.to_compact();
+        let restored = Hlc::from_compact(compact);
+        assert_eq!(hlc, restored);
+    }
+
+    #[test]
+    fn compact_roundtrip_large_logical() {
+        // 验证 logical 不再被截断为 16 位（旧 bug：65536+ 会丢失）
+        let hlc = Hlc {
+            physical_ms: 123456,
+            logical: 100_000, // > 65535，旧实现会截断
+        };
+        let compact = hlc.to_compact();
+        let restored = Hlc::from_compact(compact);
+        assert_eq!(hlc, restored, "logical 应完整保留，不应被截断");
+    }
+
+    #[test]
+    fn compact_roundtrip_max_logical() {
+        // 20 位上限 = 1,048,575
+        let hlc = Hlc {
+            physical_ms: 1_700_000_000_000, // 接近当前时间戳
+            logical: 0xFFFFF,               // 20 位最大值
         };
         let compact = hlc.to_compact();
         let restored = Hlc::from_compact(compact);

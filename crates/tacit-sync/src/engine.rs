@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::Mutex;
 use tacit_core::{
     AckSummary, BlockId, ChangeEnvelope, CoreResult, DocId, Frontier, FrontierOps,
-    PeerId, PeerSummary, Priority, SyncReason, TelemetryCollector,
+    PeerId, PeerSummary, Priority, SyncReason, TelemetryCollector, Viewport,
 };
 use tacit_transport::{ControlMsg, PathPreference};
 use tracing::debug;
@@ -54,11 +54,15 @@ pub enum SyncAction {
         priority: Priority,
     },
     /// 请求对端发送自 since 之后的 delta。
+    ///
+    /// `priority` 由调用方按场景指定：活跃文档同步用 High，
+    /// 冷文档追赶/后台补齐用 Low。
     RequestDelta {
         peer_id: PeerId,
         doc_id: DocId,
         block_id: Option<BlockId>,
         since: Frontier,
+        priority: Priority,
     },
     /// 事件通知（供 UI/日志）。
     EmitEvent(tacit_core::CoreEvent),
@@ -70,7 +74,6 @@ struct PeerSyncState {
     /// peer 已知的 frontier（按 doc 聚合）。
     known_frontier: Frontier,
     /// 最后一次在线时间（用于 stale 判定）。
-    #[allow(dead_code)]
     last_seen: SystemTime,
     /// 是否在线。
     online: bool,
@@ -85,7 +88,10 @@ pub trait SyncEngine: Send + Sync {
     /// 请求同步。
     fn request_sync(&self, peer_id: PeerId, reason: SyncReason) -> CoreResult<()>;
     /// fast-resume。
-    fn fast_resume(&self) -> CoreResult<()>;
+    ///
+    /// `viewport` 为视口信息（可见 block 范围），传入后首屏恢复会优先加载
+    /// 视口内 block；传 None 则跳过"可见 block 优先"阶段，直接加载全部活跃 block。
+    fn fast_resume(&self, viewport: Option<Viewport>) -> CoreResult<()>;
 }
 
 /// 默认 SyncEngine 实现。
@@ -209,18 +215,45 @@ impl DefaultSyncEngine {
         self.hot_path.enter_normal();
     }
 
+    /// 清理 stale peer：移除超过 `max_age` 未活跃的 peer 状态。
+    ///
+    /// 返回被移除的 peer 列表。调用方可据此通知 PeerRegistry 撤销 peer。
+    /// 此方法利用 `PeerSyncState.last_seen` 字段进行判定。
+    pub fn cleanup_stale_peers(&self, max_age: std::time::Duration) -> Vec<PeerId> {
+        let mut states = self.peer_states.lock();
+        let now = SystemTime::now();
+        let mut removed = Vec::new();
+        states.retain(|peer_id, state| {
+            let stale = now
+                .duration_since(state.last_seen)
+                .map(|d| d > max_age)
+                .unwrap_or(false);
+            if stale {
+                removed.push(peer_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !removed.is_empty() {
+            debug!(count = removed.len(), "清理 stale peer 状态");
+        }
+        removed
+    }
+
     /// 处理依赖等待重试。
     ///
-    /// 取出到期的等待条目，重新发起拉取请求。
+    /// 取出到期的等待条目，从 observed_frontier 增量拉取（而非从头拉取）。
     pub fn process_pending(&self, now: Instant) -> CoreResult<()> {
         let ready = self.pending.drain_ready(now);
         for fetch in ready {
-            // 重新发起拉取请求
+            // 从 observed_frontier 增量拉取，避免每次从头拉取完整 delta
             self.push_action(SyncAction::RequestDelta {
                 peer_id: fetch.peer_id.clone(),
                 doc_id: fetch.doc_id.clone(),
                 block_id: Some(fetch.block_id.clone()),
-                since: Frontier::new(), // 从头拉（简化：实际应从 observed_frontier 拉）
+                since: fetch.observed_frontier.clone(),
+                priority: Priority::High,
             });
             // 重新入队等待下次重试
             self.pending.requeue(fetch, now);
@@ -288,19 +321,36 @@ impl DefaultSyncEngine {
     ) -> CoreResult<()> {
         let result = self.doc_store.import_meta(doc_id, bytes)?;
         if result.changed {
+            // 获取 peer 已知的 meta frontier，作为 block 的 expected_frontier
+            // （peer 的 meta 到此 frontier 时引用的 block 应可拉取到此版本）
+            let peer_known_frontier = {
+                let states = self.peer_states.lock();
+                states
+                    .get(peer_id)
+                    .map(|s| s.known_frontier.clone())
+                    .unwrap_or_default()
+            };
+
             // 检查是否有新 block 需要拉取
             let blocks = self.doc_store.list_active_blocks(doc_id)?;
             for block in blocks {
-                // 如果本地没有该 block 的 snapshot，加入依赖等待
                 let local_frontier = self.doc_store.block_frontier(doc_id, &block.block_id);
-                if local_frontier.is_err() {
+                // 入队条件：block 完全缺失，或本地 block frontier 落后于 peer 已知 frontier
+                let need_fetch = match &local_frontier {
+                    Err(_) => true,
+                    Ok(local) => !local.covers(&peer_known_frontier),
+                };
+                if need_fetch {
+                    let observed = local_frontier.unwrap_or_default();
                     self.pending.enqueue(PendingBlockFetch {
                         doc_id: doc_id.clone(),
                         block_id: block.block_id.clone(),
-                        expected_frontier: Frontier::new(),
+                        expected_frontier: peer_known_frontier.clone(),
+                        observed_frontier: observed,
                         peer_id: peer_id.clone(),
                         retry_at: Instant::now(),
                         retries: 0,
+                        phase: crate::pending::BackoffPhase::Normal,
                     });
                     self.push_action(SyncAction::EmitEvent(
                         tacit_core::CoreEvent::SyncBlockedOnDependency {
@@ -366,6 +416,7 @@ impl DefaultSyncEngine {
                 doc_id: doc_id.clone(),
                 block_id: None,
                 since: local_meta_frontier.clone(),
+                priority: Priority::High,
             });
         }
 
@@ -392,6 +443,7 @@ impl DefaultSyncEngine {
                     doc_id: doc_id.clone(),
                     block_id: Some(block.block_id.clone()),
                     since: local_block_frontier.clone(),
+                    priority: Priority::High,
                 });
             }
         }
@@ -401,6 +453,18 @@ impl DefaultSyncEngine {
     /// 推送动作到优先级队列。
     pub(crate) fn push_action(&self, action: SyncAction) {
         self.actions.push(action);
+    }
+
+    /// 返回当前所有在线 peer 的 ID 列表。
+    ///
+    /// 供 recovery 编排器在冷文档追赶阶段为每个在线 peer 生成低优 RequestDelta。
+    pub fn online_peers(&self) -> Vec<PeerId> {
+        let states = self.peer_states.lock();
+        states
+            .iter()
+            .filter(|(_, s)| s.online)
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 }
 
@@ -424,19 +488,26 @@ impl SyncEngine for DefaultSyncEngine {
                 },
             );
         }
-        // 对所有已知 doc 发送 ack 摘要给 peer
+        // 对所有已知 doc 发送 ack 摘要给 peer。
+        // AckSummary 表示"本设备对该 doc 已确认到哪个 frontier"，
+        // 因此 ack_frontier 应为本地 meta frontier，而非 peer 报告的 frontier。
         let docs = {
             let conn = self.doc_store.store().conn();
             tacit_store::dao::list_docs(&conn)?
         };
         for doc in docs {
+            // 读取本地 meta frontier；若 doc 尚无 meta（刚创建），用空 frontier 兜底
+            let local_frontier = self
+                .doc_store
+                .meta_frontier(&doc.doc_id)
+                .unwrap_or_default();
             self.push_action(SyncAction::SendControl {
                 peer_id: peer_id.clone(),
                 msg: ControlMsg::AckSummary(AckSummary {
                     peer_id: self.config.peer_id.clone(),
                     doc_id: doc.doc_id.clone(),
                     ack_checkpoint: None,
-                    ack_frontier: summary.frontier.clone(),
+                    ack_frontier: local_frontier,
                     updated_at: SystemTime::now(),
                 }),
                 priority: Priority::Medium,
@@ -450,6 +521,8 @@ impl SyncEngine for DefaultSyncEngine {
             peer_id: peer_id.clone(),
             reason,
         }));
+        // 同步前先刷新脏 block，确保最新编辑已持久化
+        self.doc_store.flush_dirty_blocks()?;
         // 先收集 doc 列表再释放 conn 锁，避免 run_push_pull 内部再次获取 conn 导致死锁
         let docs = {
             let conn = self.doc_store.store().conn();
@@ -464,10 +537,10 @@ impl SyncEngine for DefaultSyncEngine {
         Ok(())
     }
 
-    fn fast_resume(&self) -> CoreResult<()> {
+    fn fast_resume(&self, viewport: Option<Viewport>) -> CoreResult<()> {
         // 首屏恢复策略：Meta-Document 骨架 → 可见 block → 活跃文档剩余 block → 冷文档追赶
         let coord = crate::recovery::RecoveryCoordinator::new(self.doc_store.clone());
-        coord.first_screen_recovery(self, None)?;
+        coord.first_screen_recovery(self, viewport)?;
         Ok(())
     }
 }
@@ -603,7 +676,7 @@ mod tests {
             .create_block(&DocId::new("d1"), BlockId::new("b1"), tacit_core::BlockKind::Text)
             .unwrap();
         // fast_resume 不应报错
-        engine.fast_resume().unwrap();
+        engine.fast_resume(None).unwrap();
     }
 
     #[test]
@@ -615,9 +688,11 @@ mod tests {
             doc_id: DocId::new("d1"),
             block_id: BlockId::new("b1"),
             expected_frontier: Frontier::new(),
+            observed_frontier: Frontier::new(),
             peer_id: pid(2),
             retry_at: now,
             retries: 0,
+            phase: crate::pending::BackoffPhase::Normal,
         });
         // 处理到期条目
         engine.process_pending(now).unwrap();

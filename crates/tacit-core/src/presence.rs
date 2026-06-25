@@ -123,7 +123,10 @@ impl PresenceRegistry {
     pub fn gc(&self) {
         let now = SystemTime::now();
         let mut entries = self.entries.write();
+        let before = entries.len();
         entries.retain(|_, entry| !entry.is_expired(now));
+        let count = before - entries.len();
+        tracing::debug!(count, "清理过期 presence 条目");
     }
 
     /// 列出所有未过期的 presence。

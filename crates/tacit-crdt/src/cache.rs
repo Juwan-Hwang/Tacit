@@ -20,7 +20,6 @@ struct CacheEntry {
 }
 
 /// 冷 block 保留的 snapshot。
-#[allow(dead_code)]
 struct ColdEntry {
     snapshot: Vec<u8>,
     evicted_at: Instant,
@@ -65,41 +64,70 @@ impl BlockDocCache {
     /// 插入 block。若超出容量，返回被 evict 的 (BlockId, BlockDoc)。
     ///
     /// 调用方应将被 evict 的 BlockDoc 导出 snapshot 持久化。
-    /// pinned block 不会被淘汰。
+    /// pinned block 不会被淘汰，除非所有条目都被 pinned 且超出容量，
+    /// 此时强制淘汰最旧的 pinned 条目以防内存无限增长。
     pub fn insert(&self, block_id: BlockId, doc: Arc<BlockDoc>) -> Option<(BlockId, Arc<BlockDoc>)> {
-        let mut entries = self.entries.lock();
-        entries.insert(
-            block_id.clone(),
-            CacheEntry {
-                doc,
-                last_access: Instant::now(),
-            },
-        );
-        if entries.len() > self.capacity {
+        // 在 entries 锁内：插入新条目、决定 evict_id、取出被淘汰的 doc
+        let evicted = {
+            let mut entries = self.entries.lock();
+            entries.insert(
+                block_id.clone(),
+                CacheEntry {
+                    doc,
+                    last_access: Instant::now(),
+                },
+            );
+            if entries.len() <= self.capacity {
+                return None;
+            }
+
             let pinned = self.pinned.lock();
-            // 找到 last_access 最小且非 pinned 的条目 evict
+            // 优先淘汰非 pinned 中最旧的条目
             let evict_id = entries
                 .iter()
                 .filter(|(k, _)| !pinned.contains(*k))
                 .min_by_key(|(_, e)| e.last_access)
                 .map(|(k, _)| k.clone());
+
+            let evict_id = match evict_id {
+                Some(id) => Some(id),
+                None => {
+                    // 所有条目都被 pinned：若超出硬上限，强制淘汰最旧的 pinned 条目
+                    let hard_cap = self.capacity.saturating_mul(2).max(self.capacity + 1);
+                    if entries.len() > hard_cap {
+                        tracing::warn!(
+                            entries = entries.len(),
+                            hard_cap,
+                            "所有 block 被 pinned，强制淘汰最旧 pinned 条目以防 OOM"
+                        );
+                        entries
+                            .iter()
+                            .min_by_key(|(_, e)| e.last_access)
+                            .map(|(k, _)| k.clone())
+                    } else {
+                        None
+                    }
+                }
+            };
             drop(pinned);
 
-            if let Some(evict_id) = evict_id {
-                let evicted = entries.remove(&evict_id)?;
-                // 保留冷 block snapshot
-                if let Ok(snap) = evicted.doc.export_snapshot() {
-                    self.cold.lock().insert(
-                        evict_id.clone(),
-                        ColdEntry {
-                            snapshot: snap,
-                            evicted_at: Instant::now(),
-                        },
-                    );
-                }
-                return Some((evict_id, evicted.doc));
+            // 取出被淘汰的条目（仍在 entries 锁内），随后释放 entries 锁
+            evict_id.and_then(|id| entries.remove(&id).map(|e| (id, e)))
+        };
+        // entries 锁已释放，在锁外导出 snapshot 并写入 cold（避免持锁耗时）
+
+        if let Some((evict_id, evicted)) = evicted {
+            // 保留冷 block snapshot
+            if let Ok(snap) = evicted.doc.export_snapshot() {
+                self.cold.lock().insert(
+                    evict_id.clone(),
+                    ColdEntry {
+                        snapshot: snap,
+                        evicted_at: Instant::now(),
+                    },
+                );
             }
-            // 所有 block 都被 pinned，不淘汰
+            return Some((evict_id, evicted.doc));
         }
         None
     }
@@ -156,6 +184,23 @@ impl BlockDocCache {
     /// 清理冷 block snapshot（例如内存压力时）。
     pub fn clear_cold(&self) {
         self.cold.lock().clear();
+    }
+
+    /// 清理过期的冷 block snapshot。
+    ///
+    /// 移除 `max_age` 时间前被淘汰的冷 block snapshot，
+    /// 避免冷缓存无限增长。返回清理的条目数。
+    pub fn cleanup_stale_cold(&self, max_age: std::time::Duration) -> usize {
+        let mut cold = self.cold.lock();
+        let now = Instant::now();
+        let before = cold.len();
+        cold.retain(|_, entry| now.duration_since(entry.evicted_at) < max_age);
+        before - cold.len()
+    }
+
+    /// 冷缓存条目数。
+    pub fn cold_len(&self) -> usize {
+        self.cold.lock().len()
     }
 }
 
@@ -225,5 +270,29 @@ mod tests {
         let snap = cache.get_cold_snapshot(&BlockId::new("b1"));
         assert!(snap.is_some());
         assert!(!snap.unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_pinned_force_evicts_at_hard_cap() {
+        // capacity=1, hard_cap=2：插入 2 个 pinned block 不淘汰，第 3 个强制淘汰
+        let cache = BlockDocCache::new(1);
+        // 先 pin 再 insert，避免 insert 时因未 pinned 被常规淘汰
+        cache.pin(&BlockId::new("b1"));
+        cache.insert(BlockId::new("b1"), make_block("b1"));
+        cache.pin(&BlockId::new("b2"));
+        cache.insert(BlockId::new("b2"), make_block("b2"));
+        // 此时 entries.len()=2 == hard_cap(2)，所有条目 pinned，不淘汰
+        assert!(cache.get(&BlockId::new("b1")).is_some());
+        assert!(cache.get(&BlockId::new("b2")).is_some());
+        // 插入 b3（也先 pin），entries.len()=3 > hard_cap(2)，强制淘汰最旧 pinned
+        cache.pin(&BlockId::new("b3"));
+        let evicted = cache.insert(BlockId::new("b3"), make_block("b3"));
+        assert!(evicted.is_some(), "超出硬上限应强制淘汰 pinned 条目");
+        let (evicted_id, _) = evicted.unwrap();
+        // b1 是最旧的（先插入），应被淘汰
+        assert_eq!(evicted_id, BlockId::new("b1"));
+        assert!(cache.get(&BlockId::new("b1")).is_none());
+        assert!(cache.get(&BlockId::new("b2")).is_some());
+        assert!(cache.get(&BlockId::new("b3")).is_some());
     }
 }

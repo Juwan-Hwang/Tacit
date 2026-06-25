@@ -10,10 +10,14 @@
 
 pub mod identity;
 pub mod noise;
+pub mod pairing;
 pub mod session;
 pub mod signature;
 
 pub use identity::{DeviceIdentity, PeerPubkey};
 pub use noise::{NoiseHandshake, NoiseRole, HandshakeResult};
+pub use pairing::{
+    compute_binding_digest, derive_sas_code, generate_binding_salt, verify_binding, PairingPayload,
+};
 pub use session::Session;
 pub use signature::{sign, verify};

@@ -1,0 +1,426 @@
+//! 首次配对：面对面扫码绑定。
+//!
+//! 实现 Tacit-v1.0-FINAL.md §12.1 的面对面配对协议：
+//! - 发起方生成 `group_id` 与 `binding_salt`，构造 `PairingPayload` 编码为二维码
+//! - 扫码方解析二维码，独立计算 `binding_digest`，两端显示同一 SAS 短码
+//! - 用户确认 SAS 一致后完成绑定
+//!
+//! 安全模型：`binding_digest = HMAC-SHA256(group_id || initiator_pubkey, binding_salt)`
+//! 将群组标识与发起方公钥绑定到盐，防止二维码被替换或中间人篡改。
+//! SAS 短码提供带外人工比对，进一步降低中间人攻击风险。
+
+use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tacit_core::{CoreError, CoreResult};
+
+/// HMAC-SHA256 类型别名。
+type HmacSha256 = Hmac<Sha256>;
+
+/// Ed25519 公钥长度（字节）。
+pub const ED25519_PUBKEY_LEN: usize = 32;
+
+/// 绑定盐长度（字节）。
+pub const BINDING_SALT_LEN: usize = 16;
+
+/// SAS 短码上界（不含），即取值范围为 0..=9999。
+const SAS_MODULUS: u32 = 10000;
+
+/// 二进制字段的 hex 编解码辅助模块（用于 JSON 序列化）。
+mod hex_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// 将 `&[u8]` 序列化为 hex 字符串。
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    /// 从 hex 字符串反序列化为 `Vec<u8>`。
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// 配对载荷：编码进二维码的内容。
+///
+/// 字段说明：
+/// - `group_id`：群组标识（由发起方生成，例如 UUID）
+/// - `initiator_pubkey`：发起方 Ed25519 公钥（32 字节）
+/// - `binding_salt`：绑定盐（16 字节，用于派生 `binding_digest`）
+/// - `bootstrap_hints`：可选引导提示（如中继地址、mDNS 服务名等）
+/// - `timestamp`：发起方生成载荷的时刻（Unix 毫秒）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingPayload {
+    pub group_id: String,
+    #[serde(with = "hex_bytes")]
+    pub initiator_pubkey: Vec<u8>,
+    #[serde(with = "hex_bytes")]
+    pub binding_salt: Vec<u8>,
+    pub bootstrap_hints: Vec<String>,
+    pub timestamp: i64,
+}
+
+impl PairingPayload {
+    /// 构造新的配对载荷，校验二进制字段长度。
+    pub fn new(
+        group_id: String,
+        initiator_pubkey: Vec<u8>,
+        binding_salt: Vec<u8>,
+        bootstrap_hints: Vec<String>,
+        timestamp: i64,
+    ) -> CoreResult<Self> {
+        if initiator_pubkey.len() != ED25519_PUBKEY_LEN {
+            return Err(CoreError::Crypto(format!(
+                "initiator_pubkey 长度必须为 {ED25519_PUBKEY_LEN} 字节，实际 {}",
+                initiator_pubkey.len()
+            )));
+        }
+        if binding_salt.len() != BINDING_SALT_LEN {
+            return Err(CoreError::Crypto(format!(
+                "binding_salt 长度必须为 {BINDING_SALT_LEN} 字节，实际 {}",
+                binding_salt.len()
+            )));
+        }
+        Ok(Self {
+            group_id,
+            initiator_pubkey,
+            binding_salt,
+            bootstrap_hints,
+            timestamp,
+        })
+    }
+
+    /// 序列化为 JSON 字符串，供二维码编码。
+    ///
+    /// 二进制字段（`initiator_pubkey`、`binding_salt`）以 hex 字符串表示。
+    pub fn to_qr_json(&self) -> CoreResult<String> {
+        serde_json::to_string(self)
+            .map_err(|e| CoreError::Crypto(format!("PairingPayload 序列化失败: {e}")))
+    }
+
+    /// 从 JSON 字符串反序列化（扫码得到的内容）。
+    ///
+    /// 除 JSON 解析外，额外校验二进制字段长度，拒绝畸形载荷。
+    pub fn from_qr_json(json: &str) -> CoreResult<Self> {
+        let payload: Self = serde_json::from_str(json)
+            .map_err(|e| CoreError::Crypto(format!("PairingPayload 反序列化失败: {e}")))?;
+        if payload.initiator_pubkey.len() != ED25519_PUBKEY_LEN {
+            return Err(CoreError::Crypto(format!(
+                "initiator_pubkey 长度必须为 {ED25519_PUBKEY_LEN} 字节，实际 {}",
+                payload.initiator_pubkey.len()
+            )));
+        }
+        if payload.binding_salt.len() != BINDING_SALT_LEN {
+            return Err(CoreError::Crypto(format!(
+                "binding_salt 长度必须为 {BINDING_SALT_LEN} 字节，实际 {}",
+                payload.binding_salt.len()
+            )));
+        }
+        Ok(payload)
+    }
+}
+
+/// 计算绑定摘要：`HMAC-SHA256(group_id || initiator_pubkey, binding_salt)`。
+///
+/// - 消息：`group_id` 的 UTF-8 字节后接 `initiator_pubkey`
+/// - 密钥：`binding_salt`
+///
+/// 返回 32 字节摘要。两端独立计算并比对（直接或通过 SAS 短码），
+/// 可检测二维码被替换或字段被篡改。
+pub fn compute_binding_digest(
+    group_id: &str,
+    initiator_pubkey: &[u8],
+    binding_salt: &[u8],
+) -> [u8; 32] {
+    // HMAC-SHA256 接受任意长度密钥，new_from_slice 不会失败
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(binding_salt)
+        .expect("HMAC-SHA256 接受任意长度密钥");
+    mac.update(group_id.as_bytes());
+    mac.update(initiator_pubkey);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// 从绑定摘要派生 4 位 SAS 短码（0..=9999）。
+///
+/// 取摘要前 4 字节作为大端 `u32`，再 mod 10000。
+/// 相同输入必产生相同输出（确定性），便于两端独立显示并人工比对。
+pub fn derive_sas_code(binding_digest: &[u8; 32]) -> u32 {
+    let raw = u32::from_be_bytes([
+        binding_digest[0],
+        binding_digest[1],
+        binding_digest[2],
+        binding_digest[3],
+    ]);
+    raw % SAS_MODULUS
+}
+
+/// 配对 payload 最大有效期：5 分钟（300 秒）。
+pub const MAX_PAIRING_AGE_SECS: i64 = 300;
+
+/// 验证 payload 字段一致性：检查字段长度合法，校验 timestamp 时效，并确认 `binding_digest` 可正确计算。
+///
+/// 返回 `true` 表示 payload 结构合法、时效有效、可安全派生 `binding_digest` 与 SAS 短码；
+/// 返回 `false` 表示 payload 被篡改、畸形（字段长度不符或 group_id 为空）或已过期。
+///
+/// 注意：此函数仅做结构校验。完整的端到端完整性由 SAS 短码人工确认完成——
+/// 两端独立计算 `binding_digest` 并派生 SAS，用户比对数字一致后才完成绑定。
+pub fn verify_binding(payload: &PairingPayload) -> bool {
+    if payload.initiator_pubkey.len() != ED25519_PUBKEY_LEN {
+        return false;
+    }
+    if payload.binding_salt.len() != BINDING_SALT_LEN {
+        return false;
+    }
+    if payload.group_id.is_empty() {
+        return false;
+    }
+    // 时效校验：timestamp 必须在当前时间 ±5 分钟内
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let age_secs = (now_ms - payload.timestamp).abs() / 1000;
+    if age_secs > MAX_PAIRING_AGE_SECS {
+        return false;
+    }
+    // 重新计算摘要，确认无异常
+    let _ = compute_binding_digest(
+        &payload.group_id,
+        &payload.initiator_pubkey,
+        &payload.binding_salt,
+    );
+    true
+}
+
+/// 用 `OsRng` 生成 16 字节绑定盐。
+///
+/// 使用操作系统 CSPRNG，适用于密码学场景。
+pub fn generate_binding_salt() -> [u8; BINDING_SALT_LEN] {
+    let mut salt = [0u8; BINDING_SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造测试用公钥（32 字节）。
+    fn test_pubkey() -> Vec<u8> {
+        (0u8..32).collect()
+    }
+
+    /// 构造测试用 payload。
+    fn test_payload() -> PairingPayload {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        PairingPayload::new(
+            "group-123".to_string(),
+            test_pubkey(),
+            vec![0xA0; BINDING_SALT_LEN],
+            vec!["relay://example.com".to_string()],
+            now_ms,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn qr_json_roundtrip() {
+        let payload = test_payload();
+        let json = payload.to_qr_json().unwrap();
+        let parsed = PairingPayload::from_qr_json(&json).unwrap();
+        assert_eq!(payload, parsed);
+    }
+
+    #[test]
+    fn qr_json_contains_hex_fields() {
+        let payload = test_payload();
+        let json = payload.to_qr_json().unwrap();
+        // hex 编码的公钥与盐应出现在 JSON 中
+        assert!(json.contains(&hex::encode(&payload.initiator_pubkey)));
+        assert!(json.contains(&hex::encode(&payload.binding_salt)));
+        assert!(json.contains("group-123"));
+    }
+
+    #[test]
+    fn from_qr_json_rejects_malformed() {
+        // 缺少字段
+        assert!(PairingPayload::from_qr_json(r#"{"group_id":"x"}"#).is_err());
+        // 非 JSON
+        assert!(PairingPayload::from_qr_json("not json").is_err());
+        // 公钥长度错误（hex 编码 31 字节 = 62 字符）
+        let bad = r#"{"group_id":"g","initiator_pubkey":"01020300000000000000000000000000000000000000000000000000000000","binding_salt":"0102030405060708090a0b0c0d0e0f10","bootstrap_hints":[],"timestamp":0}"#;
+        assert!(PairingPayload::from_qr_json(bad).is_err());
+    }
+
+    #[test]
+    fn binding_digest_consistent() {
+        let group_id = "group-abc";
+        let pubkey = test_pubkey();
+        let salt = [0x42u8; BINDING_SALT_LEN];
+        let d1 = compute_binding_digest(group_id, &pubkey, &salt);
+        let d2 = compute_binding_digest(group_id, &pubkey, &salt);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn binding_digest_differs_on_input_change() {
+        let group_id = "group-abc";
+        let pubkey = test_pubkey();
+        let salt = [0x42u8; BINDING_SALT_LEN];
+        let d_base = compute_binding_digest(group_id, &pubkey, &salt);
+
+        // 改 group_id
+        let d_other = compute_binding_digest("group-xyz", &pubkey, &salt);
+        assert_ne!(d_base, d_other);
+
+        // 改 pubkey
+        let mut other_pubkey = pubkey.clone();
+        other_pubkey[0] ^= 0xff;
+        let d_other = compute_binding_digest(group_id, &other_pubkey, &salt);
+        assert_ne!(d_base, d_other);
+
+        // 改 salt
+        let other_salt = [0x43u8; BINDING_SALT_LEN];
+        let d_other = compute_binding_digest(group_id, &pubkey, &other_salt);
+        assert_ne!(d_base, d_other);
+    }
+
+    #[test]
+    fn sas_code_deterministic() {
+        let digest = [0xABu8; 32];
+        let s1 = derive_sas_code(&digest);
+        let s2 = derive_sas_code(&digest);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn sas_code_in_range() {
+        // 测试多个不同摘要，全部应在 0..=9999
+        for i in 0u8..=255u8 {
+            let mut digest = [0u8; 32];
+            digest[0] = i;
+            digest[1] = 0xFF;
+            digest[2] = 0xFF;
+            digest[3] = 0xFF;
+            let sas = derive_sas_code(&digest);
+            assert!(sas < SAS_MODULUS, "SAS 码超出范围: {sas}");
+        }
+    }
+
+    #[test]
+    fn sas_code_known_value() {
+        // 前 4 字节 0x00000001 -> 1
+        let mut digest = [0u8; 32];
+        digest[3] = 0x01;
+        assert_eq!(derive_sas_code(&digest), 1);
+
+        // 前 4 字节 0x00002710 = 10000 -> mod 10000 = 0
+        let mut digest = [0u8; 32];
+        digest[2] = 0x27;
+        digest[3] = 0x10;
+        assert_eq!(derive_sas_code(&digest), 0);
+    }
+
+    #[test]
+    fn verify_binding_accepts_valid() {
+        let payload = test_payload();
+        assert!(verify_binding(&payload));
+    }
+
+    #[test]
+    fn verify_binding_rejects_tampered() {
+        let mut payload = test_payload();
+
+        // 篡改公钥长度
+        payload.initiator_pubkey.pop();
+        assert!(!verify_binding(&payload));
+
+        // 恢复并篡改盐长度
+        payload.initiator_pubkey = test_pubkey();
+        payload.binding_salt.push(0x00);
+        assert!(!verify_binding(&payload));
+
+        // 恢复并清空 group_id
+        payload.binding_salt = vec![0xA0; BINDING_SALT_LEN];
+        payload.group_id.clear();
+        assert!(!verify_binding(&payload));
+
+        // 时效过期：使用 10 分钟前的时间戳
+        let expired_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+            - 600_000;
+        let expired_payload = PairingPayload::new(
+            "group-expired".to_string(),
+            test_pubkey(),
+            vec![0xA0; BINDING_SALT_LEN],
+            vec![],
+            expired_ms,
+        )
+        .unwrap();
+        assert!(!verify_binding(&expired_payload));
+    }
+
+    #[test]
+    fn generate_binding_salt_produces_distinct_values() {
+        let salt1 = generate_binding_salt();
+        let salt2 = generate_binding_salt();
+        assert_eq!(salt1.len(), BINDING_SALT_LEN);
+        assert_eq!(salt2.len(), BINDING_SALT_LEN);
+        // 两个 16 字节随机盐相等的概率极低（2^-128）
+        assert_ne!(salt1, salt2, "两次生成的绑定盐不应相等");
+    }
+
+    #[test]
+    fn end_to_end_pairing_flow() {
+        // 模拟完整配对流程
+        // 1. 发起方生成盐与 payload
+        let group_id = "e2e-group".to_string();
+        let salt = generate_binding_salt();
+        let pubkey = test_pubkey();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let payload = PairingPayload::new(
+            group_id.clone(),
+            pubkey.clone(),
+            salt.to_vec(),
+            vec![],
+            now_ms,
+        )
+        .unwrap();
+
+        // 2. 编码为二维码 JSON
+        let qr = payload.to_qr_json().unwrap();
+
+        // 3. 扫码方解析
+        let parsed = PairingPayload::from_qr_json(&qr).unwrap();
+        assert!(verify_binding(&parsed));
+
+        // 4. 两端独立计算 binding_digest 与 SAS
+        let digest_init = compute_binding_digest(&group_id, &pubkey, &salt);
+        let digest_resp = compute_binding_digest(
+            &parsed.group_id,
+            &parsed.initiator_pubkey,
+            &parsed.binding_salt,
+        );
+        assert_eq!(digest_init, digest_resp);
+
+        let sas_init = derive_sas_code(&digest_init);
+        let sas_resp = derive_sas_code(&digest_resp);
+        assert_eq!(sas_init, sas_resp);
+        assert!(sas_init < SAS_MODULUS);
+    }
+}

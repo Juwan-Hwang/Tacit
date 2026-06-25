@@ -3,6 +3,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use tacit_core::{CoreError, CoreResult, PeerId};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// peer 公钥（Ed25519 验证密钥，32 字节）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,20 +36,21 @@ impl PeerPubkey {
         Self::from_bytes(&bytes)
     }
 
-    /// 派生 PeerId（公钥的 hex 前 16 字符）。
+    /// 派生 PeerId（公钥的 hex 前 32 字符，128bit）。
     pub fn to_peer_id(&self) -> PeerId {
-        PeerId::new(&self.to_hex()[..16])
+        PeerId::new(&self.to_hex()[..32])
     }
 }
 
 /// 持久化的 X25519 密钥对（私钥 + 公钥）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct StaticKeypair {
     pub private: [u8; 32],
     pub public: [u8; 32],
 }
 
 /// 设备身份：签名密钥 + 静态密钥。
+#[derive(ZeroizeOnDrop)]
 pub struct DeviceIdentity {
     /// Ed25519 签名密钥。
     signing_key: SigningKey,

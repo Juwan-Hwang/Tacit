@@ -38,7 +38,7 @@ pub use doc_store::DocStore;
 pub use engine::{DefaultSyncEngine, EngineConfig, SyncAction, SyncEngine};
 pub use hot_path::{HotPathConfig, HotPathController, HotPathMode};
 pub use peer_registry::PeerRegistry;
-pub use pending::{PendingBlockFetch, PendingFetchQueue};
+pub use pending::{BackoffPhase, PendingBlockFetch, PendingFetchQueue};
 pub use priority_queue::PriorityQueue;
 pub use recovery::{
     FirstScreenStage, RecoveryCoordinator, RecoveryStage, RecoveryState,

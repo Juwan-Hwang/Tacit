@@ -113,6 +113,21 @@ impl BatchSigner {
     }
 }
 
+/// 批次验证结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchVerifyResult {
+    /// 帧已接受，批次仍在进行中（或单帧模式无需验证）。
+    Accepted,
+    /// 批次结束且签名验证通过。
+    Verified,
+    /// 批次结束但签名不匹配（可能被篡改）。
+    Mismatch,
+    /// 收到 BatchMiddle/BatchEnd 但无活跃批次（状态错乱）。
+    NoActiveBatch,
+    /// 收到 BatchEnd 但未提供签名（安全降级，不再静默接受）。
+    MissingSignature,
+}
+
 /// 批次验证器：接收端验证批次签名。
 pub struct BatchVerifier {
     /// 按文档维护累积 hash。
@@ -133,34 +148,58 @@ impl BatchVerifier {
     }
 
     /// 接收一帧，根据 batch_flag 更新状态。
+    ///
+    /// `signature`：仅 BatchEnd 帧需要提供（发送方计算的批次签名），
+    /// 其他帧传 None。返回验证结果。
     pub fn receive_frame(
         &self,
         peer_id: &PeerId,
         doc_id: &DocId,
         payload: &[u8],
         flag: BatchFlag,
-    ) {
+        signature: Option<&[u8]>,
+    ) -> BatchVerifyResult {
         let mut hashes = self.hashes.lock();
         let key = (peer_id.clone(), doc_id.clone());
         match flag {
             BatchFlag::Single => {
-                // 单帧模式，无需累积
+                // 单帧模式，无需累积验证
+                BatchVerifyResult::Accepted
             }
             BatchFlag::BatchStart => {
                 let mut hasher = Sha256::new();
                 hasher.update(payload);
                 hashes.insert(key, hasher);
+                BatchVerifyResult::Accepted
             }
             BatchFlag::BatchMiddle => {
                 if let Some(hasher) = hashes.get_mut(&key) {
                     hasher.update(payload);
+                    BatchVerifyResult::Accepted
+                } else {
+                    BatchVerifyResult::NoActiveBatch
                 }
             }
             BatchFlag::BatchEnd => {
                 if let Some(mut hasher) = hashes.remove(&key) {
                     hasher.update(payload);
-                    // 最终 hash 可用于验证
-                    let _final_hash = hasher.finalize();
+                    let final_hash = hasher.finalize();
+                    match signature {
+                        Some(sig) => {
+                            // 常量时间比较，防止时序攻击
+                            if constant_time_eq(&final_hash, sig) {
+                                BatchVerifyResult::Verified
+                            } else {
+                                BatchVerifyResult::Mismatch
+                            }
+                        }
+                        None => {
+                            // 收到 BatchEnd 但未提供签名，安全降级：拒绝而非静默接受
+                            BatchVerifyResult::MissingSignature
+                        }
+                    }
+                } else {
+                    BatchVerifyResult::NoActiveBatch
                 }
             }
         }
@@ -172,6 +211,18 @@ impl BatchVerifier {
         let key = (peer_id.clone(), doc_id.clone());
         hashes.remove(&key);
     }
+}
+
+/// 常量时间字节比较，防止时序攻击。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -203,20 +254,68 @@ mod tests {
         let peer = PeerId::new("1");
         let doc = DocId::new("d1");
         // 单帧模式不应累积
-        verifier.receive_frame(&peer, &doc, b"data", BatchFlag::Single);
-        // 不应 panic
+        let result = verifier.receive_frame(&peer, &doc, b"data", BatchFlag::Single, None);
+        assert_eq!(result, BatchVerifyResult::Accepted);
     }
 
     #[test]
-    fn batch_verifier_full_cycle() {
+    fn batch_verifier_full_cycle_verified() {
+        let signer = BatchSigner::new();
         let verifier = BatchVerifier::new();
         let peer = PeerId::new("1");
         let doc = DocId::new("d1");
 
-        verifier.receive_frame(&peer, &doc, b"f1", BatchFlag::BatchStart);
-        verifier.receive_frame(&peer, &doc, b"f2", BatchFlag::BatchMiddle);
-        verifier.receive_frame(&peer, &doc, b"f3", BatchFlag::BatchEnd);
-        // 不应 panic，批次状态应已清理
+        // 发送方构建批次并签名
+        signer.start_batch(&peer, &doc);
+        signer.add_frame(&peer, &doc, b"f1");
+        signer.add_frame(&peer, &doc, b"f2");
+        let sig = signer.end_batch(&peer, &doc).unwrap();
+
+        // 接收方验证
+        let r1 = verifier.receive_frame(&peer, &doc, b"f1", BatchFlag::BatchStart, None);
+        assert_eq!(r1, BatchVerifyResult::Accepted);
+        let r2 = verifier.receive_frame(&peer, &doc, b"f2", BatchFlag::BatchMiddle, None);
+        assert_eq!(r2, BatchVerifyResult::Accepted);
+        let r3 = verifier.receive_frame(&peer, &doc, b"", BatchFlag::BatchEnd, Some(&sig));
+        assert_eq!(r3, BatchVerifyResult::Verified);
+    }
+
+    #[test]
+    fn batch_verifier_mismatch_detected() {
+        let verifier = BatchVerifier::new();
+        let peer = PeerId::new("1");
+        let doc = DocId::new("d1");
+
+        verifier.receive_frame(&peer, &doc, b"f1", BatchFlag::BatchStart, None);
+        verifier.receive_frame(&peer, &doc, b"f2", BatchFlag::BatchMiddle, None);
+        // 提供错误的签名
+        let wrong_sig = vec![0u8; 32];
+        let r = verifier.receive_frame(&peer, &doc, b"f3", BatchFlag::BatchEnd, Some(&wrong_sig));
+        assert_eq!(r, BatchVerifyResult::Mismatch);
+    }
+
+    #[test]
+    fn batch_verifier_no_active_batch() {
+        let verifier = BatchVerifier::new();
+        let peer = PeerId::new("1");
+        let doc = DocId::new("d1");
+        // 直接发 BatchEnd 而无活跃批次
+        let r = verifier.receive_frame(&peer, &doc, b"data", BatchFlag::BatchEnd, Some(&[0u8; 32]));
+        assert_eq!(r, BatchVerifyResult::NoActiveBatch);
+    }
+
+    #[test]
+    fn batch_verifier_missing_signature_rejected() {
+        let verifier = BatchVerifier::new();
+        let peer = PeerId::new("1");
+        let doc = DocId::new("d1");
+
+        // 构建活跃批次
+        verifier.receive_frame(&peer, &doc, b"f1", BatchFlag::BatchStart, None);
+        verifier.receive_frame(&peer, &doc, b"f2", BatchFlag::BatchMiddle, None);
+        // 收到 BatchEnd 但未提供签名，应返回 MissingSignature 而非 Accepted
+        let r = verifier.receive_frame(&peer, &doc, b"f3", BatchFlag::BatchEnd, None);
+        assert_eq!(r, BatchVerifyResult::MissingSignature);
     }
 
     #[test]

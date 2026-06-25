@@ -428,9 +428,11 @@ fn dependency_wait_and_retry() {
         doc_id: doc_id.clone(),
         block_id: block_id.clone(),
         expected_frontier: tacit_core::Frontier::new(),
+        observed_frontier: tacit_core::Frontier::new(),
         peer_id: pid(2),
         retry_at: now,
         retries: 0,
+        phase: tacit_sync::BackoffPhase::Normal,
     });
     assert_eq!(engine.pending_queue().len(), 1);
 
@@ -493,6 +495,7 @@ fn ble_presence_discovery() {
     // 广播 presence
     let hint = PresenceHint {
         group_id: "g1".into(),
+        device_id: "device-integration".into(),
         capabilities: AnchorCapabilities {
             can_anchor: true,
             can_relay: false,

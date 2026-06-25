@@ -35,8 +35,6 @@ pub struct RelayServer {
     sessions: Mutex<HashMap<String, SessionEntry>>,
     /// peer_id -> session_id（用于转发路由）。
     peer_to_session: Mutex<HashMap<PeerId, String>>,
-    /// session_id 计数器。
-    counter: Mutex<u64>,
 }
 
 impl RelayServer {
@@ -48,7 +46,6 @@ impl RelayServer {
             session_ttl: Duration::from_secs(300),
             sessions: Mutex::new(HashMap::new()),
             peer_to_session: Mutex::new(HashMap::new()),
-            counter: Mutex::new(0),
         }
     }
 
@@ -158,11 +155,21 @@ impl RelayServer {
         self.sessions.lock().len()
     }
 
-    /// 生成 session_id。
+    /// 根据 session_id 查询对应的 peer_id。
+    ///
+    /// 用于网络传输层在收到 Forward 请求时验证发送方身份。
+    pub fn get_session_peer(&self, session_id: &str) -> Option<PeerId> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|e| e.peer_id.clone())
+    }
+
+    /// 生成不可预测的 session_id。
+    ///
+    /// 使用 UUID v4（CSPRNG 随机），防止攻击者猜测其他 session_id。
     fn generate_session_id(&self) -> String {
-        let mut counter = self.counter.lock();
-        *counter += 1;
-        format!("relay_session_{}", *counter)
+        format!("relay_session_{}", uuid::Uuid::new_v4())
     }
 }
 
