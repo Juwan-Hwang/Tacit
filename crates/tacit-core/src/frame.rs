@@ -555,10 +555,6 @@ fn u8_to_data_frame_kind(v: u8) -> Result<DataFrameKind, FrameError> {
     }
 }
 
-// 忽略未使用的导入（保留以备将来使用）
-#[allow(unused_imports)]
-use crate::model::SnapshotChunk;
-
 #[cfg(test)]
 mod tests {
     use super::*;

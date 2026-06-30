@@ -55,12 +55,10 @@ enum BackendState {
 }
 
 impl BackendState {
-    #[allow(dead_code)]
     fn is_broadcasting(&self) -> bool {
         matches!(self, BackendState::Broadcasting | BackendState::BroadcastingAndScanning)
     }
 
-    #[allow(dead_code)]
     fn is_scanning(&self) -> bool {
         matches!(self, BackendState::Scanning | BackendState::BroadcastingAndScanning)
     }
@@ -135,6 +133,21 @@ impl BluerBackend {
         });
 
         Ok(backend)
+    }
+
+    /// 当前广播 payload。
+    pub fn current_payload(&self) -> Option<Vec<u8>> {
+        self.payload.lock().clone()
+    }
+
+    /// 是否正在广播。
+    pub fn is_broadcasting(&self) -> bool {
+        self.state.lock().is_broadcasting()
+    }
+
+    /// 是否正在扫描。
+    pub fn is_scanning(&self) -> bool {
+        self.state.lock().is_scanning()
     }
 
     /// bluez 异步任务主循环。

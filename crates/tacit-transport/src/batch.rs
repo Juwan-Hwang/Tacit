@@ -14,15 +14,12 @@ use sha2::{Digest, Sha256};
 use tacit_core::{BatchFlag, DocId, PeerId};
 
 /// 批次状态。
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug)]
 struct BatchState {
     /// 累积的 payload hash。
     hasher: Sha256,
     /// 批次内帧数。
     frame_count: u32,
-    /// 批次关联的 doc_id。
-    doc_id: DocId,
 }
 
 /// 批次签名管理器。
@@ -59,7 +56,6 @@ impl BatchSigner {
         let state = batches.entry(key).or_insert_with(|| BatchState {
             hasher: Sha256::new(),
             frame_count: 0,
-            doc_id: doc_id.clone(),
         });
         state.hasher.update(payload);
         state.frame_count += 1;
@@ -79,7 +75,6 @@ impl BatchSigner {
             BatchState {
                 hasher: Sha256::new(),
                 frame_count: 0,
-                doc_id: doc_id.clone(),
             },
         );
     }

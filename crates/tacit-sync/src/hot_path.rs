@@ -222,6 +222,7 @@ mod tests {
     fn hot_mode_defers_data_actions() {
         let ctrl = HotPathController::new(HotPathConfig {
             hot_window: Duration::from_secs(10),
+            device_profile: DeviceProfile::Desktop,
         });
         ctrl.trigger_hot();
         assert_eq!(ctrl.current_mode(), HotPathMode::Hot);
@@ -235,6 +236,7 @@ mod tests {
     fn hot_window_expires() {
         let ctrl = HotPathController::new(HotPathConfig {
             hot_window: Duration::from_millis(1),
+            device_profile: DeviceProfile::Desktop,
         });
         ctrl.trigger_hot();
         assert_eq!(ctrl.current_mode(), HotPathMode::Hot);
@@ -246,6 +248,7 @@ mod tests {
     fn partition_separates_actions() {
         let ctrl = HotPathController::new(HotPathConfig {
             hot_window: Duration::from_secs(10),
+            device_profile: DeviceProfile::Desktop,
         });
         ctrl.trigger_hot();
         let actions = vec![data_action(), control_action(), data_action()];
@@ -258,6 +261,7 @@ mod tests {
     fn enter_normal_resets_mode() {
         let ctrl = HotPathController::new(HotPathConfig {
             hot_window: Duration::from_secs(10),
+            device_profile: DeviceProfile::Desktop,
         });
         ctrl.trigger_hot();
         ctrl.enter_normal();

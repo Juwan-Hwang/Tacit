@@ -207,7 +207,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doc_actor_serializes_ops() {
         let registry = DocExecutorRegistry::new();
         let doc_id = DocId::new("d1");
@@ -237,8 +237,8 @@ mod tests {
                 .unwrap();
         }
 
-        // 等待所有操作完成
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 等待所有操作完成（给 spawn_blocking 线程池足够时间）
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 10);
         // 应串行执行，最大并发为 1
         assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);

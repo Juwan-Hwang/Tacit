@@ -1,0 +1,13 @@
+[bindings.kotlin]
+package_name = "io.tacit.sdk"
+generate_immutable_records = false
+async_runtime = "tokio"
+disable_unsigned_integer_types = true
+
+[bindings.swift]
+module_name = "Tacit"
+generate_immutable_records = false
+async_runtime = "tokio"
+
+[bindings.python]
+package_name = "tacit"

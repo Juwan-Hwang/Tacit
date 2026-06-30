@@ -1,0 +1,19 @@
+[package]
+name = "tacit-bindgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UniFFI 绑定代码生成器（Kotlin/Swift）"
+
+[[bin]]
+name = "tacit-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi_bindgen = "0.28"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+camino = "1"

@@ -9,6 +9,7 @@
 //! - 回调事件桥接：CoreEvent 转发到平台层监听器。
 //! - 不返回 LoroDoc 指针，平台层只通过 doc_id 与 blob 交互。
 
+pub mod ble;
 pub mod command_bus;
 pub mod doc_executor;
 pub mod engine;
@@ -18,6 +19,10 @@ pub mod listener;
 pub mod runtime;
 pub mod view;
 
+pub use ble::{
+    ffi_clear_ble_backend, ffi_has_ble_backend, ffi_set_ble_backend, ForeignPresenceBackend,
+    FfiAnchorCapabilities, FfiDiscoveryEvent, FfiEndpoint, FfiPresenceHint,
+};
 pub use command_bus::{Command, CommandBus, CommandBusError, CommandBuffer};
 pub use doc_executor::{DocActor, DocExecutorRegistry};
 pub use engine::TacitEngine;

@@ -18,7 +18,6 @@ use crate::protocol::{ForwardRequest, RelayMessage};
 /// session 条目。
 struct SessionEntry {
     peer_id: PeerId,
-    #[allow(dead_code)]
     created_at: Instant,
     last_active: Instant,
 }
@@ -163,6 +162,16 @@ impl RelayServer {
             .lock()
             .get(session_id)
             .map(|e| e.peer_id.clone())
+    }
+
+    /// 获取 session 的存活时长（从创建到现在）。
+    ///
+    /// 用于监控和诊断：长时间存活的 session 可能需要关注。
+    pub fn session_age(&self, session_id: &str) -> Option<Duration> {
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map(|e| Instant::now().duration_since(e.created_at))
     }
 
     /// 生成不可预测的 session_id。

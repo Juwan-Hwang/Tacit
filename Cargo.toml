@@ -11,6 +11,7 @@ members = [
     "crates/tacit-transport-relay",
     "crates/tacit-sync",
     "crates/tacit-ffi",
+    "crates/tacit-bindgen",
     "crates/tacit-tests",
 ]
 

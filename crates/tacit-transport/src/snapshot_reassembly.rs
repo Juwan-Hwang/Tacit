@@ -20,10 +20,7 @@ pub struct SnapshotReassembler {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct ReassemblyState {
-    /// checkpoint_id。
-    checkpoint_id: CheckpointId,
     /// 已收到的分片：index -> chunk。
     chunks: HashMap<u32, SnapshotChunk>,
     /// 总分片数（收到第一个分片后确定）。
@@ -48,7 +45,6 @@ impl SnapshotReassembler {
         let state = pending
             .entry(checkpoint_id_str.clone())
             .or_insert_with(|| ReassemblyState {
-                checkpoint_id: chunk.checkpoint_id.clone(),
                 chunks: HashMap::new(),
                 total: None,
             });

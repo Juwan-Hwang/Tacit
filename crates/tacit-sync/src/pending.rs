@@ -120,17 +120,20 @@ impl PendingFetchQueue {
 
     /// 取出到期且需要重试的条目。
     ///
-    /// 使用 BTreeMap::split_off 实现 O(log n) 提取，无需遍历全部条目。
+    /// 使用 BTreeMap::range 提取所有 `retry_at <= now` 的条目，O(log n) 复杂度。
     pub fn drain_ready(&self, now: Instant) -> Vec<PendingBlockFetch> {
-        // split_off 返回 >= now 的部分，我们保留它，取走 < now 的部分
         let due_keys: Vec<PendingKey> = {
             let mut time_index = self.time_index.lock();
-            let remaining = time_index.split_off(&now);
-            // split_off 后 time_index 只含 < now 的条目，用 mem::take 取出所有权
-            let due = std::mem::take(&mut *time_index);
-            // 把 >= now 的放回
-            *time_index = remaining;
-            due.into_iter().flat_map(|(_, keys)| keys).collect()
+            // 收集所有 retry_at <= now 的时间点
+            let due_times: Vec<Instant> = time_index
+                .range(..=now)
+                .map(|(&k, _)| k)
+                .collect();
+            // 逐个移除并收集 key
+            due_times
+                .into_iter()
+                .flat_map(|t| time_index.remove(&t).unwrap_or_default())
+                .collect()
         };
         // 从 entries 中取出对应的完整条目
         let mut entries = self.entries.lock();
@@ -193,14 +196,17 @@ impl PendingFetchQueue {
             block_id: block_id.clone(),
             peer_id: peer_id.clone(),
         };
-        // 从 entries 中移除，同时尝试从 time_index 中清理
-        if let Some(fetch) = self.entries.lock().remove(&key) {
-            let retry_at = fetch.retry_at;
-            if let Some(vec) = self.time_index.lock().get_mut(&retry_at) {
-                vec.retain(|k| k != &key);
-                if vec.is_empty() {
-                    self.time_index.lock().remove(&retry_at);
-                }
+        // 先从 entries 中移除，获取 retry_at
+        let retry_at = match self.entries.lock().remove(&key) {
+            Some(fetch) => fetch.retry_at,
+            None => return,
+        };
+        // 再从 time_index 中清理（避免嵌套加锁导致死锁）
+        let mut time_index = self.time_index.lock();
+        if let Some(vec) = time_index.get_mut(&retry_at) {
+            vec.retain(|k| k != &key);
+            if vec.is_empty() {
+                time_index.remove(&retry_at);
             }
         }
     }
