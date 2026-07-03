@@ -10,9 +10,7 @@ use std::time::{Duration, Instant};
 
 use tacit_core::{BlockId, BlockKind, DocId, PeerId, SyncReason};
 use tacit_store::Store;
-use tacit_sync::{
-    DefaultSyncEngine, DocStore, EngineConfig, SyncAction, SyncEngine,
-};
+use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncAction, SyncEngine};
 
 fn pid(n: u64) -> PeerId {
     PeerId(n.to_string())
@@ -40,7 +38,8 @@ fn fast_resume_produces_actions_quickly() {
     let doc_id = DocId::new("doc1");
     let block_id = BlockId::new("b1");
     ds.create_doc(doc_id.clone(), "note").unwrap();
-    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
     ds.apply_local_edit(&doc_id, &block_id, b"initial").unwrap();
 
     // 测量 fast-resume 延迟
@@ -108,10 +107,10 @@ fn priority_queue_orders_correctly() {
     // 验证动作类型正确
     for action in &actions {
         match action {
-            SyncAction::SendData { .. } |
-            SyncAction::SendControl { .. } |
-            SyncAction::RequestDelta { .. } |
-            SyncAction::EmitEvent(_) => { /* 合法动作类型 */ }
+            SyncAction::SendData { .. }
+            | SyncAction::SendControl { .. }
+            | SyncAction::RequestDelta { .. }
+            | SyncAction::EmitEvent(_) => { /* 合法动作类型 */ }
         }
     }
 }

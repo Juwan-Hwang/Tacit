@@ -27,10 +27,7 @@ pub enum ControlMsg {
     /// 缺口请求：请求对端发送自 `since` 之后的 delta。
     NeedRanges(NeedRanges),
     /// 同步意图：表明本端希望开始同步。
-    SyncIntent {
-        peer_id: PeerId,
-        doc_id: DocId,
-    },
+    SyncIntent { peer_id: PeerId, doc_id: DocId },
     /// 传输提示：告知对端本端偏好的传输路径与参数。
     TransportHints(TransportHints),
     /// 中继提示：告知对端可用的中继服务器信息。
@@ -112,4 +109,8 @@ pub struct KeyRotateNotice {
     pub new_pubkey_hex: String,
     /// 轮换序号，单调递增。
     pub rotation_seq: u64,
+    /// 轮换签名：用**旧**私钥对 `peer_id:new_pubkey_hex:rotation_seq` 的 Ed25519 签名（64 字节）。
+    ///
+    /// 接收方用旧公钥验证，防止第三方伪造轮换通知劫持身份。
+    pub signature: Vec<u8>,
 }

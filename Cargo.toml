@@ -9,6 +9,7 @@ members = [
     "crates/tacit-transport-ble",
     "crates/tacit-transport-quic",
     "crates/tacit-transport-relay",
+    "crates/tacit-transport-sms",
     "crates/tacit-sync",
     "crates/tacit-ffi",
     "crates/tacit-bindgen",
@@ -33,6 +34,7 @@ tacit-transport = { path = "crates/tacit-transport" }
 tacit-transport-ble = { path = "crates/tacit-transport-ble" }
 tacit-transport-quic = { path = "crates/tacit-transport-quic" }
 tacit-transport-relay = { path = "crates/tacit-transport-relay" }
+tacit-transport-sms = { path = "crates/tacit-transport-sms" }
 tacit-sync = { path = "crates/tacit-sync" }
 tacit-ffi = { path = "crates/tacit-ffi" }
 

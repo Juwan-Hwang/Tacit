@@ -108,7 +108,10 @@ impl StoreAndForward {
             )
             .map_err(|e| tacit_core::CoreError::Store(e.to_string()))?;
         if count > 0 {
-            info!(cleaned = count, retention_secs, "清理已确认的 sync_log 记录");
+            info!(
+                cleaned = count,
+                retention_secs, "清理已确认的 sync_log 记录"
+            );
         }
         Ok(count)
     }

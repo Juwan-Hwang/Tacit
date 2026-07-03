@@ -9,9 +9,7 @@
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use tacit_core::{
-    CheckpointId, DocId, SnapshotChunk, SnapshotKind, SnapshotMeta, Watermarks,
-};
+use tacit_core::{CheckpointId, DocId, SnapshotChunk, SnapshotKind, SnapshotMeta, Watermarks};
 use tacit_store::dao;
 use tracing::debug;
 
@@ -32,15 +30,18 @@ pub struct InstallResult {
 }
 
 /// Checkpoint 管理器。
-pub struct CheckpointManager {
-    doc_store: DocStore,
+///
+/// 持有 `DocStore` 引用，避免在 `Arc<DocStore>` 场景下 clone 整个结构。
+pub struct CheckpointManager<'a> {
+    doc_store: &'a DocStore,
     watermark_calc: WatermarkCalculator,
     compact_threshold: u64,
     chunk_size: usize,
 }
 
-impl CheckpointManager {
-    pub fn new(doc_store: DocStore, watermark_calc: WatermarkCalculator) -> Self {
+impl<'a> CheckpointManager<'a> {
+    /// 创建 Checkpoint 管理器（持有 DocStore 引用）。
+    pub fn new_ref(doc_store: &'a DocStore, watermark_calc: WatermarkCalculator) -> Self {
         Self {
             doc_store,
             watermark_calc,
@@ -61,7 +62,9 @@ impl CheckpointManager {
         let conn = self.doc_store.store().conn();
         let acks = dao::list_acks_by_doc(&conn, doc_id)?;
         drop(conn);
-        Ok(self.watermark_calc.compute(doc_id, &acks, SystemTime::now()))
+        Ok(self
+            .watermark_calc
+            .compute(doc_id, &acks, SystemTime::now()))
     }
 
     /// 判断是否需要 compaction，若需要则生成 shallow snapshot 并安装。
@@ -106,9 +109,11 @@ impl CheckpointManager {
         // 收集所有 shallow snapshot 数据
         let mut snapshots: Vec<(CheckpointId, Vec<u8>)> = Vec::new();
         for block in &blocks {
-            let shallow = self
-                .doc_store
-                .export_block_shallow(doc_id, &block.block_id, &watermarks.hard_frontier)?;
+            let shallow = self.doc_store.export_block_shallow(
+                doc_id,
+                &block.block_id,
+                &watermarks.hard_frontier,
+            )?;
             let snapshot_id =
                 tacit_core::CheckpointId::new(format!("{}_{}", checkpoint_id, block.block_id));
             snapshots.push((snapshot_id, shallow));
@@ -315,11 +320,12 @@ impl CheckpointManager {
         checkpoint_id: &CheckpointId,
     ) -> tacit_core::CoreResult<Vec<SnapshotChunk>> {
         let conn = self.doc_store.store().conn();
-        let checkpoint = dao::get_latest_checkpoint(&conn, doc_id)?
-            .ok_or_else(|| tacit_core::CoreError::Store(format!(
+        let checkpoint = dao::get_latest_checkpoint(&conn, doc_id)?.ok_or_else(|| {
+            tacit_core::CoreError::Store(format!(
                 "checkpoint 不存在: doc_id={}, checkpoint_id={}",
                 doc_id, checkpoint_id
-            )))?;
+            ))
+        })?;
         drop(conn);
 
         let blob = if checkpoint.shallow_snapshot_blob.is_empty() {
@@ -328,10 +334,8 @@ impl CheckpointManager {
             let mut chunks_blobs = Vec::new();
             let blocks = self.doc_store.list_active_blocks(doc_id)?;
             for block in &blocks {
-                let sid = tacit_core::CheckpointId::new(format!(
-                    "{}_{}",
-                    checkpoint_id, block.block_id
-                ));
+                let sid =
+                    tacit_core::CheckpointId::new(format!("{}_{}", checkpoint_id, block.block_id));
                 if let Some((blob, _, _)) = dao::get_snapshot(&conn, doc_id, &sid)? {
                     chunks_blobs.extend(blob);
                 }
@@ -371,7 +375,7 @@ fn compute_state_hash(frontier: &tacit_core::Frontier) -> [u8; 32] {
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (peer_id, seq) in entries {
         hasher.update(peer_id.as_bytes());
-        hasher.update(&seq.to_le_bytes());
+        hasher.update(seq.to_le_bytes());
     }
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -410,10 +414,10 @@ mod tests {
     fn evaluate_watermarks_empty_doc() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc);
+        let cm = CheckpointManager::new_ref(&ds, calc);
 
         let doc_id = DocId::new("doc1");
-        let _ = cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
+        cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
 
         let wm = cm.evaluate_watermarks(&doc_id).unwrap();
         assert!(wm.hard_frontier.is_empty());
@@ -424,7 +428,7 @@ mod tests {
     fn maybe_compact_below_threshold() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc);
+        let cm = CheckpointManager::new_ref(&ds, calc);
 
         let doc_id = DocId::new("doc1");
         let block_id = BlockId::new("b1");
@@ -445,7 +449,7 @@ mod tests {
     fn maybe_compact_above_threshold() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc).with_params(1, 1024); // 阈值=1
+        let cm = CheckpointManager::new_ref(&ds, calc).with_params(1, 1024); // 阈值=1
 
         let doc_id = DocId::new("doc1");
         let block_id = BlockId::new("b1");
@@ -465,11 +469,9 @@ mod tests {
                 peer_id: pid(1),
                 doc_id: doc_id.clone(),
                 ack_checkpoint: None,
-                ack_frontier: cm
-                    .doc_store
-                    .block_frontier(&doc_id, &block_id)
-                    .unwrap(),
+                ack_frontier: cm.doc_store.block_frontier(&doc_id, &block_id).unwrap(),
                 updated_at: SystemTime::now(),
+                version_override: None,
             },
         )
         .unwrap();
@@ -487,7 +489,7 @@ mod tests {
     fn chunk_snapshot_produces_chunks() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc).with_params(1, 100); // 分片=100 字节
+        let cm = CheckpointManager::new_ref(&ds, calc).with_params(1, 100); // 分片=100 字节
 
         let doc_id = DocId::new("doc1");
         let block_id = BlockId::new("b1");
@@ -507,11 +509,9 @@ mod tests {
                 peer_id: pid(1),
                 doc_id: doc_id.clone(),
                 ack_checkpoint: None,
-                ack_frontier: cm
-                    .doc_store
-                    .block_frontier(&doc_id, &block_id)
-                    .unwrap(),
+                ack_frontier: cm.doc_store.block_frontier(&doc_id, &block_id).unwrap(),
                 updated_at: SystemTime::now(),
+                version_override: None,
             },
         )
         .unwrap();
@@ -534,7 +534,7 @@ mod tests {
     fn maybe_compact_fills_shallow_snapshot_blob() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc).with_params(1, 1024);
+        let cm = CheckpointManager::new_ref(&ds, calc).with_params(1, 1024);
 
         let doc_id = DocId::new("doc1");
         let block_id = BlockId::new("b1");
@@ -554,11 +554,9 @@ mod tests {
                 peer_id: pid(1),
                 doc_id: doc_id.clone(),
                 ack_checkpoint: None,
-                ack_frontier: cm
-                    .doc_store
-                    .block_frontier(&doc_id, &block_id)
-                    .unwrap(),
+                ack_frontier: cm.doc_store.block_frontier(&doc_id, &block_id).unwrap(),
                 updated_at: SystemTime::now(),
+                version_override: None,
             },
         )
         .unwrap();
@@ -590,7 +588,7 @@ mod tests {
     fn install_snapshot_atomically() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc);
+        let cm = CheckpointManager::new_ref(&ds, calc);
 
         let doc_id = DocId::new("doc1");
         cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();
@@ -620,7 +618,7 @@ mod tests {
     fn install_snapshot_rejects_bad_state_hash() {
         let (ds, _store) = make_doc_store(1);
         let calc = WatermarkCalculator::new(std::time::Duration::from_secs(86400));
-        let cm = CheckpointManager::new(ds, calc);
+        let cm = CheckpointManager::new_ref(&ds, calc);
 
         let doc_id = DocId::new("doc1");
         cm.doc_store.create_doc(doc_id.clone(), "note").unwrap();

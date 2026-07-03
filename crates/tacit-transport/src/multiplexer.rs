@@ -156,9 +156,10 @@ impl TransportMultiplexer {
             .lock()
             .entry(ChannelKind::Ble)
             .or_insert_with(ChannelHealth::new);
-        self.channels
-            .lock()
-            .insert(ChannelKind::Ble, transport.clone() as Arc<dyn SyncTransport>);
+        self.channels.lock().insert(
+            ChannelKind::Ble,
+            transport.clone() as Arc<dyn SyncTransport>,
+        );
         *self.ble_presence.lock() = Some(transport);
         debug!("已注册 BLE 通道（含 presence 广播）");
     }
@@ -272,7 +273,10 @@ impl SyncTransport for TransportMultiplexer {
 
         let mut last_err = None;
         for (kind, transport) in &channels {
-            match transport.send_data(peer_id, frame.clone(), priority, preferred_path).await {
+            match transport
+                .send_data(peer_id, frame.clone(), priority, preferred_path)
+                .await
+            {
                 Ok(()) => {
                     self.record_success(*kind);
                     debug!(channel = ?kind, peer_id = %peer_id, "数据发送成功");
@@ -286,9 +290,8 @@ impl SyncTransport for TransportMultiplexer {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            tacit_core::CoreError::Transport("所有通道均发送失败".into())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| tacit_core::CoreError::Transport("所有通道均发送失败".into())))
     }
 
     async fn send_control(
@@ -320,9 +323,8 @@ impl SyncTransport for TransportMultiplexer {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            tacit_core::CoreError::Transport("所有通道均发送失败".into())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| tacit_core::CoreError::Transport("所有通道均发送失败".into())))
     }
 
     async fn reconnect_peer(&self, peer_id: &PeerId) -> CoreResult<()> {
@@ -520,7 +522,12 @@ mod tests {
         let mux = TransportMultiplexer::new();
 
         let result = mux
-            .send_data(&PeerId::new("p2"), make_frame(), Priority::High, PathPreference::Any)
+            .send_data(
+                &PeerId::new("p2"),
+                make_frame(),
+                Priority::High,
+                PathPreference::Any,
+            )
             .await;
         assert!(result.is_err());
     }
@@ -566,7 +573,10 @@ mod tests {
         // preferred=None 时按 priority_rank 升序排列（与 HashMap 插入序无关）
         let mux = TransportMultiplexer::new();
         // 故意乱序注册，验证排序不依赖插入序
-        mux.register_channel(ChannelKind::StoreAndForward, MockTransport::new("saf", true));
+        mux.register_channel(
+            ChannelKind::StoreAndForward,
+            MockTransport::new("saf", true),
+        );
         mux.register_channel(ChannelKind::Ble, MockTransport::new("ble", true));
         mux.register_channel(ChannelKind::WanQuic, MockTransport::new("wan", true));
         mux.register_channel(ChannelKind::Relay, MockTransport::new("relay", true));
@@ -594,7 +604,10 @@ mod tests {
     fn available_channels_preferred_first_then_priority() {
         // preferred=Some 时该通道排第一，其余按 priority_rank 升序
         let mux = TransportMultiplexer::new();
-        mux.register_channel(ChannelKind::StoreAndForward, MockTransport::new("saf", true));
+        mux.register_channel(
+            ChannelKind::StoreAndForward,
+            MockTransport::new("saf", true),
+        );
         mux.register_channel(ChannelKind::Ble, MockTransport::new("ble", true));
         mux.register_channel(ChannelKind::WanQuic, MockTransport::new("wan", true));
         mux.register_channel(ChannelKind::Relay, MockTransport::new("relay", true));
