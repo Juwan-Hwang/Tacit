@@ -3045,6 +3045,7 @@ dependencies = [
  "tacit-transport-ble",
  "tacit-transport-quic",
  "tacit-transport-relay",
+ "tacit-transport-sms",
  "tempfile",
  "tokio",
 ]
