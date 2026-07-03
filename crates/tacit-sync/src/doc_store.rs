@@ -329,10 +329,12 @@ impl DocStore {
             let result = block.import(bytes)?;
             if result.changed {
                 let new_snap = block.export_snapshot()?;
-                changed_blocks.insert(
-                    block_id.clone(),
-                    (new_snap, kind, old_snap.unwrap_or_default()),
-                );
+                // 使用 entry API：保留首次导入前的 old_snap 用于回滚，
+                // 仅更新 new_snap 为最新 snapshot
+                changed_blocks
+                    .entry(block_id.clone())
+                    .and_modify(|(ns, _, _)| *ns = new_snap.clone())
+                    .or_insert_with(|| (new_snap, kind, old_snap.unwrap_or_default()));
             }
             results.push(result);
         }

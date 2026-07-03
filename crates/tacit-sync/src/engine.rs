@@ -517,17 +517,29 @@ impl DefaultSyncEngine {
             let conn = self.doc_store.store().conn();
             let existing = tacit_store::dao::get_peer(&conn, &msg.introduced_peer)?;
 
-            // 仅在 peer 不存在时创建；已存在的 peer 不覆盖公钥与信任状态（防止降级/劫持）。
-            // 仅当 peer 仍为 Pending 时允许更新 endpoint（Trusted peer 的 endpoint
-            // 只能通过直接连接或密钥轮换等已认证渠道变更，防止第三方 Introduce 消息劫持流量）。
+            // 已存在的 peer：
+            // - Trusted peer：不覆盖公钥/信任状态/endpoint，防止劫持
+            // - Pending peer：允许更新公钥和 endpoint（介绍人已验证为 Trusted）。
+            //   这防止恶意 peer 预注册假公钥锁定 victim peer ID 的攻击。
             if let Some(mut record) = existing {
                 if record.trust_state == tacit_core::TrustState::Pending {
+                    let mut updated = false;
+                    if record.device_pubkey != msg.introduced_pubkey_hex {
+                        record.device_pubkey = msg.introduced_pubkey_hex.clone();
+                        updated = true;
+                    }
                     if let Some(addr) = &msg.endpoint {
-                        record.last_endpoint = Some(parse_endpoint(addr));
+                        let parsed = parse_endpoint(addr);
+                        if record.last_endpoint.as_ref() != Some(&parsed) {
+                            record.last_endpoint = Some(parsed);
+                            updated = true;
+                        }
+                    }
+                    if updated {
                         tacit_store::dao::upsert_peer(&conn, &record)?;
                         debug!(
                             introduced = %msg.introduced_peer,
-                            "远程信任链引入：更新 Pending peer 的 endpoint"
+                            "远程信任链引入：更新 Pending peer 的公钥/endpoint"
                         );
                     }
                 } else {
