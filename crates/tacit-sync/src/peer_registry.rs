@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use parking_lot::Mutex;
 use tacit_core::{Endpoint, PeerId, PeerRecord};
-use tacit_store::{Store, dao};
+use tacit_store::{dao, Store};
 
 /// peer 管理注册表。
 ///
@@ -144,6 +144,7 @@ mod tests {
             nat_capability: NatCapability::Unknown,
             relay_hint: None,
             success_ema: 1.0,
+            rotation_seq: 0,
         }
     }
 

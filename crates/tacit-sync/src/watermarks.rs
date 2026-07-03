@@ -30,12 +30,7 @@ impl WatermarkCalculator {
     ///
     /// `acks`：所有 peer 对该 doc 的 ack 摘要。
     /// `now`：当前时间，用于判断 active 集合。
-    pub fn compute(
-        &self,
-        doc_id: &DocId,
-        acks: &[AckSummary],
-        now: SystemTime,
-    ) -> Watermarks {
+    pub fn compute(&self, doc_id: &DocId, acks: &[AckSummary], now: SystemTime) -> Watermarks {
         // 过滤出该 doc 的 acks
         let doc_acks: Vec<&AckSummary> = acks.iter().filter(|a| &a.doc_id == doc_id).collect();
         if doc_acks.is_empty() {
@@ -45,7 +40,11 @@ impl WatermarkCalculator {
         // active 集合：在 soft_timeout 内有 ack 的 peer
         let active_peers: HashSet<&PeerId> = doc_acks
             .iter()
-            .filter(|a| now.duration_since(a.updated_at).map(|d| d < self.soft_timeout).unwrap_or(false))
+            .filter(|a| {
+                now.duration_since(a.updated_at)
+                    .map(|d| d < self.soft_timeout)
+                    .unwrap_or(false)
+            })
             .map(|a| &a.peer_id)
             .collect();
 
@@ -102,7 +101,10 @@ impl WatermarkCalculator {
         for (peer, _seq) in first.entries() {
             let peer_id = PeerId(peer.to_string());
             // 所有 ack 都必须覆盖该 peer，且取最小 seq
-            let min_seq = acks.iter().map(|a| a.ack_frontier.get(&peer_id).unwrap_or(0)).min();
+            let min_seq = acks
+                .iter()
+                .map(|a| a.ack_frontier.get(&peer_id).unwrap_or(0))
+                .min();
             if let Some(min) = min_seq {
                 if min > 0 {
                     result.set(peer_id, min);
@@ -128,6 +130,7 @@ mod tests {
             ack_checkpoint: None,
             ack_frontier: frontier,
             updated_at: updated,
+            version_override: None,
         }
     }
 
@@ -173,7 +176,12 @@ mod tests {
         let stale = now - Duration::from_secs(120);
         let acks = vec![
             ack(pid(1), "d1", Frontier::from_iter([(pid(1), 5)]), now),
-            ack(pid(2), "d1", Frontier::from_iter([(pid(1), 3), (pid(2), 8)]), stale),
+            ack(
+                pid(2),
+                "d1",
+                Frontier::from_iter([(pid(1), 3), (pid(2), 8)]),
+                stale,
+            ),
         ];
         let w = calc.compute(&DocId::new("d1"), &acks, now);
         // peer2 stale，hard 只含 peer1
