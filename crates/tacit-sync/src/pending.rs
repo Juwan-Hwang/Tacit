@@ -15,9 +15,10 @@ use parking_lot::Mutex;
 use tacit_core::{BlockId, DocId, Frontier, PeerId};
 
 /// 退避阶段：区分正常重试与降级后的后台静默拉取。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackoffPhase {
     /// 正常指数退避阶段。
+    #[default]
     Normal,
     /// 到达退避上限后降级为后台静默拉取（更长间隔，不报错）。
     Background,
@@ -36,12 +37,6 @@ pub struct PendingBlockFetch {
     pub retries: u32,
     /// 当前退避阶段。
     pub phase: BackoffPhase,
-}
-
-impl Default for BackoffPhase {
-    fn default() -> Self {
-        BackoffPhase::Normal
-    }
 }
 
 impl PendingBlockFetch {
@@ -125,10 +120,7 @@ impl PendingFetchQueue {
         let due_keys: Vec<PendingKey> = {
             let mut time_index = self.time_index.lock();
             // 收集所有 retry_at <= now 的时间点
-            let due_times: Vec<Instant> = time_index
-                .range(..=now)
-                .map(|(&k, _)| k)
-                .collect();
+            let due_times: Vec<Instant> = time_index.range(..=now).map(|(&k, _)| k).collect();
             // 逐个移除并收集 key
             due_times
                 .into_iter()
@@ -147,7 +139,7 @@ impl PendingFetchQueue {
     pub fn next_backoff(&self, retries: u32) -> Duration {
         // 指数回退：init * 2^retries，上限 max
         let multiplier = 2u32.saturating_pow(retries.min(20));
-        let backoff = self.backoff_init.saturating_mul(multiplier as u32);
+        let backoff = self.backoff_init.saturating_mul(multiplier);
         if backoff > self.backoff_max {
             self.backoff_max
         } else {
@@ -207,6 +199,38 @@ impl PendingFetchQueue {
             vec.retain(|k| k != &key);
             if vec.is_empty() {
                 time_index.remove(&retry_at);
+            }
+        }
+    }
+
+    /// 批量移除指定 peer 的所有等待条目（peer 被撤销时调用）。
+    pub fn remove_peer(&self, peer_id: &PeerId) {
+        let removed: Vec<(PendingKey, Instant)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|(_, f)| &f.peer_id == peer_id)
+                .map(|(k, f)| (k.clone(), f.retry_at))
+                .collect()
+        };
+        if removed.is_empty() {
+            return;
+        }
+        // 从 entries 中移除
+        {
+            let mut entries = self.entries.lock();
+            for (key, _) in &removed {
+                entries.remove(key);
+            }
+        }
+        // 从 time_index 中清理
+        let mut time_index = self.time_index.lock();
+        for (key, retry_at) in &removed {
+            if let Some(vec) = time_index.get_mut(retry_at) {
+                vec.retain(|k| k != key);
+                if vec.is_empty() {
+                    time_index.remove(retry_at);
+                }
             }
         }
     }
@@ -305,7 +329,10 @@ mod tests {
         let ready = q.drain_ready(now);
         assert_eq!(ready.len(), 1);
         q.requeue(ready.into_iter().next().unwrap(), now);
-        assert_eq!(q.get(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)), Some(1));
+        assert_eq!(
+            q.get(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)),
+            Some(1)
+        );
     }
 
     #[test]

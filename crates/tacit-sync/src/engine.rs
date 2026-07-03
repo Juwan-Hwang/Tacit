@@ -21,8 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 use tacit_core::{
-    AckSummary, BlockId, ChangeEnvelope, CoreResult, DocId, Frontier, FrontierOps,
-    PeerId, PeerSummary, Priority, SyncReason, TelemetryCollector, Viewport,
+    AckSummary, BlockId, ChangeEnvelope, CoreResult, DocId, Frontier, FrontierOps, PeerId,
+    PeerSummary, Priority, SyncReason, TelemetryCollector, Viewport,
 };
 use tacit_transport::{ControlMsg, PathPreference};
 use tracing::debug;
@@ -32,6 +32,50 @@ use crate::hot_path::HotPathController;
 use crate::pending::{PendingBlockFetch, PendingFetchQueue};
 use crate::priority_queue::PriorityQueue;
 use crate::watermarks::WatermarkCalculator;
+
+/// 解析 `host:port` 或 IPv6 端点字符串为 [`tacit_core::Endpoint`]。
+///
+/// 纯字符串解析，**不执行 DNS 查询**（避免阻塞异步线程 + 保留主机名供 TLS/SNI）。
+///
+/// 1. 尝试 `SocketAddr` 解析（覆盖 `IPv4:port` 和 `[IPv6]:port`）
+/// 2. 尝试 `IpAddr` 解析（覆盖裸 IP，端口 0）
+/// 3. 回退 `rfind(':')` 分割（覆盖 `hostname:port`，保留主机名）
+/// 4. 纯主机名（端口 0）
+fn parse_endpoint(addr: &str) -> tacit_core::Endpoint {
+    // 1. SocketAddr：IPv4:port / [IPv6]:port
+    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        return tacit_core::Endpoint::new(socket_addr.ip().to_string(), socket_addr.port());
+    }
+    // 2. 裸 IpAddr（无端口）
+    if let Ok(ip_addr) = addr.parse::<std::net::IpAddr>() {
+        return tacit_core::Endpoint::new(ip_addr.to_string(), 0);
+    }
+    // 3. hostname:port — 保留原始主机名供 TLS/SNI
+    //    对于带方括号的 IPv6（如 [2001:db8::1]:port），仅在 ']' 之后查找端口冒号
+    let colon_idx = if let Some(bracket_idx) = addr.rfind(']') {
+        addr[bracket_idx..].rfind(':').map(|i| bracket_idx + i)
+    } else {
+        addr.rfind(':')
+    };
+
+    if let Some(idx) = colon_idx {
+        let host = &addr[..idx];
+        let port: u16 = addr[idx + 1..].parse().unwrap_or(0);
+        // 去除 IPv6 方括号 [::1]:port → ::1
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        tacit_core::Endpoint::new(host, port)
+    } else {
+        // 4. 纯主机名或带方括号的裸 IPv6（如 [2001:db8::1]）
+        let host = addr
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(addr);
+        tacit_core::Endpoint::new(host, 0)
+    }
+}
 
 /// 同步动作：SyncEngine 产生的待执行动作。
 ///
@@ -306,6 +350,7 @@ impl DefaultSyncEngine {
                     ack_checkpoint: None,
                     ack_frontier: frontier,
                     updated_at: SystemTime::now(),
+                    version_override: None,
                 },
             )?;
         }
@@ -365,25 +410,276 @@ impl DefaultSyncEngine {
     }
 
     /// 推送本地变更给所有在线 peer。
+    ///
+    /// 锁粒度优化：先在锁内 clone 在线 peer ID 列表并释放锁，
+    /// 然后在锁外执行 delta 导出（可能触发 I/O）。
+    /// 避免在持有 `peer_states` Mutex 期间阻塞于 store 操作。
     fn push_local_change(&self, doc_id: &DocId, change: &ChangeEnvelope) -> CoreResult<()> {
-        let peers = self.peer_states.lock();
-        for (peer_id, state) in peers.iter() {
-            if state.online {
-                let bytes = if let Some(block_id) = &change.block_id {
-                    self.doc_store.export_block_delta(doc_id, block_id, &change.frontier)?
+        // 1. 锁内：仅收集在线 peer ID，立刻释放锁
+        let online_peer_ids: Vec<PeerId> = {
+            let peers = self.peer_states.lock();
+            peers
+                .iter()
+                .filter(|(_, state)| state.online)
+                .map(|(peer_id, _)| peer_id.clone())
+                .collect()
+        };
+
+        // 2. 锁外：对每个在线 peer 导出 delta 并推送
+        for peer_id in &online_peer_ids {
+            let bytes = if let Some(block_id) = &change.block_id {
+                self.doc_store
+                    .export_block_delta(doc_id, block_id, &change.frontier)?
+            } else {
+                self.doc_store.export_meta_delta(doc_id, &change.frontier)?
+            };
+            self.push_action(SyncAction::SendData {
+                peer_id: peer_id.clone(),
+                doc_id: doc_id.clone(),
+                block_id: change.block_id.clone(),
+                bytes,
+                priority: Priority::High,
+                path: PathPreference::Any,
+            });
+        }
+        Ok(())
+    }
+
+    /// 处理远端撤销消息：移除 peer 状态并发射事件。
+    ///
+    /// 收到 `RevokePeer` 后：
+    /// 1. 从 `peer_states` 中移除被撤销的 peer
+    /// 2. 清理该 peer 的依赖等待条目
+    /// 3. 发射 `PeerRevoked` 事件供上层（PeerRegistry / UI）处理
+    pub fn handle_revoke(&self, revoked_peer: &PeerId, _reason: &str) -> CoreResult<()> {
+        // 1. 移除 peer 同步状态
+        let was_known = {
+            let mut states = self.peer_states.lock();
+            states.remove(revoked_peer).is_some()
+        };
+
+        // 即使 peer_states 中不存在（例如 peer 仅在 DB 中注册但未在线），
+        // 也需要持久化撤销状态到数据库，防止重启后恢复信任。
+        // 2. 持久化撤销状态到数据库
+        {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::revoke_peer(&conn, revoked_peer)?;
+        }
+
+        if was_known {
+            // 3. 清理该 peer 的依赖等待条目
+            self.pending.remove_peer(revoked_peer);
+
+            // 4. 发射事件
+            self.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::PeerRevoked {
+                peer_id: revoked_peer.clone(),
+            }));
+            debug!(peer = %revoked_peer, "peer 已被撤销，状态已清理并持久化");
+        } else {
+            debug!(peer = %revoked_peer, "peer 已被撤销，状态已持久化（无运行时状态需清理）");
+        }
+
+        Ok(())
+    }
+
+    /// 处理远程信任链引入消息（§12.2 Introduce）。
+    ///
+    /// 收到 `IntroducePeer` 后：
+    /// 1. 校验介绍人是否为已信任的 peer（防止未知 peer 随意引入）
+    /// 2. 将被介绍的 peer 写入 `peers` 表（`TrustState::Pending`），供后续直接连接验证
+    /// 3. 发射 `PeerIntroduced` 事件，供上层（PeerRegistry / UI）感知新 peer
+    /// 4. 若被介绍的 peer 携带 endpoint，可选触发连接尝试（由上层决策）
+    ///
+    /// 安全模型：
+    /// - 介绍人必须是当前已知的在线 peer（`peer_states` 中存在）
+    /// - 被介绍的 peer 初始为 `Pending` 状态，不自动信任
+    /// - 后续需通过 Noise 握手完成身份验证后升级为 `Trusted`
+    pub fn handle_introduce(
+        &self,
+        msg: &tacit_transport::IntroducePeer,
+        sender_peer_id: &PeerId,
+    ) -> CoreResult<()> {
+        // 1. 校验发送者 == 介绍人（防止第三方冒充介绍人发起引入）
+        if sender_peer_id != &msg.introducer {
+            return Err(tacit_core::CoreError::Sync(format!(
+                "介绍消息发送者 {sender_peer_id} 与介绍人 {} 不匹配，拒绝引入",
+                msg.introducer
+            )));
+        }
+
+        // 2. 校验介绍人是否已知且已被信任（Pending peer 不得引入他人）
+        let introducer_trusted = {
+            let conn = self.doc_store.store().conn();
+            match tacit_store::dao::get_peer(&conn, &msg.introducer) {
+                Ok(Some(record)) => record.trust_state == tacit_core::TrustState::Trusted,
+                _ => false,
+            }
+        };
+
+        if !introducer_trusted {
+            return Err(tacit_core::CoreError::Sync(format!(
+                "介绍人 {} 未被信任，拒绝引入未知信任链",
+                msg.introducer
+            )));
+        }
+
+        // 3. 校验被介绍 peer 的公钥 hex 格式（必须是 64 字符 hex，解码为 32 字节）
+        if msg.introduced_pubkey_hex.len() != 64 || hex::decode(&msg.introduced_pubkey_hex).is_err()
+        {
+            return Err(tacit_core::CoreError::Sync(format!(
+                "被介绍的 peer 公钥 hex 格式不合法: {}",
+                msg.introduced_pubkey_hex
+            )));
+        }
+
+        // 4. 将被介绍的 peer 写入 peers 表（Pending 状态）
+        {
+            let conn = self.doc_store.store().conn();
+            let existing = tacit_store::dao::get_peer(&conn, &msg.introduced_peer)?;
+
+            // 已存在的 peer：
+            // - Trusted peer：不覆盖公钥/信任状态/endpoint，防止劫持
+            // - Pending peer：允许更新公钥和 endpoint（介绍人已验证为 Trusted）。
+            //   这防止恶意 peer 预注册假公钥锁定 victim peer ID 的攻击。
+            if let Some(mut record) = existing {
+                if record.trust_state == tacit_core::TrustState::Pending {
+                    let mut updated = false;
+                    if record.device_pubkey != msg.introduced_pubkey_hex {
+                        record.device_pubkey = msg.introduced_pubkey_hex.clone();
+                        updated = true;
+                    }
+                    if let Some(addr) = &msg.endpoint {
+                        let parsed = parse_endpoint(addr);
+                        if record.last_endpoint.as_ref() != Some(&parsed) {
+                            record.last_endpoint = Some(parsed);
+                            updated = true;
+                        }
+                    }
+                    if updated {
+                        tacit_store::dao::upsert_peer(&conn, &record)?;
+                        debug!(
+                            introduced = %msg.introduced_peer,
+                            "远程信任链引入：更新 Pending peer 的公钥/endpoint"
+                        );
+                    }
                 } else {
-                    self.doc_store.export_meta_delta(doc_id, &change.frontier)?
+                    debug!(
+                        introduced = %msg.introduced_peer,
+                        "远程信任链引入：忽略对已信任 peer 的 endpoint 更新以防劫持"
+                    );
+                }
+            } else {
+                let record = tacit_core::PeerRecord {
+                    peer_id: msg.introduced_peer.clone(),
+                    device_pubkey: msg.introduced_pubkey_hex.clone(),
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Pending,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: msg.endpoint.as_ref().map(|addr| parse_endpoint(addr)),
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 0.0,
+                    rotation_seq: 0,
                 };
-                self.push_action(SyncAction::SendData {
-                    peer_id: peer_id.clone(),
-                    doc_id: doc_id.clone(),
-                    block_id: change.block_id.clone(),
-                    bytes,
-                    priority: Priority::High,
-                    path: PathPreference::Any,
-                });
+                tacit_store::dao::upsert_peer(&conn, &record)?;
+                debug!(
+                    introducer = %msg.introducer,
+                    introduced = %msg.introduced_peer,
+                    "远程信任链引入：新 peer 已注册为 Pending"
+                );
             }
         }
+
+        // 3. 发射事件
+        self.push_action(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::PeerIntroduced {
+                introducer: msg.introducer.clone(),
+                introduced_peer: msg.introduced_peer.clone(),
+                introduced_pubkey_hex: msg.introduced_pubkey_hex.clone(),
+                endpoint: msg.endpoint.clone(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    /// 处理密钥轮换通知（§12.2 KeyRotate）。
+    ///
+    /// 收到 `KeyRotateNotice` 后：
+    /// 1. 校验 peer 是否已知（未知的 peer 不允许轮换密钥）
+    /// 2. 校验 `rotation_seq` 单调递增（防止重放攻击）
+    /// 3. 更新 `peers` 表中该 peer 的 `device_pubkey`
+    /// 4. 发射 `PeerKeyRotated` 事件，供上层（Crypto 层 / PeerRegistry）更新密钥缓存
+    ///
+    /// 安全模型：
+    /// - `rotation_seq` 必须大于已存储的序号（从 0 开始，首次轮换为 1）
+    /// - 新公钥写入后，旧公钥立即失效，后续握手使用新公钥验证
+    /// - 轮换不改变 `TrustState`（已信任的 peer 轮换密钥后仍为 Trusted）
+    pub fn handle_key_rotate(&self, msg: &tacit_transport::KeyRotateNotice) -> CoreResult<()> {
+        // 0. 校验新公钥 hex 格式（必须是 64 字符 hex，解码为 32 字节）
+        if msg.new_pubkey_hex.len() != 64 || hex::decode(&msg.new_pubkey_hex).is_err() {
+            return Err(tacit_core::CoreError::Crypto(format!(
+                "新公钥 hex 格式不合法: {}",
+                msg.new_pubkey_hex
+            )));
+        }
+
+        // 1. 校验 peer 是否已知
+        let conn = self.doc_store.store().conn();
+        let existing = tacit_store::dao::get_peer(&conn, &msg.peer_id)?;
+
+        let mut record = existing.ok_or_else(|| {
+            tacit_core::CoreError::PeerNotFound(format!(
+                "密钥轮换失败：peer {} 不在已知列表中",
+                msg.peer_id
+            ))
+        })?;
+
+        // 2. 校验 rotation_seq 单调递增（使用 peers 表中独立的 rotation_seq 列）
+        let current_seq = record.rotation_seq;
+        if msg.rotation_seq <= current_seq {
+            return Err(tacit_core::CoreError::Crypto(format!(
+                "密钥轮换序号不递增：当前 {}，收到 {}（可能是重放攻击）",
+                current_seq, msg.rotation_seq
+            )));
+        }
+
+        // 3. 验证轮换签名：用旧公钥验证，防止第三方伪造轮换通知
+        let sign_message = format!(
+            "{}:{}:{}",
+            msg.peer_id, msg.new_pubkey_hex, msg.rotation_seq
+        );
+        let old_pubkey_bytes = hex::decode(&record.device_pubkey)
+            .map_err(|e| tacit_core::CoreError::Crypto(format!("旧公钥 hex 解码失败: {e}")))?;
+        let old_pubkey_arr: [u8; 32] = old_pubkey_bytes.as_slice().try_into().map_err(|_| {
+            tacit_core::CoreError::Crypto("旧公钥长度不合法（期望 32 字节）".into())
+        })?;
+        tacit_crypto::verify(sign_message.as_bytes(), &msg.signature, &old_pubkey_arr)?;
+
+        // 4. 更新公钥与序号
+        let old_pubkey = record.device_pubkey.clone();
+        record.device_pubkey = msg.new_pubkey_hex.clone();
+        record.rotation_seq = msg.rotation_seq;
+        tacit_store::dao::upsert_peer(&conn, &record)?;
+
+        debug!(
+            peer = %msg.peer_id,
+            old_pubkey = %old_pubkey,
+            new_pubkey = %msg.new_pubkey_hex,
+            seq = msg.rotation_seq,
+            "密钥轮换完成"
+        );
+
+        // 4. 发射事件
+        self.push_action(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::PeerKeyRotated {
+                peer_id: msg.peer_id.clone(),
+                new_pubkey_hex: msg.new_pubkey_hex.clone(),
+                rotation_seq: msg.rotation_seq,
+            },
+        ));
+
         Ok(())
     }
 
@@ -426,7 +722,9 @@ impl DefaultSyncEngine {
             let local_block_frontier = self.doc_store.block_frontier(doc_id, &block.block_id)?;
             if !peer_frontier.covers(&local_block_frontier) {
                 // 本地有 peer 没有的 block 数据，推送
-                let delta = self.doc_store.export_block_delta(doc_id, &block.block_id, &peer_frontier)?;
+                let delta =
+                    self.doc_store
+                        .export_block_delta(doc_id, &block.block_id, &peer_frontier)?;
                 self.push_action(SyncAction::SendData {
                     peer_id: peer_id.clone(),
                     doc_id: doc_id.clone(),
@@ -509,6 +807,7 @@ impl SyncEngine for DefaultSyncEngine {
                     ack_checkpoint: None,
                     ack_frontier: local_frontier,
                     updated_at: SystemTime::now(),
+                    version_override: None,
                 }),
                 priority: Priority::Medium,
             });
@@ -531,9 +830,9 @@ impl SyncEngine for DefaultSyncEngine {
         for doc in docs {
             self.run_push_pull(&peer_id, &doc.doc_id)?;
         }
-        self.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
-            peer_id,
-        }));
+        self.push_action(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::SyncCompleted { peer_id },
+        ));
         Ok(())
     }
 
@@ -556,12 +855,8 @@ mod tests {
 
     fn make_engine() -> (DefaultSyncEngine, Arc<DocStore>) {
         let store = Store::open_memory().unwrap();
-        let doc_store = Arc::new(DocStore::new(
-            pid(1),
-            store,
-            32,
-        ));
-        let _ = doc_store.create_doc(DocId::new("d1"), "note").unwrap();
+        let doc_store = Arc::new(DocStore::new(pid(1), store, 32));
+        doc_store.create_doc(DocId::new("d1"), "note").unwrap();
         let engine = DefaultSyncEngine::new(
             doc_store.clone(),
             EngineConfig {
@@ -577,23 +872,31 @@ mod tests {
         let (engine, doc_store) = make_engine();
         // 创建 block
         doc_store
-            .create_block(&DocId::new("d1"), BlockId::new("b1"), tacit_core::BlockKind::Text)
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
             .unwrap();
         // 标记 peer 在线
-        engine.on_peer_summary(
-            pid(2),
-            PeerSummary {
-                peer_id: pid(2),
-                online: true,
-                frontier: Frontier::new(),
-                capabilities: Default::default(),
-            },
-        ).unwrap();
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: true,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
         // 本地编辑
         doc_store
             .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"hello")
             .unwrap();
-        let frontier = doc_store.block_frontier(&DocId::new("d1"), &BlockId::new("b1")).unwrap();
+        let frontier = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
         engine
             .on_local_change(
                 DocId::new("d1"),
@@ -607,14 +910,20 @@ mod tests {
             .unwrap();
         let actions = engine.drain_actions();
         // 应该有 SendData 动作
-        assert!(actions.iter().any(|a| matches!(a, SyncAction::SendData { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::SendData { .. })));
     }
 
     #[test]
     fn request_sync_generates_push_pull() {
         let (engine, doc_store) = make_engine();
         doc_store
-            .create_block(&DocId::new("d1"), BlockId::new("b1"), tacit_core::BlockKind::Text)
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
             .unwrap();
         doc_store
             .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"data")
@@ -649,8 +958,10 @@ mod tests {
                     ack_checkpoint: None,
                     ack_frontier: Frontier::from_iter([(pid(1), 5)]),
                     updated_at: SystemTime::now(),
+                    version_override: None,
                 },
-            ).unwrap();
+            )
+            .unwrap();
             tacit_store::dao::upsert_ack(
                 &conn,
                 &AckSummary {
@@ -659,8 +970,10 @@ mod tests {
                     ack_checkpoint: None,
                     ack_frontier: Frontier::from_iter([(pid(1), 3)]),
                     updated_at: SystemTime::now(),
+                    version_override: None,
                 },
-            ).unwrap();
+            )
+            .unwrap();
         } // conn 在此 drop
         let w = engine.compute_watermarks(&DocId::new("d1")).unwrap();
         // hard = min(5,3) = 3
@@ -673,7 +986,11 @@ mod tests {
     fn fast_resume_opens_all_docs() {
         let (engine, doc_store) = make_engine();
         doc_store
-            .create_block(&DocId::new("d1"), BlockId::new("b1"), tacit_core::BlockKind::Text)
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
             .unwrap();
         // fast_resume 不应报错
         engine.fast_resume(None).unwrap();
@@ -698,7 +1015,507 @@ mod tests {
         engine.process_pending(now).unwrap();
         // 应该产生 RequestDelta 动作并重新入队
         let actions = engine.drain_actions();
-        assert!(actions.iter().any(|a| matches!(a, SyncAction::RequestDelta { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::RequestDelta { .. })));
         assert_eq!(engine.pending_queue().len(), 1);
+    }
+
+    #[test]
+    fn handle_revoke_removes_peer_and_emits_event() {
+        let (engine, _doc_store) = make_engine();
+        // 注册 peer
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: true,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+        // 确认 peer 已注册
+        assert_eq!(engine.online_peers().len(), 1);
+
+        // 撤销 peer
+        engine.handle_revoke(&pid(2), "test revocation").unwrap();
+
+        // peer 应已移除
+        assert_eq!(engine.online_peers().len(), 0);
+
+        // 应发射 PeerRevoked 事件
+        let actions = engine.drain_actions();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            SyncAction::EmitEvent(tacit_core::CoreEvent::PeerRevoked { .. })
+        )));
+    }
+
+    #[test]
+    fn handle_revoke_cleans_pending_queue() {
+        let (engine, _doc_store) = make_engine();
+        // 注册 peer
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: true,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+        // 入队依赖等待
+        let now = Instant::now();
+        engine.pending_queue().enqueue(PendingBlockFetch {
+            doc_id: DocId::new("d1"),
+            block_id: BlockId::new("b1"),
+            expected_frontier: Frontier::new(),
+            observed_frontier: Frontier::new(),
+            peer_id: pid(2),
+            retry_at: now,
+            retries: 0,
+            phase: crate::pending::BackoffPhase::Normal,
+        });
+        assert_eq!(engine.pending_queue().len(), 1);
+
+        // 撤销 peer
+        engine.handle_revoke(&pid(2), "test").unwrap();
+
+        // 依赖等待应被清理
+        assert_eq!(engine.pending_queue().len(), 0);
+    }
+
+    // ===== handle_introduce 测试 =====
+
+    /// 辅助：注册在线 peer。
+    fn register_online_peer(engine: &DefaultSyncEngine, peer_id: PeerId) {
+        let summary = PeerSummary {
+            peer_id: peer_id.clone(),
+            online: true,
+            frontier: Frontier::new(),
+            capabilities: Default::default(),
+        };
+        engine.on_peer_summary(peer_id, summary).unwrap();
+    }
+
+    /// 辅助：注册已信任的在线 peer（内存 + DB）。
+    fn register_trusted_peer(engine: &DefaultSyncEngine, doc_store: &DocStore, peer_id: PeerId) {
+        register_online_peer(engine, peer_id.clone());
+        let conn = doc_store.store().conn();
+        tacit_store::dao::upsert_peer(
+            &conn,
+            &tacit_core::PeerRecord {
+                peer_id,
+                device_pubkey: "trusted".to_string(),
+                capabilities: Default::default(),
+                trust_state: tacit_core::TrustState::Trusted,
+                anchor_priority: 0,
+                last_seen_at: SystemTime::now(),
+                last_endpoint: None,
+                nat_capability: tacit_core::NatCapability::Unknown,
+                relay_hint: None,
+                success_ema: 1.0,
+                rotation_seq: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn handle_introduce_registers_new_peer_as_pending() {
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
+
+        let pubkey = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let msg = tacit_transport::IntroducePeer {
+            introducer: pid(2),
+            introduced_peer: pid(3),
+            introduced_pubkey_hex: pubkey.to_string(),
+            endpoint: Some("192.168.1.100:8080".to_string()),
+        };
+        engine.handle_introduce(&msg, &pid(2)).unwrap();
+
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(3)).unwrap();
+        assert!(peer.is_some());
+        let peer = peer.unwrap();
+        assert_eq!(peer.trust_state, tacit_core::TrustState::Pending);
+        assert_eq!(peer.device_pubkey, pubkey);
+        assert!(peer.last_endpoint.is_some());
+    }
+
+    #[test]
+    fn handle_introduce_emits_peer_introduced_event() {
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
+
+        let pubkey = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let msg = tacit_transport::IntroducePeer {
+            introducer: pid(2),
+            introduced_peer: pid(3),
+            introduced_pubkey_hex: pubkey.to_string(),
+            endpoint: None,
+        };
+        engine.handle_introduce(&msg, &pid(2)).unwrap();
+
+        let actions = engine.drain_actions();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            SyncAction::EmitEvent(tacit_core::CoreEvent::PeerIntroduced {
+                introduced_peer,
+                ..
+            }) if introduced_peer == &pid(3)
+        )));
+    }
+
+    #[test]
+    fn handle_introduce_rejects_unknown_introducer() {
+        let (engine, _doc_store) = make_engine();
+
+        let msg = tacit_transport::IntroducePeer {
+            introducer: pid(99),
+            introduced_peer: pid(3),
+            introduced_pubkey_hex:
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            endpoint: None,
+        };
+        let result = engine.handle_introduce(&msg, &pid(99));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_introduce_rejects_mismatched_sender() {
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
+        register_online_peer(&engine, pid(5));
+
+        // pid(5) 试图冒充 pid(2) 发起引入
+        let msg = tacit_transport::IntroducePeer {
+            introducer: pid(2),
+            introduced_peer: pid(3),
+            introduced_pubkey_hex:
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            endpoint: None,
+        };
+        let result = engine.handle_introduce(&msg, &pid(5));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_introduce_does_not_overwrite_existing_peer() {
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(3),
+                    device_pubkey:
+                        "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+                            .to_string(),
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 5,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 0.9,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let msg = tacit_transport::IntroducePeer {
+            introducer: pid(2),
+            introduced_peer: pid(3),
+            introduced_pubkey_hex:
+                "1122334455667788112233445566778811223344556677881122334455667788".to_string(),
+            endpoint: None,
+        };
+        engine.handle_introduce(&msg, &pid(2)).unwrap();
+
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(3)).unwrap().unwrap();
+        assert_eq!(peer.trust_state, tacit_core::TrustState::Trusted);
+        assert_eq!(
+            peer.device_pubkey,
+            "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+        );
+    }
+
+    // ===== handle_key_rotate 测试 =====
+
+    /// 辅助：生成 DeviceIdentity 并返回 (identity, pubkey_hex)。
+    fn make_identity() -> (tacit_crypto::identity::DeviceIdentity, String) {
+        let id = tacit_crypto::identity::DeviceIdentity::generate().unwrap();
+        let pubkey_hex = hex::encode(id.public_key());
+        (id, pubkey_hex)
+    }
+
+    /// 辅助：用旧身份签发 KeyRotateNotice。
+    fn sign_rotation(
+        identity: &tacit_crypto::identity::DeviceIdentity,
+        peer_id: &PeerId,
+        new_pubkey_hex: &str,
+        rotation_seq: u64,
+    ) -> tacit_transport::KeyRotateNotice {
+        let message = format!("{}:{}:{}", peer_id, new_pubkey_hex, rotation_seq);
+        let sig = tacit_crypto::sign(identity, message.as_bytes());
+        tacit_transport::KeyRotateNotice {
+            peer_id: peer_id.clone(),
+            new_pubkey_hex: new_pubkey_hex.to_string(),
+            rotation_seq,
+            signature: sig.to_vec(),
+        }
+    }
+
+    #[test]
+    fn handle_key_rotate_updates_pubkey_and_seq() {
+        let (engine, doc_store) = make_engine();
+        register_online_peer(&engine, pid(2));
+
+        let (old_id, old_pubkey_hex) = make_identity();
+        let (_, new_pubkey_hex) = make_identity();
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: old_pubkey_hex,
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let msg = sign_rotation(&old_id, &pid(2), &new_pubkey_hex, 1);
+        engine.handle_key_rotate(&msg).unwrap();
+
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
+        assert_eq!(peer.device_pubkey, new_pubkey_hex);
+        assert_eq!(peer.rotation_seq, 1);
+        assert_eq!(peer.trust_state, tacit_core::TrustState::Trusted);
+    }
+
+    #[test]
+    fn handle_key_rotate_emits_event() {
+        let (engine, doc_store) = make_engine();
+        register_online_peer(&engine, pid(2));
+
+        let (old_id, old_pubkey_hex) = make_identity();
+        let (_, new_pubkey_hex) = make_identity();
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: old_pubkey_hex,
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let msg = sign_rotation(&old_id, &pid(2), &new_pubkey_hex, 1);
+        engine.handle_key_rotate(&msg).unwrap();
+
+        let actions = engine.drain_actions();
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            SyncAction::EmitEvent(tacit_core::CoreEvent::PeerKeyRotated {
+                peer_id,
+                rotation_seq: 1,
+                ..
+            }) if peer_id == &pid(2)
+        )));
+    }
+
+    #[test]
+    fn handle_key_rotate_rejects_unknown_peer() {
+        let (engine, _doc_store) = make_engine();
+
+        let msg = tacit_transport::KeyRotateNotice {
+            peer_id: pid(99),
+            new_pubkey_hex: "newkey".to_string(),
+            rotation_seq: 1,
+            signature: vec![0u8; 64],
+        };
+        let result = engine.handle_key_rotate(&msg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_key_rotate_rejects_non_incrementing_seq() {
+        let (engine, doc_store) = make_engine();
+        register_online_peer(&engine, pid(2));
+
+        let (_, pubkey_hex) = make_identity();
+        let pubkey_hex_check = pubkey_hex.clone();
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: pubkey_hex,
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 3,
+                },
+            )
+            .unwrap();
+        }
+
+        // seq=3 不递增
+        let msg = tacit_transport::KeyRotateNotice {
+            peer_id: pid(2),
+            new_pubkey_hex: "00".repeat(32),
+            rotation_seq: 3,
+            signature: vec![0u8; 64],
+        };
+        assert!(engine.handle_key_rotate(&msg).is_err());
+
+        // seq=2 回退
+        let msg = tacit_transport::KeyRotateNotice {
+            peer_id: pid(2),
+            new_pubkey_hex: "00".repeat(32),
+            rotation_seq: 2,
+            signature: vec![0u8; 64],
+        };
+        assert!(engine.handle_key_rotate(&msg).is_err());
+
+        // 公钥不变
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
+        assert_eq!(peer.device_pubkey, pubkey_hex_check);
+    }
+
+    #[test]
+    fn handle_key_rotate_rejects_invalid_signature() {
+        let (engine, doc_store) = make_engine();
+        register_online_peer(&engine, pid(2));
+
+        let (_, old_pubkey_hex) = make_identity();
+        let old_pubkey_hex_check = old_pubkey_hex.clone();
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: old_pubkey_hex,
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        // 用无效签名
+        let msg = tacit_transport::KeyRotateNotice {
+            peer_id: pid(2),
+            new_pubkey_hex: "00".repeat(32),
+            rotation_seq: 1,
+            signature: vec![0u8; 64],
+        };
+        assert!(engine.handle_key_rotate(&msg).is_err());
+
+        // 公钥不变
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
+        assert_eq!(peer.device_pubkey, old_pubkey_hex_check);
+    }
+
+    #[test]
+    fn handle_key_rotate_chained_rotations() {
+        let (engine, doc_store) = make_engine();
+        register_online_peer(&engine, pid(2));
+
+        let (id_v0, pubkey_v0) = make_identity();
+        let (id_v1, pubkey_v1) = make_identity();
+        let (id_v2, pubkey_v2) = make_identity();
+        let (_id_v3, pubkey_v3) = make_identity();
+
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: pubkey_v0,
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        // seq=1: 用 id_v0 签名，轮换到 pubkey_v1
+        let msg = sign_rotation(&id_v0, &pid(2), &pubkey_v1, 1);
+        engine.handle_key_rotate(&msg).unwrap();
+
+        // seq=2: 用 id_v1 签名，轮换到 pubkey_v2
+        let msg = sign_rotation(&id_v1, &pid(2), &pubkey_v2, 2);
+        engine.handle_key_rotate(&msg).unwrap();
+
+        // seq=3: 用 id_v2 签名，轮换到 pubkey_v3
+        let msg = sign_rotation(&id_v2, &pid(2), &pubkey_v3, 3);
+        engine.handle_key_rotate(&msg).unwrap();
+
+        let conn = doc_store.store().conn();
+        let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
+        assert_eq!(peer.device_pubkey, pubkey_v3);
+        assert_eq!(peer.rotation_seq, 3);
     }
 }

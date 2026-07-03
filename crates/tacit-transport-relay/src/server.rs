@@ -3,6 +3,7 @@
 //! - 校验 admission proof。
 //! - 映射 session_id -> peer_id。
 //! - 转发数据流。
+//! - Per-peer token bucket 速率限制。
 //! - TTL 缓存清理。
 
 use std::collections::HashMap;
@@ -22,6 +23,52 @@ struct SessionEntry {
     last_active: Instant,
 }
 
+/// Per-peer token bucket 速率限制器。
+///
+/// 每个 peer 拥有独立的 token bucket，按字节数计量。
+/// 桶容量为 `burst_bytes`，以 `rate_bytes_per_sec` 的速率补充。
+/// 转发请求消耗对应字节数的 token；token 不足时拒绝转发。
+struct TokenBucket {
+    /// 桶内当前 token 数（字节）。
+    tokens: f64,
+    /// 桶容量（最大突发字节数）。
+    capacity: f64,
+    /// 补充速率（字节/秒）。
+    rate: f64,
+    /// 上次补充时间。
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, rate: f64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            rate,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// 补充 token 并尝试消费 `cost` 字节。
+    ///
+    /// 返回 true 表示允许通过，false 表示限流。
+    fn try_consume(&mut self, cost: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.last_refill = now;
+
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Relay 服务端。
 pub struct RelayServer {
     /// 共享密钥（用于验证 admission proof）。
@@ -34,6 +81,12 @@ pub struct RelayServer {
     sessions: Mutex<HashMap<String, SessionEntry>>,
     /// peer_id -> session_id（用于转发路由）。
     peer_to_session: Mutex<HashMap<PeerId, String>>,
+    /// per-peer token bucket 限流器。
+    rate_limiters: Mutex<HashMap<PeerId, TokenBucket>>,
+    /// 限流配置：桶容量（字节，默认 10 MB 突发）。
+    rate_burst_bytes: f64,
+    /// 限流配置：补充速率（字节/秒，默认 1 MB/s）。
+    rate_bytes_per_sec: f64,
 }
 
 impl RelayServer {
@@ -45,7 +98,21 @@ impl RelayServer {
             session_ttl: Duration::from_secs(300),
             sessions: Mutex::new(HashMap::new()),
             peer_to_session: Mutex::new(HashMap::new()),
+            rate_limiters: Mutex::new(HashMap::new()),
+            rate_burst_bytes: 10.0 * 1024.0 * 1024.0,
+            rate_bytes_per_sec: 1024.0 * 1024.0,
         }
+    }
+
+    /// 自定义速率限制参数。
+    ///
+    /// # 参数
+    /// - `burst_bytes`: 桶容量（最大突发字节数）
+    /// - `rate_bytes_per_sec`: 持续补充速率（字节/秒）
+    pub fn with_rate_limit(mut self, burst_bytes: f64, rate_bytes_per_sec: f64) -> Self {
+        self.rate_burst_bytes = burst_bytes;
+        self.rate_bytes_per_sec = rate_bytes_per_sec;
+        self
     }
 
     /// 处理注册请求。
@@ -73,7 +140,14 @@ impl RelayServer {
         }
         {
             let mut p2s = self.peer_to_session.lock();
-            p2s.insert(peer_id, session_id.clone());
+            p2s.insert(peer_id.clone(), session_id.clone());
+        }
+        // 为 peer 初始化 token bucket（仅在首次注册时创建，重注册时保留现有 bucket 防止限流绕过）
+        {
+            let mut limiters = self.rate_limiters.lock();
+            limiters.entry(peer_id.clone()).or_insert_with(|| {
+                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec)
+            });
         }
 
         debug!(peer_id = %proof.peer_id, session_id = %session_id, "注册成功");
@@ -101,6 +175,22 @@ impl RelayServer {
             }
         }
 
+        // 速率限制检查
+        let cost = req.data.len() as f64;
+        let allowed = {
+            let mut limiters = self.rate_limiters.lock();
+            let bucket = limiters.entry(from_peer_id.clone()).or_insert_with(|| {
+                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec)
+            });
+            bucket.try_consume(cost)
+        };
+        if !allowed {
+            warn!(peer = %from_peer_id, bytes = req.data.len(), "relay 转发被限流");
+            return Ok(RelayMessage::ForwardFailed {
+                reason: "rate limited".into(),
+            });
+        }
+
         // 查找目标 peer 的 session
         let target_session = {
             let p2s = self.peer_to_session.lock();
@@ -113,6 +203,7 @@ impl RelayServer {
                 debug!(
                     from = %from_peer_id,
                     to = %req.target_peer_id,
+                    bytes = req.data.len(),
                     "转发数据"
                 );
                 Ok(RelayMessage::Incoming {
@@ -143,7 +234,12 @@ impl RelayServer {
 
         for sid in expired {
             if let Some(entry) = sessions.remove(&sid) {
-                p2s.remove(&entry.peer_id);
+                // 仅当 p2s 仍映射到此过期 sid 时才清理，避免误删已重注册的新 session
+                if p2s.get(&entry.peer_id) == Some(&sid) {
+                    p2s.remove(&entry.peer_id);
+                    let mut limiters = self.rate_limiters.lock();
+                    limiters.remove(&entry.peer_id);
+                }
                 debug!(session_id = %sid, "清理过期 session");
             }
         }
@@ -260,5 +356,46 @@ mod tests {
 
         let proof = generate_proof(&PeerId::new("1"), &secret).unwrap();
         assert!(server.handle_register(&proof).is_err());
+    }
+
+    #[test]
+    fn rate_limit_blocks_excessive_traffic() {
+        let secret = b"relay_secret".to_vec();
+        // 桶容量 100 字节，速率 10 字节/秒
+        let server = RelayServer::new(secret.clone()).with_rate_limit(100.0, 10.0);
+
+        let proof = generate_proof(&PeerId::new("1"), &secret).unwrap();
+        let session1 = server.handle_register(&proof).unwrap();
+        let proof2 = generate_proof(&PeerId::new("2"), &secret).unwrap();
+        let session2 = server.handle_register(&proof2).unwrap();
+
+        // 发送 50 字节：应通过（桶有 100 token）
+        let req = ForwardRequest {
+            session_id: session1.clone(),
+            target_peer_id: "2".into(),
+            data: vec![0u8; 50],
+        };
+        match server.handle_forward(&req).unwrap() {
+            RelayMessage::Incoming { .. } => {}
+            other => panic!("期望 Incoming，得到 {:?}", other),
+        }
+
+        // 再发送 60 字节：应被限流（剩余 50 token < 60）
+        let req = ForwardRequest {
+            session_id: session1,
+            target_peer_id: "2".into(),
+            data: vec![0u8; 60],
+        };
+        match server.handle_forward(&req).unwrap() {
+            RelayMessage::ForwardFailed { reason } => {
+                assert!(
+                    reason.contains("rate limited"),
+                    "原因应包含 rate limited: {reason}"
+                );
+            }
+            other => panic!("期望 ForwardFailed，得到 {:?}", other),
+        }
+
+        let _ = session2;
     }
 }

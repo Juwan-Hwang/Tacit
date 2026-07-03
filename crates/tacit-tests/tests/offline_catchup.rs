@@ -37,7 +37,9 @@ fn transfer_block_delta(
         if !doc_exists {
             target.create_doc(doc_id.clone(), "note").unwrap();
         }
-        target.create_block(doc_id, block_id.clone(), BlockKind::Text).unwrap();
+        target
+            .create_block(doc_id, block_id.clone(), BlockKind::Text)
+            .unwrap();
     }
     let bytes = if since.is_empty() {
         source.export_block_snapshot(doc_id, block_id).unwrap()
@@ -47,12 +49,7 @@ fn transfer_block_delta(
     target.import_block(doc_id, block_id, &bytes).unwrap();
 }
 
-fn transfer_meta_delta(
-    source: &DocStore,
-    target: &DocStore,
-    doc_id: &DocId,
-    since: &Frontier,
-) {
+fn transfer_meta_delta(source: &DocStore, target: &DocStore, doc_id: &DocId, since: &Frontier) {
     let doc_exists = {
         let conn = target.store().conn();
         tacit_store::dao::get_doc(&conn, doc_id).unwrap().is_some()
@@ -79,8 +76,10 @@ fn three_day_offline_catchup() {
 
     // 初始同步
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"day 0 initial").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"day 0 initial")
+        .unwrap();
 
     let empty = Frontier::new();
     transfer_meta_delta(&ds1, &ds2, &doc_id, &empty);
@@ -93,24 +92,38 @@ fn three_day_offline_catchup() {
     for day in 1..=3 {
         for edit in 0..10 {
             let text = format!(" day{}_edit{}", day, edit);
-            ds2.apply_local_edit(&doc_id, &block_id, text.as_bytes()).unwrap();
+            ds2.apply_local_edit(&doc_id, &block_id, text.as_bytes())
+                .unwrap();
         }
     }
 
-    let peer2_final_render = ds2.get_block(&doc_id, &block_id).unwrap()
-        .export_render_bytes().unwrap();
+    let peer2_final_render = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
 
     // peer 1 回来，通过 shallow snapshot + tail delta 追赶
-    let shallow = ds2.export_block_shallow(&doc_id, &block_id, &stale_frontier).unwrap();
-    let tail_delta = ds2.export_block_delta(&doc_id, &block_id, &stale_frontier).unwrap();
+    let shallow = ds2
+        .export_block_shallow(&doc_id, &block_id, &stale_frontier)
+        .unwrap();
+    let tail_delta = ds2
+        .export_block_delta(&doc_id, &block_id, &stale_frontier)
+        .unwrap();
 
     ds1.import_block(&doc_id, &block_id, &shallow).unwrap();
     ds1.import_block(&doc_id, &block_id, &tail_delta).unwrap();
 
     // 验证 peer 1 追上 peer 2
-    let peer1_final_render = ds1.get_block(&doc_id, &block_id).unwrap()
-        .export_render_bytes().unwrap();
-    assert_eq!(peer1_final_render, peer2_final_render, "3 天离线后应追上最新状态");
+    let peer1_final_render = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    assert_eq!(
+        peer1_final_render, peer2_final_render,
+        "3 天离线后应追上最新状态"
+    );
 }
 
 /// 测试：多 block 离线追赶。
@@ -125,7 +138,8 @@ fn multi_block_offline_catchup() {
     // 初始：peer 1 创建 5 个 block
     ds1.create_doc(doc_id.clone(), "note").unwrap();
     for bid in &blocks {
-        ds1.create_block(&doc_id, bid.clone(), BlockKind::Text).unwrap();
+        ds1.create_block(&doc_id, bid.clone(), BlockKind::Text)
+            .unwrap();
         ds1.apply_local_edit(&doc_id, bid, b"initial").unwrap();
     }
 
@@ -157,8 +171,16 @@ fn multi_block_offline_catchup() {
 
     // 验证所有 block 收敛
     for bid in &blocks {
-        let r1 = ds1.get_block(&doc_id, bid).unwrap().export_render_bytes().unwrap();
-        let r2 = ds2.get_block(&doc_id, bid).unwrap().export_render_bytes().unwrap();
+        let r1 = ds1
+            .get_block(&doc_id, bid)
+            .unwrap()
+            .export_render_bytes()
+            .unwrap();
+        let r2 = ds2
+            .get_block(&doc_id, bid)
+            .unwrap()
+            .export_render_bytes()
+            .unwrap();
         assert_eq!(r1, r2, "block {} 应收敛", bid.as_str());
     }
 }
@@ -174,7 +196,8 @@ fn offline_new_block_catchup() {
 
     // 初始同步
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block1.clone(), BlockKind::Text).unwrap();
+    ds1.create_block(&doc_id, block1.clone(), BlockKind::Text)
+        .unwrap();
     ds1.apply_local_edit(&doc_id, &block1, b"initial").unwrap();
 
     let empty = Frontier::new();
@@ -183,8 +206,10 @@ fn offline_new_block_catchup() {
 
     // peer 1 离线，peer 2 新增 block2 并编辑
     let block2 = BlockId::new("b2");
-    ds2.create_block(&doc_id, block2.clone(), BlockKind::Text).unwrap();
-    ds2.apply_local_edit(&doc_id, &block2, b"new block while peer1 offline").unwrap();
+    ds2.create_block(&doc_id, block2.clone(), BlockKind::Text)
+        .unwrap();
+    ds2.apply_local_edit(&doc_id, &block2, b"new block while peer1 offline")
+        .unwrap();
 
     // peer 1 回来，先同步 meta（获知新 block），再同步 block2
     let stale_meta = ds1.meta_frontier(&doc_id).unwrap();
@@ -194,8 +219,16 @@ fn offline_new_block_catchup() {
     transfer_block_delta(&ds2, &ds1, &doc_id, &block2, &empty);
 
     // 验证 block2 内容一致
-    let r1 = ds1.get_block(&doc_id, &block2).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block2).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block2)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block2)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
     assert_eq!(r1, r2, "新 block 应同步成功");
 }
 
@@ -210,8 +243,10 @@ fn catchup_then_bidirectional_edit_converges() {
 
     // 初始同步
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"initial").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"initial")
+        .unwrap();
 
     let empty = Frontier::new();
     transfer_meta_delta(&ds1, &ds2, &doc_id, &empty);
@@ -219,15 +254,20 @@ fn catchup_then_bidirectional_edit_converges() {
 
     // peer 1 离线，peer 2 编辑
     let stale_f = ds1.block_frontier(&doc_id, &block_id).unwrap();
-    ds2.apply_local_edit(&doc_id, &block_id, b" peer2 offline work").unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" peer2 offline work")
+        .unwrap();
 
     // peer 1 追赶
-    let tail = ds2.export_block_delta(&doc_id, &block_id, &stale_f).unwrap();
+    let tail = ds2
+        .export_block_delta(&doc_id, &block_id, &stale_f)
+        .unwrap();
     ds1.import_block(&doc_id, &block_id, &tail).unwrap();
 
     // 追赶后双方各自编辑
-    ds1.apply_local_edit(&doc_id, &block_id, b" peer1 post-catchup").unwrap();
-    ds2.apply_local_edit(&doc_id, &block_id, b" peer2 post-catchup").unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b" peer1 post-catchup")
+        .unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" peer2 post-catchup")
+        .unwrap();
 
     // 双向同步
     let f1 = ds1.block_frontier(&doc_id, &block_id).unwrap();
@@ -236,7 +276,15 @@ fn catchup_then_bidirectional_edit_converges() {
     transfer_block_delta(&ds1, &ds2, &doc_id, &block_id, &f2);
 
     // 验证收敛
-    let r1 = ds1.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
     assert_eq!(r1, r2, "追赶后双向编辑应收敛");
 }

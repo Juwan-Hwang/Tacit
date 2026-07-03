@@ -31,6 +31,7 @@ fn ack(peer: PeerId, doc: &str, frontier: Frontier, seq: u64) -> AckSummary {
         ack_checkpoint: None,
         ack_frontier: f,
         updated_at: std::time::SystemTime::now(),
+        version_override: None,
     }
 }
 
@@ -93,15 +94,13 @@ fn bench_pending_queue_drain_ready(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
             b.iter_batched(
                 || {
-                    let q = PendingFetchQueue::new(
-                        Duration::from_millis(200),
-                        Duration::from_secs(2),
-                    );
+                    let q =
+                        PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
                     let now = Instant::now();
                     for i in 0..size {
                         q.enqueue(tacit_sync::PendingBlockFetch {
                             doc_id: DocId::new("d1"),
-                            block_id: BlockId::new(&format!("b{i}")),
+                            block_id: BlockId::new(format!("b{i}")),
                             expected_frontier: Frontier::new(),
                             observed_frontier: Frontier::new(),
                             peer_id: pid(1),
@@ -168,12 +167,8 @@ fn bench_block_edit_and_export(c: &mut Criterion) {
                         let store = Store::open_memory().unwrap();
                         let ds = DocStore::new(pid(1), store, 32);
                         ds.create_doc(DocId::new("d1"), "note").unwrap();
-                        ds.create_block(
-                            &DocId::new("d1"),
-                            BlockId::new("b1"),
-                            BlockKind::Text,
-                        )
-                        .unwrap();
+                        ds.create_block(&DocId::new("d1"), BlockId::new("b1"), BlockKind::Text)
+                            .unwrap();
                         ds
                     },
                     |ds| {
@@ -211,14 +206,13 @@ fn bench_engine_peer_summary(c: &mut Criterion) {
                 let store = Store::open_memory().unwrap();
                 let doc_store = std::sync::Arc::new(DocStore::new(pid(1), store, 32));
                 doc_store.create_doc(DocId::new("d1"), "note").unwrap();
-                let engine = tacit_sync::DefaultSyncEngine::new(
+                tacit_sync::DefaultSyncEngine::new(
                     doc_store,
                     EngineConfig {
                         peer_id: pid(1),
                         ..Default::default()
                     },
-                );
-                engine
+                )
             },
             |engine| {
                 engine

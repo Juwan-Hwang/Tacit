@@ -56,11 +56,17 @@ enum BackendState {
 
 impl BackendState {
     fn is_broadcasting(&self) -> bool {
-        matches!(self, BackendState::Broadcasting | BackendState::BroadcastingAndScanning)
+        matches!(
+            self,
+            BackendState::Broadcasting | BackendState::BroadcastingAndScanning
+        )
     }
 
     fn is_scanning(&self) -> bool {
-        matches!(self, BackendState::Scanning | BackendState::BroadcastingAndScanning)
+        matches!(
+            self,
+            BackendState::Scanning | BackendState::BroadcastingAndScanning
+        )
     }
 
     fn set_broadcasting(&mut self, on: bool) {
@@ -289,11 +295,7 @@ impl BluerBackend {
     ///
     /// 仅处理包含 TACIT_SERVICE_UUID 的 service data，
     /// 并从 payload 中的 device_id 获取 peer_id（不使用 MAC 作为 fallback）。
-    async fn process_device(
-        adapter: &bluer::Adapter,
-        backend: &Arc<Self>,
-        addr: &bluer::Address,
-    ) {
+    async fn process_device(adapter: &bluer::Adapter, backend: &Arc<Self>, addr: &bluer::Address) {
         let device = match adapter.device(*addr) {
             Ok(d) => d,
             Err(e) => {
@@ -329,7 +331,7 @@ impl BluerBackend {
             };
 
             // 先解码 payload（peer_id 参数未使用），从 device_id 获取 peer_id
-            let temp_peer_id = PeerId::new(&addr.to_string());
+            let temp_peer_id = PeerId::new(addr.to_string());
             match decode_presence_payload(&payload, &temp_peer_id) {
                 Ok(hint) => {
                     // 用 payload 中的 device_id 作为 peer_id，不使用 MAC 作为 fallback
@@ -356,9 +358,11 @@ impl BluerBackend {
 
 impl PresenceBackend for BluerBackend {
     fn start_broadcast(&self, payload: Vec<u8>) -> CoreResult<()> {
-        let tx = self.cmd_tx.lock().clone().ok_or_else(|| {
-            CoreError::Transport("bluez 后端已关闭".into())
-        })?;
+        let tx = self
+            .cmd_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("bluez 后端已关闭".into()))?;
         tx.send(BackendCommand::StartBroadcast(payload))
             .map_err(|_| CoreError::Transport("发送广播命令失败".into()))?;
         Ok(())
@@ -373,9 +377,11 @@ impl PresenceBackend for BluerBackend {
     }
 
     fn start_scan(&self) -> CoreResult<()> {
-        let tx = self.cmd_tx.lock().clone().ok_or_else(|| {
-            CoreError::Transport("bluez 后端已关闭".into())
-        })?;
+        let tx = self
+            .cmd_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("bluez 后端已关闭".into()))?;
         tx.send(BackendCommand::StartScan)
             .map_err(|_| CoreError::Transport("发送扫描命令失败".into()))?;
         Ok(())
@@ -442,8 +448,8 @@ mod tests {
         non_matching.insert(other_uuid, vec![0x01, 0x02]);
 
         // 匹配的应能取到 payload
-        assert!(matching.get(&tacit_uuid).is_some());
+        assert!(matching.contains_key(&tacit_uuid));
         // 不匹配的取不到 TACIT payload
-        assert!(non_matching.get(&tacit_uuid).is_none());
+        assert!(!non_matching.contains_key(&tacit_uuid));
     }
 }

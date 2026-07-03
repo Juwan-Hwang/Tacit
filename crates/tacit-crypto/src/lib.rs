@@ -15,9 +15,10 @@ pub mod session;
 pub mod signature;
 
 pub use identity::{DeviceIdentity, PeerPubkey};
-pub use noise::{NoiseHandshake, NoiseRole, HandshakeResult};
+pub use noise::{HandshakeResult, NoiseHandshake, NoiseRole};
 pub use pairing::{
-    compute_binding_digest, derive_sas_code, generate_binding_salt, verify_binding, PairingPayload,
+    compute_binding_digest, confirm_sas_code, derive_sas_code, format_sas_code,
+    generate_binding_salt, verify_binding, PairingPayload, PairingRole, PairingSession,
 };
 pub use session::Session;
 pub use signature::{sign, verify};
