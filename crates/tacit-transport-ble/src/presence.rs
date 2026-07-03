@@ -69,11 +69,7 @@ const EXT_FLAG_IS_IPV4: u8 = 0b0000_0010;
 /// - [20..22] port: 大端 u16（仅 has_endpoint 时）
 /// - [22..26] ipv4: 4 字节（仅 has_endpoint 且 is_ipv4 时）
 pub fn encode_presence_payload(hint: &PresenceHint) -> CoreResult<Vec<u8>> {
-    let frame = DiscoveryFrame::from_presence(
-        &hint.group_id,
-        &hint.device_id,
-        hint.capabilities,
-    );
+    let frame = DiscoveryFrame::from_presence(&hint.group_id, &hint.device_id, hint.capabilities);
     let mut buf = frame.encode();
 
     // endpoint 扩展
@@ -122,13 +118,12 @@ pub fn decode_presence_payload(
         )));
     }
 
-    let frame = DiscoveryFrame::decode(payload).map_err(|e: FrameError| {
-        taci_core_frame_error_to_core(&e)
-    })?;
+    let frame = DiscoveryFrame::decode(payload)
+        .map_err(|e: FrameError| taci_core_frame_error_to_core(&e))?;
 
     // 还原 group_id / device_id（hash 的 hex，用于匹配，不可逆推原始值）
-    let group_id = hex::encode(&frame.group_id);
-    let device_id = hex::encode(&frame.device_id);
+    let group_id = hex::encode(frame.group_id);
+    let device_id = hex::encode(frame.device_id);
 
     // 解析 endpoint 扩展
     let ext_flags = payload[EXT_FLAGS_OFFSET];
@@ -141,10 +136,8 @@ pub fn decode_presence_payload(
                 "BLE endpoint 扩展缺少 port".into(),
             ));
         }
-        let port = u16::from_be_bytes([
-            payload[EXT_FLAGS_OFFSET + 1],
-            payload[EXT_FLAGS_OFFSET + 2],
-        ]);
+        let port =
+            u16::from_be_bytes([payload[EXT_FLAGS_OFFSET + 1], payload[EXT_FLAGS_OFFSET + 2]]);
         if is_ipv4 {
             if payload.len() < EXT_FLAGS_OFFSET + 7 {
                 return Err(tacit_core::CoreError::Deserialize(
@@ -183,15 +176,11 @@ fn taci_core_frame_error_to_core(e: &FrameError) -> tacit_core::CoreError {
         FrameError::ChecksumMismatch => {
             CoreError::Deserialize("DiscoveryFrame checksum 不匹配".into())
         }
-        FrameError::UnknownControlType(v) => {
-            CoreError::Deserialize(format!("未知控制类型: {v}"))
-        }
+        FrameError::UnknownControlType(v) => CoreError::Deserialize(format!("未知控制类型: {v}")),
         FrameError::UnknownDataFrameKind(v) => {
             CoreError::Deserialize(format!("未知数据帧类型: {v}"))
         }
-        FrameError::VersionMismatch(v) => {
-            CoreError::Deserialize(format!("版本不兼容: {v}"))
-        }
+        FrameError::VersionMismatch(v) => CoreError::Deserialize(format!("版本不兼容: {v}")),
         FrameError::FrameTooLarge(size) => {
             CoreError::Deserialize(format!("帧过大: {size} 字节，超过最大限制"))
         }

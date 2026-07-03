@@ -304,6 +304,91 @@ impl DocStore {
         Ok(result)
     }
 
+    /// 批量导入多个 block delta/snapshot。
+    ///
+    /// 在单个事务中持久化所有变更的 block snapshot，减少事务开销。
+    /// 适用于大量 block 追赶场景（如长时间离线后恢复）。
+    ///
+    /// 返回每个 block 的导入结果，顺序与输入一致。
+    pub fn import_blocks_batch(
+        &self,
+        doc_id: &DocId,
+        blocks: &[(BlockId, Vec<u8>)],
+    ) -> CoreResult<Vec<ImportResult>> {
+        // 1. 逐个导入 delta（CRDT 操作，不涉及 I/O）
+        //    同时保存旧 snapshot，以便 DB 写入失败时回滚内存状态
+        //    使用 HashMap 去重：同一 block 在批次中出现多次时，只保留最终 snapshot
+        let mut results = Vec::with_capacity(blocks.len());
+        let mut changed_blocks: std::collections::HashMap<BlockId, (Vec<u8>, BlockKind, Vec<u8>)> =
+            std::collections::HashMap::new();
+        for (block_id, bytes) in blocks {
+            let block = self.get_block(doc_id, block_id)?;
+            // 导入前保存旧 snapshot 用于回滚
+            let old_snap = block.export_snapshot().ok();
+            let kind = block.kind();
+            let result = block.import(bytes)?;
+            if result.changed {
+                let new_snap = block.export_snapshot()?;
+                // 使用 entry API：保留首次导入前的 old_snap 用于回滚，
+                // 仅更新 new_snap 为最新 snapshot
+                changed_blocks
+                    .entry(block_id.clone())
+                    .and_modify(|(ns, _, _)| *ns = new_snap.clone())
+                    .or_insert_with(|| (new_snap, kind, old_snap.unwrap_or_default()));
+            }
+            results.push(result);
+        }
+
+        // 2. 在单个事务中批量持久化所有变更的 snapshot（每个 block 仅写一次）
+        if !changed_blocks.is_empty() {
+            if let Err(e) = self.store.transaction(|conn| {
+                for (block_id, (snap, _, _)) in &changed_blocks {
+                    dao::insert_snapshot(
+                        conn,
+                        doc_id,
+                        &CheckpointId::new(block_id.as_str()),
+                        snap,
+                        tacit_core::SnapshotKind::Full,
+                        SystemTime::now(),
+                    )?;
+                }
+                Ok(())
+            }) {
+                // DB 写入失败：用旧 snapshot 重建 BlockDoc 以回滚内存状态
+                tracing::error!(
+                    doc_id = %doc_id,
+                    error = %e,
+                    "批量导入 DB 写入失败，正在回滚内存状态"
+                );
+                for (block_id, (_, kind, old_snap)) in &changed_blocks {
+                    if !old_snap.is_empty() {
+                        if let Ok(restored) = BlockDoc::from_snapshot(
+                            block_id.clone(),
+                            *kind,
+                            &self.peer_id,
+                            old_snap,
+                        ) {
+                            self.cache.insert(block_id.clone(), Arc::new(restored));
+                            tracing::debug!(
+                                block_id = %block_id,
+                                "已用旧 snapshot 回滚内存状态"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+            tracing::debug!(
+                doc_id = %doc_id,
+                total = blocks.len(),
+                changed = changed_blocks.len(),
+                "批量导入完成"
+            );
+        }
+
+        Ok(results)
+    }
+
     /// 导入远端 MetaDoc delta/snapshot。
     pub fn import_meta(&self, doc_id: &DocId, bytes: &[u8]) -> CoreResult<ImportResult> {
         let meta = self.open_doc(doc_id)?;
@@ -358,11 +443,7 @@ impl DocStore {
     }
 
     /// 导出 block 完整 snapshot。
-    pub fn export_block_snapshot(
-        &self,
-        doc_id: &DocId,
-        block_id: &BlockId,
-    ) -> CoreResult<Vec<u8>> {
+    pub fn export_block_snapshot(&self, doc_id: &DocId, block_id: &BlockId) -> CoreResult<Vec<u8>> {
         let block = self.get_block(doc_id, block_id)?;
         block.export_snapshot()
     }

@@ -8,9 +8,7 @@ use tacit_core::{
     ApplyResult, BlockId, BlockKind, CoreError, CoreResult, Frontier, ImportResult, PeerId,
 };
 
-use crate::converter::{
-    format_peer_id, frontiers_to_frontier, parse_peer_id, LoroExport,
-};
+use crate::converter::{format_peer_id, frontiers_to_frontier, parse_peer_id, LoroExport};
 
 /// block 内部根容器名。
 const ROOT_CONTAINER: &str = "block";
@@ -136,8 +134,9 @@ impl BlockDoc {
         let map = self.get_map_container();
         let json_str = std::str::from_utf8(edit_bytes)
             .map_err(|e| CoreError::Crdt(format!("编辑字节非 UTF-8: {e}")))?;
-        let kvs: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(json_str)
-            .map_err(|e| CoreError::Crdt(format!("JSON 解析失败: {e}")))?;
+        let kvs: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(json_str)
+                .map_err(|e| CoreError::Crdt(format!("JSON 解析失败: {e}")))?;
         for (k, v) in kvs {
             let value: LoroValue = serde_json::from_str(
                 &serde_json::to_string(&v)
@@ -173,13 +172,10 @@ impl BlockDoc {
         // LoroValue -> serde_json::Value
         let mut json: serde_json::Value = serde_json::to_value(&loro_val)
             .map_err(|e| CoreError::Crdt(format!("JSON 序列化失败: {e}")))?;
-        let obj = json.as_object_mut().ok_or_else(|| {
-            CoreError::Crdt(format!("Todo 索引 {index} 处的元素不是 JSON 对象"))
-        })?;
-        obj.insert(
-            "completed".to_string(),
-            serde_json::Value::Bool(completed),
-        );
+        let obj = json
+            .as_object_mut()
+            .ok_or_else(|| CoreError::Crdt(format!("Todo 索引 {index} 处的元素不是 JSON 对象")))?;
+        obj.insert("completed".to_string(), serde_json::Value::Bool(completed));
         // serde_json::Value -> LoroValue
         let new_val: LoroValue = serde_json::from_str(
             &serde_json::to_string(&json)
@@ -285,7 +281,8 @@ mod tests {
         block.apply_edit(b"hello").unwrap();
         let snap = block.export_snapshot().unwrap();
 
-        let block2 = BlockDoc::from_snapshot(BlockId::new("b1"), BlockKind::Text, &pid(2), &snap).unwrap();
+        let block2 =
+            BlockDoc::from_snapshot(BlockId::new("b1"), BlockKind::Text, &pid(2), &snap).unwrap();
         let render = block2.export_render_bytes().unwrap();
         assert_eq!(render, b"hello");
     }
@@ -325,7 +322,9 @@ mod tests {
     fn todo_block_uses_list_container() {
         let block = BlockDoc::new(BlockId::new("b1"), BlockKind::Todo, &pid(1)).unwrap();
         let item = serde_json::json!({"text": "buy milk", "done": false});
-        block.apply_edit(serde_json::to_vec(&item).unwrap().as_slice()).unwrap();
+        block
+            .apply_edit(serde_json::to_vec(&item).unwrap().as_slice())
+            .unwrap();
         let render = block.export_render_bytes().unwrap();
         let items: Vec<serde_json::Value> = serde_json::from_slice(&render).unwrap();
         assert_eq!(items.len(), 1);
@@ -371,7 +370,9 @@ mod tests {
     fn settings_block_uses_map_container() {
         let block = BlockDoc::new(BlockId::new("b1"), BlockKind::Settings, &pid(1)).unwrap();
         let kvs = serde_json::json!({"theme": "dark", "font_size": 14});
-        block.apply_edit(serde_json::to_vec(&kvs).unwrap().as_slice()).unwrap();
+        block
+            .apply_edit(serde_json::to_vec(&kvs).unwrap().as_slice())
+            .unwrap();
         let render = block.export_render_bytes().unwrap();
         let map: serde_json::Value = serde_json::from_slice(&render).unwrap();
         assert_eq!(map["theme"], "dark");

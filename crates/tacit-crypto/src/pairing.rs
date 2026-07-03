@@ -137,8 +137,8 @@ pub fn compute_binding_digest(
     binding_salt: &[u8],
 ) -> [u8; 32] {
     // HMAC-SHA256 接受任意长度密钥，new_from_slice 不会失败
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(binding_salt)
-        .expect("HMAC-SHA256 接受任意长度密钥");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(binding_salt).expect("HMAC-SHA256 接受任意长度密钥");
     mac.update(group_id.as_bytes());
     mac.update(initiator_pubkey);
     let result = mac.finalize().into_bytes();
@@ -159,6 +159,193 @@ pub fn derive_sas_code(binding_digest: &[u8; 32]) -> u32 {
         binding_digest[3],
     ]);
     raw % SAS_MODULUS
+}
+
+/// 将 SAS 短码格式化为 4 位零填充字符串（如 `0042`）。
+///
+/// 用于在 UI 上显示给用户比对。始终返回恰好 4 个字符。
+pub fn format_sas_code(sas: u32) -> String {
+    format!("{sas:04}")
+}
+
+/// 比对两端 SAS 短码。
+///
+/// 匹配则返回 `Ok(())`，不匹配则返回 `Err`。
+/// 此函数实现 §12.1 推荐的"短校验码确认"步骤：
+/// 用户在两端屏幕上看到 4 位数字后，输入对端数字（或由 UI 直接比对）。
+pub fn confirm_sas_code(local: u32, remote: u32) -> CoreResult<()> {
+    if local == remote {
+        Ok(())
+    } else {
+        Err(CoreError::Crypto(format!(
+            "SAS 短码不匹配：本地 {}，对端 {}",
+            format_sas_code(local),
+            format_sas_code(remote)
+        )))
+    }
+}
+
+/// 配对角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingRole {
+    /// 发起方：生成二维码。
+    Initiator,
+    /// 响应方：扫码。
+    Responder,
+}
+
+/// 配对会话状态机：封装从二维码生成/扫描到 SAS 确认的完整流程。
+///
+/// ## 流程
+///
+/// ### 发起方
+/// 1. [`PairingSession::initiator`] 创建会话，生成 `binding_salt` 与 `PairingPayload`
+/// 2. [`PairingSession::qr_json`] 编码为二维码供对端扫描
+/// 3. [`PairingSession::sas_code`] / [`PairingSession::sas_display`] 显示 4 位短码
+/// 4. [`PairingSession::confirm`] 比对对端 SAS，完成绑定
+///
+/// ### 响应方
+/// 1. [`PairingSession::responder_from_qr`] 扫描二维码创建会话
+/// 2. [`PairingSession::sas_code`] / [`PairingSession::sas_display`] 显示 4 位短码
+/// 3. [`PairingSession::confirm`] 比对对端 SAS，完成绑定
+///
+/// ## 安全模型
+///
+/// - `binding_digest = HMAC-SHA256(group_id || initiator_pubkey, binding_salt)`
+/// - 两端独立计算 `binding_digest` 并派生 SAS 短码
+/// - 用户比对 4 位数字一致后才调用 `confirm` 完成绑定
+/// - SAS 不匹配意味着中间人篡改了二维码或公钥
+pub struct PairingSession {
+    role: PairingRole,
+    group_id: String,
+    initiator_pubkey: Vec<u8>,
+    binding_salt: Vec<u8>,
+    binding_digest: [u8; 32],
+    sas_code: u32,
+    confirmed: bool,
+    bootstrap_hints: Vec<String>,
+}
+
+impl PairingSession {
+    /// 发起方创建配对会话。
+    ///
+    /// 生成随机 `binding_salt`，构造 `PairingPayload` 供二维码编码。
+    /// 调用方需提供自身的 Ed25519 公钥。
+    pub fn initiator(
+        group_id: String,
+        initiator_pubkey: Vec<u8>,
+        bootstrap_hints: Vec<String>,
+    ) -> CoreResult<Self> {
+        let salt = generate_binding_salt();
+        let digest = compute_binding_digest(&group_id, &initiator_pubkey, &salt);
+        let sas = derive_sas_code(&digest);
+        Ok(Self {
+            role: PairingRole::Initiator,
+            group_id: group_id.clone(),
+            initiator_pubkey,
+            binding_salt: salt.to_vec(),
+            binding_digest: digest,
+            sas_code: sas,
+            confirmed: false,
+            bootstrap_hints,
+        })
+    }
+
+    /// 响应方从二维码 JSON 创建配对会话。
+    ///
+    /// 解析 `PairingPayload`，校验时效，计算 `binding_digest` 与 SAS 短码。
+    pub fn responder_from_qr(qr_json: &str) -> CoreResult<Self> {
+        let payload = PairingPayload::from_qr_json(qr_json)?;
+        if !verify_binding(&payload) {
+            return Err(CoreError::Crypto(
+                "配对 payload 校验失败：已过期或字段不合法".into(),
+            ));
+        }
+        let digest = compute_binding_digest(
+            &payload.group_id,
+            &payload.initiator_pubkey,
+            &payload.binding_salt,
+        );
+        let sas = derive_sas_code(&digest);
+        Ok(Self {
+            role: PairingRole::Responder,
+            group_id: payload.group_id,
+            initiator_pubkey: payload.initiator_pubkey,
+            binding_salt: payload.binding_salt,
+            binding_digest: digest,
+            sas_code: sas,
+            confirmed: false,
+            bootstrap_hints: payload.bootstrap_hints,
+        })
+    }
+
+    /// 获取配对载荷（用于发起方编码二维码）。
+    pub fn payload(&self) -> CoreResult<PairingPayload> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        PairingPayload::new(
+            self.group_id.clone(),
+            self.initiator_pubkey.clone(),
+            self.binding_salt.clone(),
+            self.bootstrap_hints.clone(),
+            now_ms,
+        )
+    }
+
+    /// 编码为二维码 JSON（发起方使用）。
+    pub fn qr_json(&self) -> CoreResult<String> {
+        self.payload()?.to_qr_json()
+    }
+
+    /// 获取 SAS 短码（0..=9999）。
+    pub fn sas_code(&self) -> u32 {
+        self.sas_code
+    }
+
+    /// 获取格式化的 SAS 短码字符串（如 "0042"）。
+    pub fn sas_display(&self) -> String {
+        format_sas_code(self.sas_code)
+    }
+
+    /// 获取绑定摘要（32 字节）。
+    pub fn binding_digest(&self) -> &[u8; 32] {
+        &self.binding_digest
+    }
+
+    /// 获取配对角色。
+    pub fn role(&self) -> PairingRole {
+        self.role
+    }
+
+    /// 获取 group_id。
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// 获取发起方公钥。
+    pub fn initiator_pubkey(&self) -> &[u8] {
+        &self.initiator_pubkey
+    }
+
+    /// 确认对端 SAS 短码一致。
+    ///
+    /// 比对本地 SAS 与对端 SAS，匹配则标记为已确认。
+    /// 重复调用已确认的会话返回 `Ok(())`（幂等）。
+    pub fn confirm(&mut self, remote_sas: u32) -> CoreResult<()> {
+        if self.confirmed {
+            return Ok(());
+        }
+        confirm_sas_code(self.sas_code, remote_sas)?;
+        self.confirmed = true;
+        Ok(())
+    }
+
+    /// 是否已确认。
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed
+    }
 }
 
 /// 配对 payload 最大有效期：5 分钟（300 秒）。
@@ -422,5 +609,191 @@ mod tests {
         let sas_resp = derive_sas_code(&digest_resp);
         assert_eq!(sas_init, sas_resp);
         assert!(sas_init < SAS_MODULUS);
+    }
+
+    // ===== SAS 格式化与确认测试 =====
+
+    #[test]
+    fn format_sas_code_pads_to_four_digits() {
+        assert_eq!(format_sas_code(0), "0000");
+        assert_eq!(format_sas_code(1), "0001");
+        assert_eq!(format_sas_code(42), "0042");
+        assert_eq!(format_sas_code(999), "0999");
+        assert_eq!(format_sas_code(9999), "9999");
+    }
+
+    #[test]
+    fn confirm_sas_code_matching() {
+        assert!(confirm_sas_code(42, 42).is_ok());
+        assert!(confirm_sas_code(0, 0).is_ok());
+        assert!(confirm_sas_code(9999, 9999).is_ok());
+    }
+
+    #[test]
+    fn confirm_sas_code_mismatching() {
+        assert!(confirm_sas_code(42, 43).is_err());
+        assert!(confirm_sas_code(0, 1).is_err());
+        assert!(confirm_sas_code(1234, 4321).is_err());
+    }
+
+    // ===== PairingSession 测试 =====
+
+    #[test]
+    fn pairing_session_initiator_and_responder_match() {
+        let group_id = "session-group".to_string();
+        let pubkey = test_pubkey();
+
+        // 发起方创建会话
+        let initiator =
+            PairingSession::initiator(group_id.clone(), pubkey.clone(), vec![]).unwrap();
+        assert_eq!(initiator.role(), PairingRole::Initiator);
+        assert!(!initiator.is_confirmed());
+
+        // 编码二维码
+        let qr = initiator.qr_json().unwrap();
+
+        // 响应方扫码
+        let mut responder = PairingSession::responder_from_qr(&qr).unwrap();
+        assert_eq!(responder.role(), PairingRole::Responder);
+        assert!(!responder.is_confirmed());
+
+        // 两端 SAS 短码应一致
+        assert_eq!(initiator.sas_code(), responder.sas_code());
+        assert_eq!(initiator.sas_display(), responder.sas_display());
+        assert_eq!(initiator.sas_display().len(), 4);
+
+        // 确认 SAS
+        let sas = initiator.sas_code();
+        responder.confirm(sas).unwrap();
+        assert!(responder.is_confirmed());
+    }
+
+    #[test]
+    fn pairing_session_confirm_mismatch_fails() {
+        let pubkey = test_pubkey();
+        let initiator = PairingSession::initiator("mismatch-group".into(), pubkey, vec![]).unwrap();
+        let qr = initiator.qr_json().unwrap();
+        let mut responder = PairingSession::responder_from_qr(&qr).unwrap();
+
+        // 用错误的 SAS 码确认
+        let wrong_sas = (responder.sas_code() + 1) % SAS_MODULUS;
+        let result = responder.confirm(wrong_sas);
+        assert!(result.is_err());
+        assert!(!responder.is_confirmed());
+    }
+
+    #[test]
+    fn pairing_session_confirm_is_idempotent() {
+        let pubkey = test_pubkey();
+        let initiator =
+            PairingSession::initiator("idempotent-group".into(), pubkey, vec![]).unwrap();
+        let qr = initiator.qr_json().unwrap();
+        let mut responder = PairingSession::responder_from_qr(&qr).unwrap();
+
+        let sas = initiator.sas_code();
+
+        // 第一次确认
+        responder.confirm(sas).unwrap();
+        assert!(responder.is_confirmed());
+
+        // 第二次确认（幂等，即使 SAS 不同也返回 Ok）
+        let wrong_sas = (sas + 1) % SAS_MODULUS;
+        responder.confirm(wrong_sas).unwrap();
+        assert!(responder.is_confirmed());
+    }
+
+    #[test]
+    fn pairing_session_responder_rejects_expired_qr() {
+        let pubkey = test_pubkey();
+        let expired_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+            - 600_000; // 10 分钟前
+        let payload = PairingPayload::new(
+            "expired-group".to_string(),
+            pubkey,
+            vec![0xA0; BINDING_SALT_LEN],
+            vec![],
+            expired_ms,
+        )
+        .unwrap();
+        let qr = payload.to_qr_json().unwrap();
+
+        let result = PairingSession::responder_from_qr(&qr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pairing_session_binding_digest_consistent() {
+        let group_id = "digest-group".to_string();
+        let pubkey = test_pubkey();
+
+        let session = PairingSession::initiator(group_id.clone(), pubkey.clone(), vec![]).unwrap();
+
+        // Session 内部存储的 digest 应可通过 accessor 获取
+        // 通过 SAS 码间接验证 digest 一致性（SAS 从 digest 确定性派生）
+        let expected_sas = derive_sas_code(session.binding_digest());
+        assert_eq!(session.sas_code(), expected_sas);
+    }
+
+    #[test]
+    fn pairing_session_group_and_pubkey_accessors() {
+        let group_id = "accessor-group".to_string();
+        let pubkey = test_pubkey();
+
+        let session = PairingSession::initiator(group_id.clone(), pubkey.clone(), vec![]).unwrap();
+        assert_eq!(session.group_id(), "accessor-group");
+        assert_eq!(session.initiator_pubkey(), &pubkey as &[u8]);
+    }
+
+    #[test]
+    fn pairing_session_full_flow_with_sas_confirmation() {
+        // 模拟完整的 §12.1 推荐流程：
+        // 1. 发起方生成二维码
+        // 2. 响应方扫码
+        // 3. 两端显示 SAS 短码
+        // 4. 用户比对后确认
+
+        let group_id = "full-flow-group".to_string();
+        let pubkey = test_pubkey();
+
+        // 1. 发起方
+        let initiator =
+            PairingSession::initiator(group_id, pubkey, vec!["relay://example.com".into()])
+                .unwrap();
+        let qr = initiator.qr_json().unwrap();
+
+        // 2. 响应方扫码
+        let mut responder = PairingSession::responder_from_qr(&qr).unwrap();
+
+        // 3. 两端显示 SAS
+        let initiator_sas = initiator.sas_display();
+        let responder_sas = responder.sas_display();
+
+        // 4. 用户比对（模拟用户确认一致）
+        assert_eq!(initiator_sas, responder_sas, "两端 SAS 短码必须一致");
+
+        // 5. 确认绑定
+        responder.confirm(initiator.sas_code()).unwrap();
+        assert!(responder.is_confirmed());
+    }
+
+    #[test]
+    fn pairing_session_different_pubkeys_produce_different_sas() {
+        let group_id = "diff-pubkey-group".to_string();
+        let pubkey_a: Vec<u8> = (0u8..32).collect();
+        let pubkey_b: Vec<u8> = (1u8..33).collect();
+
+        let session_a = PairingSession::initiator(group_id.clone(), pubkey_a, vec![]).unwrap();
+        let session_b = PairingSession::initiator(group_id, pubkey_b, vec![]).unwrap();
+
+        // 不同公钥应产生不同的 SAS 短码（极大概率）
+        // 注意：理论上可能碰撞（1/10000），但实际不会发生
+        assert_ne!(
+            session_a.sas_code(),
+            session_b.sas_code(),
+            "不同公钥不应产生相同 SAS 短码"
+        );
     }
 }

@@ -7,8 +7,8 @@
 //! - 健康检查与主动探测
 //! - 并发连接与信号量限流
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use tacit_core::{DataFrame, DataFrameKind, DocId, PeerId, Priority, SessionId};
 use tacit_transport::{PathPreference, SyncTransport, TransportEvent};
@@ -95,6 +95,7 @@ async fn real_quic_send_control_and_receive() {
         ack_checkpoint: None,
         ack_frontier: tacit_core::Frontier::new(),
         updated_at: std::time::SystemTime::now(),
+        version_override: None,
     };
     let msg = tacit_transport::ControlMsg::AckSummary(ack);
     client
@@ -103,7 +104,11 @@ async fn real_quic_send_control_and_receive() {
         .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(received_count.load(Ordering::SeqCst), 1, "应收到 1 个控制帧");
+    assert_eq!(
+        received_count.load(Ordering::SeqCst),
+        1,
+        "应收到 1 个控制帧"
+    );
 }
 
 #[tokio::test]
@@ -164,10 +169,7 @@ async fn real_quic_health_probe_alive_connection() {
 
     // 主动探测存活连接
     let dead = client.health_probe().await;
-    assert!(
-        dead.is_empty(),
-        "存活连接的 health_probe 不应返回死连接"
-    );
+    assert!(dead.is_empty(), "存活连接的 health_probe 不应返回死连接");
 }
 
 #[tokio::test]

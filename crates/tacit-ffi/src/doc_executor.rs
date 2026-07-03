@@ -92,13 +92,9 @@ impl DocActor {
     where
         F: FnOnce() -> CoreResult<()> + Send + 'static,
     {
-        self.tx
-            .send(Box::new(op))
-            .await
-            .map_err(|_| tacit_core::CoreError::Sync(format!(
-                "DocActor 队列已关闭: doc_id={}",
-                self.doc_id
-            )))
+        self.tx.send(Box::new(op)).await.map_err(|_| {
+            tacit_core::CoreError::Sync(format!("DocActor 队列已关闭: doc_id={}", self.doc_id))
+        })
     }
 
     /// channel 是否已关闭（Actor 已退出）。
@@ -285,10 +281,7 @@ mod tests {
         let doc_id = DocId::new("d_idle");
 
         // 提交一个操作触发 actor 创建
-        registry
-            .submit(&doc_id, || Ok(()))
-            .await
-            .unwrap();
+        registry.submit(&doc_id, || Ok(())).await.unwrap();
         assert_eq!(registry.len(), 1);
 
         // 等待 idle timeout
@@ -305,10 +298,7 @@ mod tests {
         assert_eq!(registry.len(), 0);
 
         // 再次提交应重新创建 actor
-        registry
-            .submit(&doc_id, || Ok(()))
-            .await
-            .unwrap();
+        registry.submit(&doc_id, || Ok(())).await.unwrap();
         assert_eq!(registry.len(), 1);
     }
 

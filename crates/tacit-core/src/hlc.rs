@@ -92,7 +92,7 @@ impl Hlc {
     pub fn to_compact(&self) -> u64 {
         // 物理时间取低 44 位（当前时间戳远小于 2^44，不会溢出）
         let physical = (self.physical_ms as u64) & 0xFFFFFFFFFFF; // 44 bits
-        // logical 取低 20 位（u32 最大值远大于 2^20，需检查溢出）
+                                                                  // logical 取低 20 位（u32 最大值远大于 2^20，需检查溢出）
         let logical = (self.logical as u64) & 0xFFFFF; // 20 bits
         (physical << 20) | logical
     }
@@ -137,6 +137,7 @@ impl LocalSeq {
     }
 
     /// 递增并返回新值。
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u64 {
         self.0 += 1;
         self.0

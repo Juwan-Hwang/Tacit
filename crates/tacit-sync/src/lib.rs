@@ -40,7 +40,5 @@ pub use hot_path::{HotPathConfig, HotPathController, HotPathMode};
 pub use peer_registry::PeerRegistry;
 pub use pending::{BackoffPhase, PendingBlockFetch, PendingFetchQueue};
 pub use priority_queue::PriorityQueue;
-pub use recovery::{
-    FirstScreenStage, RecoveryCoordinator, RecoveryStage, RecoveryState,
-};
+pub use recovery::{FirstScreenStage, RecoveryCoordinator, RecoveryStage, RecoveryState};
 pub use watermarks::WatermarkCalculator;
