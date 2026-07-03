@@ -496,15 +496,18 @@ impl DefaultSyncEngine {
             )));
         }
 
-        // 2. 校验介绍人是否已知
-        let introducer_known = {
-            let states = self.peer_states.lock();
-            states.contains_key(&msg.introducer)
+        // 2. 校验介绍人是否已知且已被信任（Pending peer 不得引入他人）
+        let introducer_trusted = {
+            let conn = self.doc_store.store().conn();
+            match tacit_store::dao::get_peer(&conn, &msg.introducer) {
+                Ok(Some(record)) => record.trust_state == tacit_core::TrustState::Trusted,
+                _ => false,
+            }
         };
 
-        if !introducer_known {
+        if !introducer_trusted {
             return Err(tacit_core::CoreError::Sync(format!(
-                "介绍人 {} 不在已知 peer 列表中，拒绝引入未知信任链",
+                "介绍人 {} 未被信任，拒绝引入未知信任链",
                 msg.introducer
             )));
         }
@@ -1059,10 +1062,33 @@ mod tests {
         engine.on_peer_summary(peer_id, summary).unwrap();
     }
 
+    /// 辅助：注册已信任的在线 peer（内存 + DB）。
+    fn register_trusted_peer(engine: &DefaultSyncEngine, doc_store: &DocStore, peer_id: PeerId) {
+        register_online_peer(engine, peer_id.clone());
+        let conn = doc_store.store().conn();
+        tacit_store::dao::upsert_peer(
+            &conn,
+            &tacit_core::PeerRecord {
+                peer_id,
+                device_pubkey: "trusted".to_string(),
+                capabilities: Default::default(),
+                trust_state: tacit_core::TrustState::Trusted,
+                anchor_priority: 0,
+                last_seen_at: SystemTime::now(),
+                last_endpoint: None,
+                nat_capability: tacit_core::NatCapability::Unknown,
+                relay_hint: None,
+                success_ema: 1.0,
+                rotation_seq: 0,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn handle_introduce_registers_new_peer_as_pending() {
         let (engine, doc_store) = make_engine();
-        register_online_peer(&engine, pid(2));
+        register_trusted_peer(&engine, &doc_store, pid(2));
 
         let msg = tacit_transport::IntroducePeer {
             introducer: pid(2),
@@ -1083,8 +1109,8 @@ mod tests {
 
     #[test]
     fn handle_introduce_emits_peer_introduced_event() {
-        let (engine, _doc_store) = make_engine();
-        register_online_peer(&engine, pid(2));
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
 
         let msg = tacit_transport::IntroducePeer {
             introducer: pid(2),
@@ -1120,8 +1146,8 @@ mod tests {
 
     #[test]
     fn handle_introduce_rejects_mismatched_sender() {
-        let (engine, _doc_store) = make_engine();
-        register_online_peer(&engine, pid(2));
+        let (engine, doc_store) = make_engine();
+        register_trusted_peer(&engine, &doc_store, pid(2));
         register_online_peer(&engine, pid(5));
 
         // pid(5) 试图冒充 pid(2) 发起引入
@@ -1138,7 +1164,7 @@ mod tests {
     #[test]
     fn handle_introduce_does_not_overwrite_existing_peer() {
         let (engine, doc_store) = make_engine();
-        register_online_peer(&engine, pid(2));
+        register_trusted_peer(&engine, &doc_store, pid(2));
 
         {
             let conn = doc_store.store().conn();

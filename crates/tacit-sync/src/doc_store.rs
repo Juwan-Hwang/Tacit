@@ -316,23 +316,31 @@ impl DocStore {
         blocks: &[(BlockId, Vec<u8>)],
     ) -> CoreResult<Vec<ImportResult>> {
         // 1. 逐个导入 delta（CRDT 操作，不涉及 I/O）
+        //    同时保存旧 snapshot，以便 DB 写入失败时回滚内存状态
         //    使用 HashMap 去重：同一 block 在批次中出现多次时，只保留最终 snapshot
         let mut results = Vec::with_capacity(blocks.len());
-        let mut changed_blocks: std::collections::HashMap<BlockId, Vec<u8>> =
+        let mut changed_blocks: std::collections::HashMap<BlockId, (Vec<u8>, BlockKind, Vec<u8>)> =
             std::collections::HashMap::new();
         for (block_id, bytes) in blocks {
             let block = self.get_block(doc_id, block_id)?;
+            // 导入前保存旧 snapshot 用于回滚
+            let old_snap = block.export_snapshot().ok();
+            let kind = block.kind();
             let result = block.import(bytes)?;
             if result.changed {
-                changed_blocks.insert(block_id.clone(), block.export_snapshot()?);
+                let new_snap = block.export_snapshot()?;
+                changed_blocks.insert(
+                    block_id.clone(),
+                    (new_snap, kind, old_snap.unwrap_or_default()),
+                );
             }
             results.push(result);
         }
 
         // 2. 在单个事务中批量持久化所有变更的 snapshot（每个 block 仅写一次）
         if !changed_blocks.is_empty() {
-            self.store.transaction(|conn| {
-                for (block_id, snap) in &changed_blocks {
+            if let Err(e) = self.store.transaction(|conn| {
+                for (block_id, (snap, _, _)) in &changed_blocks {
                     dao::insert_snapshot(
                         conn,
                         doc_id,
@@ -343,7 +351,31 @@ impl DocStore {
                     )?;
                 }
                 Ok(())
-            })?;
+            }) {
+                // DB 写入失败：用旧 snapshot 重建 BlockDoc 以回滚内存状态
+                tracing::error!(
+                    doc_id = %doc_id,
+                    error = %e,
+                    "批量导入 DB 写入失败，正在回滚内存状态"
+                );
+                for (block_id, (_, kind, old_snap)) in &changed_blocks {
+                    if !old_snap.is_empty() {
+                        if let Ok(restored) = BlockDoc::from_snapshot(
+                            block_id.clone(),
+                            *kind,
+                            &self.peer_id,
+                            old_snap,
+                        ) {
+                            self.cache.insert(block_id.clone(), Arc::new(restored));
+                            tracing::debug!(
+                                block_id = %block_id,
+                                "已用旧 snapshot 回滚内存状态"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
             tracing::debug!(
                 doc_id = %doc_id,
                 total = blocks.len(),

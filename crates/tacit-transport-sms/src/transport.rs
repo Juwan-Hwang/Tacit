@@ -89,16 +89,15 @@ impl SmsTransport {
     /// 在配对阶段从 `bootstrap_hints` 中提取 `sms:` 前缀的号码，
     /// 或由集成层直接注入。
     pub fn register_peer(&self, peer_id: PeerId, phone: String) {
-        // 先读取旧号码（释放读锁后再获取写锁，避免死锁）
-        let old_phone = self.peer_phones.read().get(&peer_id).cloned();
-
         // 统一锁顺序：peer_phones -> phone_peers（与 unregister_peer 一致）
+        // 直接获取写锁，避免先读后写产生的 TOCTOU 竞态
         let mut peer_phones = self.peer_phones.write();
         let mut phone_peers = self.phone_peers.write();
+        let old_phone = peer_phones.get(&peer_id).cloned();
 
-        // 清理旧的反向映射：如果此 peer 之前注册过不同号码，移除旧的 phone→peer 条目
+        // 清理旧的反向映射：如果此 peer 之前注册过不同号码，且该号码仍映射到此 peer，则移除
         if let Some(ref old) = old_phone {
-            if old != &phone {
+            if old != &phone && phone_peers.get(old) == Some(&peer_id) {
                 phone_peers.remove(old);
             }
         }
