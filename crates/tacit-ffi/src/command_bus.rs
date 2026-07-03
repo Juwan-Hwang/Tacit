@@ -20,10 +20,7 @@ const DEFAULT_COMMAND_CAPACITY: usize = 256;
 #[derive(Debug, Clone)]
 pub enum Command {
     /// 创建文档。
-    CreateDocument {
-        doc_id: DocId,
-        kind: String,
-    },
+    CreateDocument { doc_id: DocId, kind: String },
     /// 创建 block。
     CreateBlock {
         doc_id: DocId,
@@ -39,19 +36,11 @@ pub enum Command {
     /// 请求 fast-resume。
     RequestFastResume,
     /// 请求同步。
-    RequestSync {
-        peer_id: PeerId,
-        reason: SyncReason,
-    },
+    RequestSync { peer_id: PeerId, reason: SyncReason },
     /// 通知 peer 上线。
-    PeerOnline {
-        peer_id: PeerId,
-    },
+    PeerOnline { peer_id: PeerId },
     /// 通知网络状态变化。
-    NetworkChanged {
-        online: bool,
-        net_type: String,
-    },
+    NetworkChanged { online: bool, net_type: String },
     /// 触发 Hot-Path 模式。
     TriggerHotPath,
     /// 退出 Hot-Path 模式。
@@ -87,22 +76,18 @@ impl CommandBus {
 
     /// 发送命令（非阻塞，队列满时返回错误）。
     pub fn try_send(&self, cmd: Command) -> Result<(), CommandBusError> {
-        self.tx
-            .try_send(cmd)
-            .map_err(|e| match e {
-                crossbeam_channel::TrySendError::Full(_) => CommandBusError::QueueFull,
-                crossbeam_channel::TrySendError::Disconnected(_) => CommandBusError::Disconnected,
-            })
+        self.tx.try_send(cmd).map_err(|e| match e {
+            crossbeam_channel::TrySendError::Full(_) => CommandBusError::QueueFull,
+            crossbeam_channel::TrySendError::Disconnected(_) => CommandBusError::Disconnected,
+        })
     }
 
     /// 发送命令（阻塞等待，带超时）。
     pub fn send_timeout(&self, cmd: Command, timeout: Duration) -> Result<(), CommandBusError> {
-        self.tx
-            .send_timeout(cmd, timeout)
-            .map_err(|e| match e {
-                crossbeam_channel::SendTimeoutError::Timeout(_) => CommandBusError::Timeout,
-                crossbeam_channel::SendTimeoutError::Disconnected(_) => CommandBusError::Disconnected,
-            })
+        self.tx.send_timeout(cmd, timeout).map_err(|e| match e {
+            crossbeam_channel::SendTimeoutError::Timeout(_) => CommandBusError::Timeout,
+            crossbeam_channel::SendTimeoutError::Disconnected(_) => CommandBusError::Disconnected,
+        })
     }
 
     /// 接收端引用（供 RuntimeSupervisor 消费）。

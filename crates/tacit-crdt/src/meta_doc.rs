@@ -10,11 +10,10 @@ use loro::{LoroDoc, LoroMovableList, LoroValue, ValueOrContainer};
 use parking_lot::Mutex;
 use serde_json;
 use std::collections::HashMap;
-use tacit_core::{
-    BlockId, BlockKind, BlockRecord, CoreError, CoreResult, DocId, Frontier, ImportResult,
-    PeerId,
-};
 use std::time::SystemTime;
+use tacit_core::{
+    BlockId, BlockKind, BlockRecord, CoreError, CoreResult, DocId, Frontier, ImportResult, PeerId,
+};
 
 use crate::converter::{frontiers_to_frontier, LoroExport};
 
@@ -115,8 +114,8 @@ impl MetaDoc {
             deleted: false,
             updated_at: SystemTime::now(),
         };
-        let json = serde_json::to_string(&record)
-            .map_err(|e| CoreError::Serialize(e.to_string()))?;
+        let json =
+            serde_json::to_string(&record).map_err(|e| CoreError::Serialize(e.to_string()))?;
         let list = self.list();
         let pos = list.len();
         list.insert(pos, json)
@@ -134,12 +133,12 @@ impl MetaDoc {
     pub fn soft_delete(&self, block_id: &BlockId) -> CoreResult<()> {
         let list = self.list();
         // 使用内存索引查找（O(1)），索引不存在时自动构建（O(n) 一次）
-        let idx = self.find_block_index(&list, block_id).ok_or_else(|| {
-            CoreError::BlockNotFound {
-                doc_id: self.doc_id.to_string(),
-                block_id: block_id.to_string(),
-            }
-        })?;
+        let idx =
+            self.find_block_index(&list, block_id)
+                .ok_or_else(|| CoreError::BlockNotFound {
+                    doc_id: self.doc_id.to_string(),
+                    block_id: block_id.to_string(),
+                })?;
 
         if let Some(ValueOrContainer::Value(LoroValue::String(s))) = list.get(idx) {
             if let Ok(mut record) = serde_json::from_str::<BlockRecord>(s.as_str()) {
@@ -192,12 +191,12 @@ impl MetaDoc {
     pub fn remove_block(&self, block_id: &BlockId) -> CoreResult<()> {
         let list = self.list();
         // 使用内存索引查找
-        let idx = self.find_block_index(&list, block_id).ok_or_else(|| {
-            CoreError::BlockNotFound {
-                doc_id: self.doc_id.to_string(),
-                block_id: block_id.to_string(),
-            }
-        })?;
+        let idx =
+            self.find_block_index(&list, block_id)
+                .ok_or_else(|| CoreError::BlockNotFound {
+                    doc_id: self.doc_id.to_string(),
+                    block_id: block_id.to_string(),
+                })?;
 
         if let Some(ValueOrContainer::Value(LoroValue::String(s))) = list.get(idx) {
             if let Ok(record) = serde_json::from_str::<BlockRecord>(s.as_str()) {
@@ -280,7 +279,11 @@ impl MetaDoc {
 
     /// 列出未删除的 block。
     pub fn list_active_blocks(&self) -> CoreResult<Vec<BlockRecord>> {
-        Ok(self.list_blocks()?.into_iter().filter(|b| !b.deleted).collect())
+        Ok(self
+            .list_blocks()?
+            .into_iter()
+            .filter(|b| !b.deleted)
+            .collect())
     }
 
     /// 导出完整 snapshot。
@@ -343,7 +346,9 @@ mod tests {
         // 全部列表仍含已删除项
         let all = meta.list_blocks().unwrap();
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|b| b.block_id == BlockId::new("b1") && b.deleted));
+        assert!(all
+            .iter()
+            .any(|b| b.block_id == BlockId::new("b1") && b.deleted));
     }
 
     #[test]

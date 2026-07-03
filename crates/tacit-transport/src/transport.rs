@@ -4,9 +4,7 @@
 //! - [`TransportManager`]：高层管理接口（蓝图定义），负责连接池、presence、网络变化。
 
 use async_trait::async_trait;
-use tacit_core::{
-    CoreResult, DataFrame, NetworkType, PeerId, PresenceHint, Priority,
-};
+use tacit_core::{CoreResult, DataFrame, NetworkType, PeerId, PresenceHint, Priority};
 
 use crate::ControlMsg;
 

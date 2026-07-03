@@ -72,7 +72,7 @@ impl DiscoveryFrame {
         if data.len() < 19 {
             return Err(FrameError::TooShort);
         }
-        if &data[0..2] != MAGIC {
+        if data[0..2] != MAGIC {
             return Err(FrameError::BadMagic);
         }
         let version = data[2];
@@ -184,12 +184,12 @@ impl ControlFrame {
         if data.len() < 30 {
             return Err(FrameError::TooShort);
         }
-        if &data[0..2] != MAGIC {
+        if data[0..2] != MAGIC {
             return Err(FrameError::BadMagic);
         }
         let version = data[2];
-        let ctrl_type = ControlType::from_u8(data[3])
-            .ok_or(FrameError::UnknownControlType(data[3]))?;
+        let ctrl_type =
+            ControlType::from_u8(data[3]).ok_or(FrameError::UnknownControlType(data[3]))?;
         let session_id = u64::from_be_bytes(data[4..12].try_into().unwrap());
         let payload_len = u16::from_be_bytes([data[12], data[13]]) as usize;
         if data.len() < 14 + payload_len + 16 {
@@ -307,8 +307,8 @@ impl DataFrameWire {
     /// sync 层需通过 hex 字符串匹配已知的 doc/peer。
     pub fn to_data_frame(&self) -> DataFrame {
         DataFrame {
-            doc_id: DocId::new(&hex::encode(self.doc_id)),
-            actor_id: PeerId::new(&hex::encode(self.actor_id)),
+            doc_id: DocId::new(hex::encode(self.doc_id)),
+            actor_id: PeerId::new(hex::encode(self.actor_id)),
             seq: self.seq,
             kind: self.kind,
             payload: self.payload.clone(),
@@ -344,7 +344,7 @@ impl DataFrameWire {
         if data.len() < 40 {
             return Err(FrameError::TooShort);
         }
-        if &data[0..2] != MAGIC {
+        if data[0..2] != MAGIC {
             return Err(FrameError::BadMagic);
         }
         let version = data[2];
@@ -361,10 +361,8 @@ impl DataFrameWire {
         let ref_id: [u8; 8] = data[29 + payload_len..29 + payload_len + 8]
             .try_into()
             .unwrap();
-        let sig_len = u16::from_be_bytes([
-            data[29 + payload_len + 8],
-            data[29 + payload_len + 9],
-        ]) as usize;
+        let sig_len =
+            u16::from_be_bytes([data[29 + payload_len + 8], data[29 + payload_len + 9]]) as usize;
         let sig_start = 29 + payload_len + 10;
         if data.len() < sig_start + sig_len + 16 {
             return Err(FrameError::TooShort);
@@ -626,10 +624,7 @@ mod tests {
 
     #[test]
     fn tlv_encode_decode() {
-        let entries = vec![
-            (1u8, b"hello".to_vec()),
-            (2u8, b"world".to_vec()),
-        ];
+        let entries = vec![(1u8, b"hello".to_vec()), (2u8, b"world".to_vec())];
         let encoded = Tlv::encode_all(&entries);
         let decoded = Tlv::decode_all(&encoded).unwrap();
         assert_eq!(decoded, entries);
