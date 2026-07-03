@@ -448,8 +448,8 @@ mod tests {
         non_matching.insert(other_uuid, vec![0x01, 0x02]);
 
         // 匹配的应能取到 payload
-        assert!(matching.get(&tacit_uuid).is_some());
+        assert!(matching.contains_key(&tacit_uuid));
         // 不匹配的取不到 TACIT payload
-        assert!(non_matching.get(&tacit_uuid).is_none());
+        assert!(!non_matching.contains_key(&tacit_uuid));
     }
 }
