@@ -56,11 +56,17 @@ enum BackendState {
 
 impl BackendState {
     fn is_broadcasting(&self) -> bool {
-        matches!(self, BackendState::Broadcasting | BackendState::BroadcastingAndScanning)
+        matches!(
+            self,
+            BackendState::Broadcasting | BackendState::BroadcastingAndScanning
+        )
     }
 
     fn is_scanning(&self) -> bool {
-        matches!(self, BackendState::Scanning | BackendState::BroadcastingAndScanning)
+        matches!(
+            self,
+            BackendState::Scanning | BackendState::BroadcastingAndScanning
+        )
     }
 
     fn set_broadcasting(&mut self, on: bool) {
@@ -289,11 +295,7 @@ impl BluerBackend {
     ///
     /// 仅处理包含 TACIT_SERVICE_UUID 的 service data，
     /// 并从 payload 中的 device_id 获取 peer_id（不使用 MAC 作为 fallback）。
-    async fn process_device(
-        adapter: &bluer::Adapter,
-        backend: &Arc<Self>,
-        addr: &bluer::Address,
-    ) {
+    async fn process_device(adapter: &bluer::Adapter, backend: &Arc<Self>, addr: &bluer::Address) {
         let device = match adapter.device(*addr) {
             Ok(d) => d,
             Err(e) => {
@@ -356,9 +358,11 @@ impl BluerBackend {
 
 impl PresenceBackend for BluerBackend {
     fn start_broadcast(&self, payload: Vec<u8>) -> CoreResult<()> {
-        let tx = self.cmd_tx.lock().clone().ok_or_else(|| {
-            CoreError::Transport("bluez 后端已关闭".into())
-        })?;
+        let tx = self
+            .cmd_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("bluez 后端已关闭".into()))?;
         tx.send(BackendCommand::StartBroadcast(payload))
             .map_err(|_| CoreError::Transport("发送广播命令失败".into()))?;
         Ok(())
@@ -373,9 +377,11 @@ impl PresenceBackend for BluerBackend {
     }
 
     fn start_scan(&self) -> CoreResult<()> {
-        let tx = self.cmd_tx.lock().clone().ok_or_else(|| {
-            CoreError::Transport("bluez 后端已关闭".into())
-        })?;
+        let tx = self
+            .cmd_tx
+            .lock()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("bluez 后端已关闭".into()))?;
         tx.send(BackendCommand::StartScan)
             .map_err(|_| CoreError::Transport("发送扫描命令失败".into()))?;
         Ok(())

@@ -28,20 +28,15 @@ pub enum HotPathMode {
 }
 
 /// 设备类型：不同平台的唤醒窗口差异较大。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeviceProfile {
     /// iOS：后台唤醒窗口极短（1-3 秒），系统启发式调度。
     Ios,
     /// Android：前台服务可保持较长连接，但后台仍受限。
     Android,
     /// Desktop：无需 Hot-Path 限制，可始终 Normal 模式。
+    #[default]
     Desktop,
-}
-
-impl Default for DeviceProfile {
-    fn default() -> Self {
-        Self::Desktop
-    }
 }
 
 /// Hot-Path 控制器配置。
@@ -169,16 +164,14 @@ impl Default for HotPathController {
 fn is_control_action(action: &SyncAction) -> bool {
     matches!(
         action,
-        SyncAction::SendControl { .. }
-            | SyncAction::RequestDelta { .. }
-            | SyncAction::EmitEvent(_)
+        SyncAction::SendControl { .. } | SyncAction::RequestDelta { .. } | SyncAction::EmitEvent(_)
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tacit_core::{DocId, PeerId, Frontier};
+    use tacit_core::{DocId, Frontier, PeerId};
     use tacit_transport::ControlMsg;
 
     fn pid(n: u64) -> PeerId {
@@ -199,13 +192,14 @@ mod tests {
     fn control_action() -> SyncAction {
         SyncAction::SendControl {
             peer_id: pid(1),
-            msg: ControlMsg::AckSummary(tacit_core::AckSummary {
-                peer_id: pid(1),
-                doc_id: DocId::new("d1"),
-                ack_checkpoint: None,
-                ack_frontier: Frontier::new(),
-                updated_at: std::time::SystemTime::now(),
-            }),
+msg: ControlMsg::AckSummary(tacit_core::AckSummary {
+peer_id: pid(1),
+doc_id: DocId::new("d1"),
+ack_checkpoint: None,
+ack_frontier: Frontier::new(),
+updated_at: std::time::SystemTime::now(),
+version_override: None,
+}),
             priority: tacit_core::Priority::Medium,
         }
     }

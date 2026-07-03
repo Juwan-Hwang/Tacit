@@ -95,9 +95,7 @@ impl SnapshotReassembler {
                 let chunk = state
                     .chunks
                     .get(&i)
-                    .ok_or_else(|| {
-                        CoreError::Store(format!("缺少分片: index={}", i))
-                    })?;
+                    .ok_or_else(|| CoreError::Store(format!("缺少分片: index={}", i)))?;
                 complete.extend_from_slice(&chunk.data);
             }
             // 从 pending 移除
@@ -117,10 +115,7 @@ impl SnapshotReassembler {
     pub fn progress(&self, checkpoint_id: &CheckpointId) -> (u32, u32) {
         let pending = self.pending.lock();
         if let Some(state) = pending.get(checkpoint_id.as_str()) {
-            (
-                state.chunks.len() as u32,
-                state.total.unwrap_or(0),
-            )
+            (state.chunks.len() as u32, state.total.unwrap_or(0))
         } else {
             (0, 0)
         }
@@ -161,15 +156,21 @@ mod tests {
     fn reassembles_complete_snapshot() {
         let reassembler = SnapshotReassembler::new();
         let data = b"hello world this is a snapshot";
-        let chunks = vec![
+        let chunks = [
             make_chunk("ckpt1", 0, 3, &data[0..10]),
             make_chunk("ckpt1", 1, 3, &data[10..20]),
             make_chunk("ckpt1", 2, 3, &data[20..]),
         ];
 
         // 前两个分片不应完成
-        assert!(reassembler.receive_chunk(chunks[0].clone()).unwrap().is_none());
-        assert!(reassembler.receive_chunk(chunks[1].clone()).unwrap().is_none());
+        assert!(reassembler
+            .receive_chunk(chunks[0].clone())
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .receive_chunk(chunks[1].clone())
+            .unwrap()
+            .is_none());
 
         // 第三个分片应完成
         let result = reassembler.receive_chunk(chunks[2].clone()).unwrap();
@@ -182,15 +183,21 @@ mod tests {
     fn handles_out_of_order() {
         let reassembler = SnapshotReassembler::new();
         let data = b"0123456789";
-        let chunks = vec![
+        let chunks = [
             make_chunk("ckpt1", 0, 3, &data[0..4]),
             make_chunk("ckpt1", 1, 3, &data[4..7]),
             make_chunk("ckpt1", 2, 3, &data[7..]),
         ];
 
         // 乱序接收
-        assert!(reassembler.receive_chunk(chunks[2].clone()).unwrap().is_none());
-        assert!(reassembler.receive_chunk(chunks[0].clone()).unwrap().is_none());
+        assert!(reassembler
+            .receive_chunk(chunks[2].clone())
+            .unwrap()
+            .is_none());
+        assert!(reassembler
+            .receive_chunk(chunks[0].clone())
+            .unwrap()
+            .is_none());
         let result = reassembler.receive_chunk(chunks[1].clone()).unwrap();
         assert!(result.is_some());
         assert_eq!(result.unwrap(), data);
@@ -200,7 +207,7 @@ mod tests {
     fn ignores_duplicate_chunks() {
         let reassembler = SnapshotReassembler::new();
         let data = b"hello";
-        let chunks = vec![
+        let chunks = [
             make_chunk("ckpt1", 0, 2, &data[0..3]),
             make_chunk("ckpt1", 1, 2, &data[3..]),
         ];

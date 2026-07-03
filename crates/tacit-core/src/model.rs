@@ -184,6 +184,12 @@ pub struct AckSummary {
     /// 当前 ack frontier。
     pub ack_frontier: Frontier,
     pub updated_at: SystemTime,
+    /// 可选版本覆盖信息（§13.2）。
+    ///
+    /// 当 peer 声明的协议/格式版本与本地不同时，携带此字段覆盖默认版本协商结果。
+    /// v1.0 中通常为 `None`；后续多版本能力协商时启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_override: Option<u32>,
 }
 
 /// 双水位：强安全与软安全。

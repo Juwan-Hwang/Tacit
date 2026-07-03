@@ -27,10 +27,7 @@ pub enum ControlMsg {
     /// 缺口请求：请求对端发送自 `since` 之后的 delta。
     NeedRanges(NeedRanges),
     /// 同步意图：表明本端希望开始同步。
-    SyncIntent {
-        peer_id: PeerId,
-        doc_id: DocId,
-    },
+    SyncIntent { peer_id: PeerId, doc_id: DocId },
     /// 传输提示：告知对端本端偏好的传输路径与参数。
     TransportHints(TransportHints),
     /// 中继提示：告知对端可用的中继服务器信息。

@@ -10,14 +10,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tacit_core::{
-    BlockId, BlockKind, DocId, PeerId, SyncReason,
-};
+use tacit_core::{BlockId, BlockKind, DocId, PeerId, SyncReason};
 use tacit_store::Store;
-use tacit_sync::{DocStore, EngineConfig, DefaultSyncEngine, SyncEngine, SyncAction};
-use tacit_transport_relay::{
-    generate_proof, verify_proof, RelayClient, RelayServer,
-};
+use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncAction, SyncEngine};
+use tacit_transport_relay::{generate_proof, verify_proof, RelayClient, RelayServer};
 
 fn pid(n: u64) -> PeerId {
     PeerId(n.to_string())
@@ -57,7 +53,9 @@ fn transfer_block_delta(
         if !doc_exists {
             target.create_doc(doc_id.clone(), "note").unwrap();
         }
-        target.create_block(doc_id, block_id.clone(), BlockKind::Text).unwrap();
+        target
+            .create_block(doc_id, block_id.clone(), BlockKind::Text)
+            .unwrap();
     }
     // since 为空时用完整 snapshot（含容器创建 op），非空时用增量 delta
     let bytes = if since.is_empty() {
@@ -108,8 +106,10 @@ fn three_node_lan_sync_converges() {
 
     // peer 1 创建文档和 block，编辑
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"hello from peer1").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"hello from peer1")
+        .unwrap();
 
     // 同步到 peer 2：先 meta，再 block
     let empty = tacit_core::Frontier::new();
@@ -117,7 +117,8 @@ fn three_node_lan_sync_converges() {
     transfer_block_delta(&ds1, &ds2, &doc_id, &block_id, &empty);
 
     // peer 2 编辑
-    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 edit").unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 edit")
+        .unwrap();
 
     // peer 2 同步到 peer 3（peer3 无先验状态，用空 frontier 做全量同步）
     transfer_meta_delta(&ds2, &ds3, &doc_id, &empty);
@@ -156,8 +157,10 @@ fn anchor_offline_switch() {
 
     // 初始：peer 1（Anchor）创建文档
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"anchor initial").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"anchor initial")
+        .unwrap();
 
     // 同步到 peer 2 和 peer 3
     let empty = tacit_core::Frontier::new();
@@ -167,7 +170,8 @@ fn anchor_offline_switch() {
     transfer_block_delta(&ds1, &ds3, &doc_id, &block_id, &empty);
 
     // Anchor（peer 1）离线，peer 2 编辑
-    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 while anchor offline").unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 while anchor offline")
+        .unwrap();
 
     // peer 2 直接同步给 peer 3（绕过 Anchor）
     let f2 = ds1.block_frontier(&doc_id, &block_id).unwrap();
@@ -201,8 +205,10 @@ fn stale_device_catchup() {
 
     // 初始同步
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"initial").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"initial")
+        .unwrap();
 
     let empty = tacit_core::Frontier::new();
     transfer_meta_delta(&ds1, &ds2, &doc_id, &empty);
@@ -212,18 +218,28 @@ fn stale_device_catchup() {
     let stale_frontier = ds1.block_frontier(&doc_id, &block_id).unwrap();
 
     // peer 2 持续编辑（模拟 peer 1 离线期间）
-    ds2.apply_local_edit(&doc_id, &block_id, b" + edit1").unwrap();
-    ds2.apply_local_edit(&doc_id, &block_id, b" + edit2").unwrap();
-    ds2.apply_local_edit(&doc_id, &block_id, b" + edit3").unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + edit1")
+        .unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + edit2")
+        .unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + edit3")
+        .unwrap();
 
-    let peer2_final_render = ds2.get_block(&doc_id, &block_id).unwrap()
-        .export_render_bytes().unwrap();
+    let peer2_final_render = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
 
     // peer 1 回来，通过 shallow snapshot + tail delta 追赶
     // 1. 导出 peer 2 的 shallow snapshot（在 stale_frontier 处）
-    let shallow = ds2.export_block_shallow(&doc_id, &block_id, &stale_frontier).unwrap();
+    let shallow = ds2
+        .export_block_shallow(&doc_id, &block_id, &stale_frontier)
+        .unwrap();
     // 2. 导出 peer 2 自 stale_frontier 之后的 tail delta
-    let tail_delta = ds2.export_block_delta(&doc_id, &block_id, &stale_frontier).unwrap();
+    let tail_delta = ds2
+        .export_block_delta(&doc_id, &block_id, &stale_frontier)
+        .unwrap();
 
     // 3. peer 1 先导入 shallow snapshot（手术式重入）
     ds1.import_block(&doc_id, &block_id, &shallow).unwrap();
@@ -231,9 +247,15 @@ fn stale_device_catchup() {
     ds1.import_block(&doc_id, &block_id, &tail_delta).unwrap();
 
     // 验证 peer 1 追上 peer 2
-    let peer1_final_render = ds1.get_block(&doc_id, &block_id).unwrap()
-        .export_render_bytes().unwrap();
-    assert_eq!(peer1_final_render, peer2_final_render, "stale device 应追上最新状态");
+    let peer1_final_render = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    assert_eq!(
+        peer1_final_render, peer2_final_render,
+        "stale device 应追上最新状态"
+    );
 }
 
 // ===== relay 兜底 =====
@@ -264,7 +286,10 @@ fn relay_fallback_data_forwarding() {
     let incoming = server.handle_forward(&forward_req).unwrap();
 
     match incoming {
-        tacit_transport_relay::RelayMessage::Incoming { from_peer_id, data: received } => {
+        tacit_transport_relay::RelayMessage::Incoming {
+            from_peer_id,
+            data: received,
+        } => {
             assert_eq!(from_peer_id, "1");
             assert_eq!(received, data);
         }
@@ -280,7 +305,10 @@ fn relay_fallback_data_forwarding() {
     };
     let incoming2 = server.handle_forward(&forward_req2).unwrap();
     match incoming2 {
-        tacit_transport_relay::RelayMessage::Incoming { from_peer_id, data: received } => {
+        tacit_transport_relay::RelayMessage::Incoming {
+            from_peer_id,
+            data: received,
+        } => {
             assert_eq!(from_peer_id, "2");
             assert_eq!(received, data2);
         }
@@ -295,11 +323,17 @@ fn relay_admission_rejects_unauthorized() {
 
     // 用错误密钥生成 proof
     let bad_proof = generate_proof(&pid(1), b"wrong_secret").unwrap();
-    assert!(server.handle_register(&bad_proof).is_err(), "错误密钥应被拒绝");
+    assert!(
+        server.handle_register(&bad_proof).is_err(),
+        "错误密钥应被拒绝"
+    );
 
     // 用正确密钥生成 proof
     let good_proof = generate_proof(&pid(1), &secret).unwrap();
-    assert!(server.handle_register(&good_proof).is_ok(), "正确密钥应通过");
+    assert!(
+        server.handle_register(&good_proof).is_ok(),
+        "正确密钥应通过"
+    );
 
     // 验证 proof 完整性
     let proof = generate_proof(&pid(2), &secret).unwrap();
@@ -324,7 +358,9 @@ fn relay_client_register_forward_flow() {
         _ => panic!("期望 Register"),
     };
     let session1 = server.handle_register(&proof).unwrap();
-    let response = tacit_transport_relay::RelayMessage::RegisterOk { session_id: session1 };
+    let response = tacit_transport_relay::RelayMessage::RegisterOk {
+        session_id: session1,
+    };
     client1.handle_register_response(&response).unwrap();
     assert!(client1.is_registered());
 
@@ -335,13 +371,17 @@ fn relay_client_register_forward_flow() {
         _ => panic!("期望 Register"),
     };
     let session2 = server.handle_register(&proof2).unwrap();
-    let response2 = tacit_transport_relay::RelayMessage::RegisterOk { session_id: session2 };
+    let response2 = tacit_transport_relay::RelayMessage::RegisterOk {
+        session_id: session2,
+    };
     client2.handle_register_response(&response2).unwrap();
     assert!(client2.is_registered());
 
     // client1 通过 relay 转发数据给 client2
     let data = vec![1, 2, 3, 4, 5];
-    let forward_msg = client1.create_forward_message(&pid(2), data.clone()).unwrap();
+    let forward_msg = client1
+        .create_forward_message(&pid(2), data.clone())
+        .unwrap();
     // 模拟 server 处理转发
     let forward_req = match &forward_msg {
         tacit_transport_relay::RelayMessage::Forward(req) => req.clone(),
@@ -362,9 +402,15 @@ fn fast_resume_first_screen_renderable() {
 
     // 创建引擎，模拟用户使用
     let engine = TacitEngine::new_memory("1").unwrap();
-    engine.create_document("doc1".into(), "note".into()).unwrap();
-    engine.create_block("doc1".into(), "block1".into(), "text".into()).unwrap();
-    engine.apply_user_edit("doc1".into(), "block1".into(), b"hello world".to_vec()).unwrap();
+    engine
+        .create_document("doc1".into(), "note".into())
+        .unwrap();
+    engine
+        .create_block("doc1".into(), "block1".into(), "text".into())
+        .unwrap();
+    engine
+        .apply_user_edit("doc1".into(), "block1".into(), b"hello world".to_vec())
+        .unwrap();
 
     // 模拟应用重启：调用 fast_resume 恢复所有文档状态
     engine.request_fast_resume().unwrap();
@@ -372,7 +418,10 @@ fn fast_resume_first_screen_renderable() {
     // 验证首屏可渲染：打开文档，获取 block 列表
     let view = engine.open_document("doc1".into()).unwrap();
     assert_eq!(view.doc_id, "doc1");
-    assert!(!view.block_ids.is_empty(), "fast-resume 后应有 block 可渲染");
+    assert!(
+        !view.block_ids.is_empty(),
+        "fast-resume 后应有 block 可渲染"
+    );
     assert_eq!(view.block_ids[0], "block1");
 }
 
@@ -381,8 +430,12 @@ fn fast_resume_after_peer_online() {
     use tacit_ffi::TacitEngine;
 
     let engine = TacitEngine::new_memory("1").unwrap();
-    engine.create_document("doc1".into(), "note".into()).unwrap();
-    engine.create_block("doc1".into(), "block1".into(), "text".into()).unwrap();
+    engine
+        .create_document("doc1".into(), "note".into())
+        .unwrap();
+    engine
+        .create_block("doc1".into(), "block1".into(), "text".into())
+        .unwrap();
 
     // peer 上线触发同步
     engine.on_peer_online("2".into()).unwrap();
@@ -404,42 +457,53 @@ fn dependency_wait_and_retry() {
     let block_id = BlockId::new("b1");
 
     ds.create_doc(doc_id.clone(), "note").unwrap();
-    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
 
     // peer 2 上线
-    engine.on_peer_summary(
-        pid(2),
-        tacit_core::PeerSummary {
-            peer_id: pid(2),
-            online: true,
-            frontier: tacit_core::Frontier::new(),
-            capabilities: Default::default(),
-        },
-    ).unwrap();
+    engine
+        .on_peer_summary(
+            pid(2),
+            tacit_core::PeerSummary {
+                peer_id: pid(2),
+                online: true,
+                frontier: tacit_core::Frontier::new(),
+                capabilities: Default::default(),
+            },
+        )
+        .unwrap();
 
     // 请求同步，应产生 SendData 动作
-    engine.request_sync(pid(2), SyncReason::UserForeground).unwrap();
+    engine
+        .request_sync(pid(2), SyncReason::UserForeground)
+        .unwrap();
     let actions = engine.drain_actions();
-    assert!(actions.iter().any(|a| matches!(a, SyncAction::SendData { .. })));
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, SyncAction::SendData { .. })));
 
     // 模拟依赖等待：入队一个 block fetch
     let now = Instant::now();
-    engine.pending_queue().enqueue(tacit_sync::PendingBlockFetch {
-        doc_id: doc_id.clone(),
-        block_id: block_id.clone(),
-        expected_frontier: tacit_core::Frontier::new(),
-        observed_frontier: tacit_core::Frontier::new(),
-        peer_id: pid(2),
-        retry_at: now,
-        retries: 0,
-        phase: tacit_sync::BackoffPhase::Normal,
-    });
+    engine
+        .pending_queue()
+        .enqueue(tacit_sync::PendingBlockFetch {
+            doc_id: doc_id.clone(),
+            block_id: block_id.clone(),
+            expected_frontier: tacit_core::Frontier::new(),
+            observed_frontier: tacit_core::Frontier::new(),
+            peer_id: pid(2),
+            retry_at: now,
+            retries: 0,
+            phase: tacit_sync::BackoffPhase::Normal,
+        });
     assert_eq!(engine.pending_queue().len(), 1);
 
     // 处理到期条目，应产生 RequestDelta 并重新入队
     engine.process_pending(now).unwrap();
     let actions = engine.drain_actions();
-    assert!(actions.iter().any(|a| matches!(a, SyncAction::RequestDelta { .. })));
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, SyncAction::RequestDelta { .. })));
     assert_eq!(engine.pending_queue().len(), 1, "应重新入队等待重试");
 }
 
@@ -448,8 +512,8 @@ fn dependency_wait_and_retry() {
 #[test]
 fn watermarks_gc_computation() {
     use std::time::{Duration, SystemTime};
-    use tacit_store::dao;
     use tacit_core::{AckSummary, Frontier};
+    use tacit_store::dao;
 
     let (ds, engine) = make_node(1);
     let doc_id = DocId::new("d1");
@@ -458,36 +522,54 @@ fn watermarks_gc_computation() {
     // 插入两个 peer 的 ack
     {
         let conn = ds.store().conn();
-        dao::upsert_ack(&conn, &AckSummary {
-            peer_id: pid(2),
-            doc_id: doc_id.clone(),
-            ack_checkpoint: None,
-            ack_frontier: Frontier::from_iter([(pid(1), 10)]),
-            updated_at: SystemTime::now(),
-        }).unwrap();
-        dao::upsert_ack(&conn, &AckSummary {
-            peer_id: pid(3),
-            doc_id: doc_id.clone(),
-            ack_checkpoint: None,
-            ack_frontier: Frontier::from_iter([(pid(1), 7)]),
-            updated_at: SystemTime::now() - Duration::from_secs(120), // stale
-        }).unwrap();
+        dao::upsert_ack(
+            &conn,
+&AckSummary {
+peer_id: pid(2),
+doc_id: doc_id.clone(),
+ack_checkpoint: None,
+ack_frontier: Frontier::from_iter([(pid(1), 10)]),
+updated_at: SystemTime::now(),
+version_override: None,
+},
+        )
+        .unwrap();
+        dao::upsert_ack(
+            &conn,
+&AckSummary {
+peer_id: pid(3),
+doc_id: doc_id.clone(),
+ack_checkpoint: None,
+ack_frontier: Frontier::from_iter([(pid(1), 7)]),
+updated_at: SystemTime::now() - Duration::from_secs(120), // stale
+version_override: None,
+},
+        )
+        .unwrap();
     }
 
     let w = engine.compute_watermarks(&doc_id).unwrap();
     // peer3 stale（120s 前），但 soft_timeout 默认 3 天，所以 peer3 仍算 active
     // hard = active peer 交集 = min(10, 7) = 7
-    assert_eq!(w.hard_frontier.get(&pid(1)), Some(7), "hard 应为 active peer 的最小 seq");
+    assert_eq!(
+        w.hard_frontier.get(&pid(1)),
+        Some(7),
+        "hard 应为 active peer 的最小 seq"
+    );
     // soft = 所有 ack 并集 = max(10, 7) = 10
-    assert_eq!(w.soft_frontier.get(&pid(1)), Some(10), "soft 应为所有 ack 的最大 seq");
+    assert_eq!(
+        w.soft_frontier.get(&pid(1)),
+        Some(10),
+        "soft 应为所有 ack 的最大 seq"
+    );
 }
 
 // ===== BLE Presence 发现 =====
 
 #[test]
 fn ble_presence_discovery() {
-    use tacit_transport_ble::{BlePresence, MockPresenceBackend, DiscoveryEvent};
     use tacit_core::{AnchorCapabilities, Endpoint, PresenceHint};
+    use tacit_transport_ble::{BlePresence, DiscoveryEvent, MockPresenceBackend};
 
     let backend = Arc::new(MockPresenceBackend::new());
     let presence = Arc::new(BlePresence::new(backend.clone()));
@@ -532,7 +614,7 @@ fn ble_presence_discovery() {
 
 #[test]
 fn noise_handshake_and_encrypted_sync() {
-    use tacit_crypto::{DeviceIdentity, NoiseHandshake, sign, verify};
+    use tacit_crypto::{sign, verify, DeviceIdentity, NoiseHandshake};
 
     // 两个设备身份
     let id1 = DeviceIdentity::generate().unwrap();
@@ -567,5 +649,8 @@ fn noise_handshake_and_encrypted_sync() {
     let msg = b"authenticate: peer1";
     let sig = sign(&id1, msg);
     assert!(verify(msg, &sig, &id1.public_key()).is_ok());
-    assert!(verify(msg, &sig, &id2.public_key()).is_err(), "错误公钥应验签失败");
+    assert!(
+        verify(msg, &sig, &id2.public_key()).is_err(),
+        "错误公钥应验签失败"
+    );
 }

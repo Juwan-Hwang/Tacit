@@ -25,6 +25,7 @@ impl Frontier {
     }
 
     /// 从迭代器构造。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_iter<I: IntoIterator<Item = (PeerId, u64)>>(iter: I) -> Self {
         let mut f = Self::new();
         for (peer, seq) in iter {
@@ -78,9 +79,10 @@ pub trait FrontierOps {
 
 impl FrontierOps for Frontier {
     fn covers(&self, other: &Frontier) -> bool {
-        other.map.iter().all(|(k, v)| {
-            self.map.get(k).copied().unwrap_or(0) >= *v
-        })
+        other
+            .map
+            .iter()
+            .all(|(k, v)| self.map.get(k).copied().unwrap_or(0) >= *v)
     }
 
     fn missing_against(&self, other: &Frontier) -> Vec<(PeerId, u64)> {

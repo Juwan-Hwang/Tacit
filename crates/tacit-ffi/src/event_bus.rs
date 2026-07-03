@@ -73,9 +73,7 @@ impl EventBus {
 
     /// 取消订阅。
     pub fn unsubscribe(&self, id: &SubscriptionId) {
-        self.subscribers
-            .write()
-            .retain(|s| s.id != id.0);
+        self.subscribers.write().retain(|s| s.id != id.0);
     }
 
     /// 发布事件到所有匹配的订阅者。
@@ -85,11 +83,7 @@ impl EventBus {
         let mut count = 0;
         for sub in subscribers.iter() {
             // 检查过滤器
-            let matches = sub
-                .filter
-                .as_ref()
-                .map(|f| f(event))
-                .unwrap_or(true);
+            let matches = sub.filter.as_ref().map(|f| f(event)).unwrap_or(true);
             if !matches {
                 continue;
             }
@@ -129,9 +123,7 @@ pub mod filters {
 
     /// 仅 peer 状态变化事件。
     pub fn peer_status_only() -> EventFilter {
-        Arc::new(|e: &CoreEvent| {
-            matches!(e, CoreEvent::PeerStatusChanged { .. })
-        })
+        Arc::new(|e: &CoreEvent| matches!(e, CoreEvent::PeerStatusChanged { .. }))
     }
 
     /// 仅错误事件。

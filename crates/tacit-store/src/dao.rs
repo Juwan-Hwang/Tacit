@@ -142,6 +142,7 @@ pub fn insert_snapshot(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 pub fn get_latest_snapshot(
     conn: &Connection,
     doc_id: &DocId,
@@ -260,18 +261,20 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
         .optional()
         .map_err(store_err)?;
     match row {
-        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema)) => Ok(Some(PeerRecord {
-            peer_id: PeerId::new(id),
-            device_pubkey: pubkey,
-            capabilities: de_json(&caps).unwrap_or_default(),
-            trust_state: de_json(&trust).unwrap_or(TrustState::Pending),
-            anchor_priority: prio,
-            last_seen_at: from_millis(seen),
-            last_endpoint: endpoint.and_then(|s| de_json(&s)),
-            nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
-            relay_hint: relay.map(PeerId::new),
-            success_ema: ema,
-        })),
+        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema)) => {
+            Ok(Some(PeerRecord {
+                peer_id: PeerId::new(id),
+                device_pubkey: pubkey,
+                capabilities: de_json(&caps).unwrap_or_default(),
+                trust_state: de_json(&trust).unwrap_or(TrustState::Pending),
+                anchor_priority: prio,
+                last_seen_at: from_millis(seen),
+                last_endpoint: endpoint.and_then(|s| de_json(&s)),
+                nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
+                relay_hint: relay.map(PeerId::new),
+                success_ema: ema,
+            }))
+        }
         None => Ok(None),
     }
 }
@@ -298,7 +301,8 @@ pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
         .map_err(store_err)?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema) = r.map_err(store_err)?;
+        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema) =
+            r.map_err(store_err)?;
         out.push(PeerRecord {
             peer_id: PeerId::new(id),
             device_pubkey: pubkey,
@@ -335,9 +339,14 @@ pub fn best_anchor(conn: &Connection) -> CoreResult<Option<PeerId>> {
         .max_by(|a, b| {
             // 5 键排序：anchor_priority desc, nat_capability desc, success_ema desc, last_seen_at desc, peer_id asc
             // max_by 中 a.cmp(&b) = Greater 表示 a > b，即 a 更优
-            a.anchor_priority.cmp(&b.anchor_priority)
+            a.anchor_priority
+                .cmp(&b.anchor_priority)
                 .then(nat_rank(&a.nat_capability).cmp(&nat_rank(&b.nat_capability)))
-                .then(a.success_ema.partial_cmp(&b.success_ema).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    a.success_ema
+                        .partial_cmp(&b.success_ema)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
                 .then(a.last_seen_at.cmp(&b.last_seen_at))
                 .then(b.peer_id.as_str().cmp(a.peer_id.as_str()))
         });
@@ -387,23 +396,28 @@ pub fn revoke_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<()> {
 
 pub fn upsert_ack(conn: &Connection, ack: &AckSummary) -> CoreResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO acks (peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR REPLACE INTO acks (peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at, version_override)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             ack.peer_id.as_str(),
             ack.doc_id.as_str(),
             ack.ack_checkpoint.as_ref().map(|c| c.as_str()),
             ser_frontier(&ack.ack_frontier),
             to_millis(ack.updated_at),
+            ack.version_override.map(|v| v as i64),
         ],
     )
     .map_err(store_err)?;
     Ok(())
 }
 
-pub fn get_ack(conn: &Connection, peer_id: &PeerId, doc_id: &DocId) -> CoreResult<Option<AckSummary>> {
+pub fn get_ack(
+    conn: &Connection,
+    peer_id: &PeerId,
+    doc_id: &DocId,
+) -> CoreResult<Option<AckSummary>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at FROM acks WHERE peer_id = ?1 AND doc_id = ?2")
+        .prepare("SELECT peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at, version_override FROM acks WHERE peer_id = ?1 AND doc_id = ?2")
         .map_err(store_err)?;
     let row = stmt
         .query_row(params![peer_id.as_str(), doc_id.as_str()], |r| {
@@ -413,17 +427,19 @@ pub fn get_ack(conn: &Connection, peer_id: &PeerId, doc_id: &DocId) -> CoreResul
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         })
         .optional()
         .map_err(store_err)?;
     match row {
-        Some((pid, did, cp, frontier, updated)) => Ok(Some(AckSummary {
+        Some((pid, did, cp, frontier, updated, ver_override)) => Ok(Some(AckSummary {
             peer_id: PeerId::new(pid),
             doc_id: DocId::new(did),
             ack_checkpoint: cp.map(CheckpointId::new),
             ack_frontier: de_frontier(&frontier),
             updated_at: from_millis(updated),
+            version_override: ver_override.map(|v| v as u32),
         })),
         None => Ok(None),
     }
@@ -432,7 +448,7 @@ pub fn get_ack(conn: &Connection, peer_id: &PeerId, doc_id: &DocId) -> CoreResul
 /// 列出指定文档的所有 ack 摘要。
 pub fn list_acks_by_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Vec<AckSummary>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at FROM acks WHERE doc_id = ?1")
+        .prepare("SELECT peer_id, doc_id, ack_checkpoint, ack_frontier, updated_at, version_override FROM acks WHERE doc_id = ?1")
         .map_err(store_err)?;
     let rows = stmt
         .query_map(params![doc_id.as_str()], |r| {
@@ -442,18 +458,20 @@ pub fn list_acks_by_doc(conn: &Connection, doc_id: &DocId) -> CoreResult<Vec<Ack
                 r.get::<_, Option<String>>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(store_err)?;
     let mut out = Vec::new();
     for r in rows {
-        let (pid, did, cp, frontier, updated) = r.map_err(store_err)?;
+        let (pid, did, cp, frontier, updated, ver_override) = r.map_err(store_err)?;
         out.push(AckSummary {
             peer_id: PeerId::new(pid),
             doc_id: DocId::new(did),
             ack_checkpoint: cp.map(CheckpointId::new),
             ack_frontier: de_frontier(&frontier),
             updated_at: from_millis(updated),
+            version_override: ver_override.map(|v| v as u32),
         });
     }
     Ok(out)
@@ -492,7 +510,10 @@ pub fn upsert_block_sync_state(conn: &Connection, rec: &BlockSyncStateRecord) ->
     Ok(())
 }
 
-pub fn list_pending_blocks(conn: &Connection, now_ms: i64) -> CoreResult<Vec<BlockSyncStateRecord>> {
+pub fn list_pending_blocks(
+    conn: &Connection,
+    now_ms: i64,
+) -> CoreResult<Vec<BlockSyncStateRecord>> {
     let mut stmt = conn
         .prepare("SELECT doc_id, block_id, peer_id, expected_frontier, observed_frontier, retry_after_ms, updated_at FROM block_sync_state WHERE retry_after_ms <= ?1")
         .map_err(store_err)?;
@@ -572,7 +593,10 @@ pub fn insert_checkpoint(conn: &Connection, rec: &CheckpointRecord) -> CoreResul
     Ok(())
 }
 
-pub fn get_latest_checkpoint(conn: &Connection, doc_id: &DocId) -> CoreResult<Option<CheckpointRecord>> {
+pub fn get_latest_checkpoint(
+    conn: &Connection,
+    doc_id: &DocId,
+) -> CoreResult<Option<CheckpointRecord>> {
     let mut stmt = conn
         .prepare("SELECT doc_id, checkpoint_id, shallow_snapshot_blob, frontier, state_hash, created_at FROM checkpoint_log WHERE doc_id = ?1 ORDER BY created_at DESC LIMIT 1")
         .map_err(store_err)?;
@@ -842,7 +866,9 @@ pub fn get_transport_stats(
 /// 列出所有 transport_stats。
 pub fn list_transport_stats(conn: &Connection) -> CoreResult<Vec<TransportStatsRecord>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, channel, success_ema, avg_latency_ms, updated_at FROM transport_stats")
+        .prepare(
+            "SELECT peer_id, channel, success_ema, avg_latency_ms, updated_at FROM transport_stats",
+        )
         .map_err(store_err)?;
     let rows = stmt
         .query_map([], |r| {

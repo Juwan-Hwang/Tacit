@@ -11,8 +11,8 @@ use tacit_core::{
 use tacit_core::{DocId, PeerId};
 
 use crate::control::{
-    IntroducePeer, KeyRotateNotice, NeedRanges, PeerAnnouncement, RelayHints, TransportHints,
-    RevokePeer,
+    IntroducePeer, KeyRotateNotice, NeedRanges, PeerAnnouncement, RelayHints, RevokePeer,
+    TransportHints,
 };
 use crate::ControlMsg as CMsg;
 
@@ -92,7 +92,10 @@ fn control_msg_to_tlv(msg: &CMsg) -> Result<(ControlType, Vec<u8>), FrameError> 
     match msg {
         CMsg::Capabilities(ann) => {
             let json = serialize_msg(ann)?;
-            Ok((ControlType::Capabilities, Tlv::encode(ControlType::Capabilities as u8, &json)))
+            Ok((
+                ControlType::Capabilities,
+                Tlv::encode(ControlType::Capabilities as u8, &json),
+            ))
         }
         CMsg::KnownCheckpoint {
             peer_id,
@@ -107,15 +110,24 @@ fn control_msg_to_tlv(msg: &CMsg) -> Result<(ControlType, Vec<u8>), FrameError> 
                 "frontier": frontier,
             });
             let bytes = serialize_msg(&json)?;
-            Ok((ControlType::KnownCheckpoint, Tlv::encode(ControlType::KnownCheckpoint as u8, &bytes)))
+            Ok((
+                ControlType::KnownCheckpoint,
+                Tlv::encode(ControlType::KnownCheckpoint as u8, &bytes),
+            ))
         }
         CMsg::AckSummary(ack) => {
             let json = serialize_msg(ack)?;
-            Ok((ControlType::AckSummary, Tlv::encode(ControlType::AckSummary as u8, &json)))
+            Ok((
+                ControlType::AckSummary,
+                Tlv::encode(ControlType::AckSummary as u8, &json),
+            ))
         }
         CMsg::NeedRanges(ranges) => {
             let json = serialize_msg(ranges)?;
-            Ok((ControlType::NeedRanges, Tlv::encode(ControlType::NeedRanges as u8, &json)))
+            Ok((
+                ControlType::NeedRanges,
+                Tlv::encode(ControlType::NeedRanges as u8, &json),
+            ))
         }
         CMsg::SyncIntent { peer_id, doc_id } => {
             let json = serde_json::json!({
@@ -123,27 +135,45 @@ fn control_msg_to_tlv(msg: &CMsg) -> Result<(ControlType, Vec<u8>), FrameError> 
                 "doc_id": doc_id.as_str(),
             });
             let bytes = serialize_msg(&json)?;
-            Ok((ControlType::SyncIntent, Tlv::encode(ControlType::SyncIntent as u8, &bytes)))
+            Ok((
+                ControlType::SyncIntent,
+                Tlv::encode(ControlType::SyncIntent as u8, &bytes),
+            ))
         }
         CMsg::TransportHints(hints) => {
             let json = serialize_msg(hints)?;
-            Ok((ControlType::TransportHints, Tlv::encode(ControlType::TransportHints as u8, &json)))
+            Ok((
+                ControlType::TransportHints,
+                Tlv::encode(ControlType::TransportHints as u8, &json),
+            ))
         }
         CMsg::RelayHints(hints) => {
             let json = serialize_msg(hints)?;
-            Ok((ControlType::RelayHints, Tlv::encode(ControlType::RelayHints as u8, &json)))
+            Ok((
+                ControlType::RelayHints,
+                Tlv::encode(ControlType::RelayHints as u8, &json),
+            ))
         }
         CMsg::Introduce(intro) => {
             let json = serialize_msg(intro)?;
-            Ok((ControlType::Introduce, Tlv::encode(ControlType::Introduce as u8, &json)))
+            Ok((
+                ControlType::Introduce,
+                Tlv::encode(ControlType::Introduce as u8, &json),
+            ))
         }
         CMsg::Revoke(revoke) => {
             let json = serialize_msg(revoke)?;
-            Ok((ControlType::Revoke, Tlv::encode(ControlType::Revoke as u8, &json)))
+            Ok((
+                ControlType::Revoke,
+                Tlv::encode(ControlType::Revoke as u8, &json),
+            ))
         }
         CMsg::KeyRotate(rotate) => {
             let json = serialize_msg(rotate)?;
-            Ok((ControlType::KeyRotate, Tlv::encode(ControlType::KeyRotate as u8, &json)))
+            Ok((
+                ControlType::KeyRotate,
+                Tlv::encode(ControlType::KeyRotate as u8, &json),
+            ))
         }
     }
 }
@@ -159,15 +189,9 @@ fn serialize_msg<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, FrameError> 
 /// 将 (ControlType, TLV payload) 转为 ControlMsg。
 ///
 /// 反序列化失败时返回 `FrameError`，不静默使用默认值。
-fn tlv_to_control_msg(
-    ctrl_type: ControlType,
-    payload: &[u8],
-) -> Result<CMsg, FrameError> {
+fn tlv_to_control_msg(ctrl_type: ControlType, payload: &[u8]) -> Result<CMsg, FrameError> {
     let entries = Tlv::decode_all(payload)?;
-    let value = entries
-        .first()
-        .map(|(_, v)| v.as_slice())
-        .unwrap_or(&[]);
+    let value = entries.first().map(|(_, v)| v.as_slice()).unwrap_or(&[]);
     match ctrl_type {
         ControlType::Capabilities => {
             let ann: PeerAnnouncement = serde_json::from_slice(value)
@@ -177,19 +201,21 @@ fn tlv_to_control_msg(
         ControlType::KnownCheckpoint => {
             let json: serde_json::Value = serde_json::from_slice(value)
                 .map_err(|_| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
-            let peer_id_str = json["peer_id"]
-                .as_str()
-                .ok_or_else(|| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
-            let doc_id_str = json["doc_id"]
-                .as_str()
-                .ok_or_else(|| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
+            let peer_id_str = json["peer_id"].as_str().ok_or(
+                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
+            )?;
+            let doc_id_str = json["doc_id"].as_str().ok_or(
+                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
+            )?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             let checkpoint = json["checkpoint"]
                 .as_str()
                 .map(tacit_core::CheckpointId::new);
             let frontier: tacit_core::Frontier = serde_json::from_value(json["frontier"].clone())
-                .map_err(|_| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
+                .map_err(|_| {
+                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
+            })?;
             Ok(CMsg::KnownCheckpoint {
                 peer_id,
                 doc_id,
@@ -212,10 +238,10 @@ fn tlv_to_control_msg(
                 .map_err(|_| FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
             let peer_id_str = json["peer_id"]
                 .as_str()
-                .ok_or_else(|| FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
+                .ok_or(FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
             let doc_id_str = json["doc_id"]
                 .as_str()
-                .ok_or_else(|| FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
+                .ok_or(FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             Ok(CMsg::SyncIntent { peer_id, doc_id })
@@ -255,13 +281,14 @@ mod tests {
 
     #[test]
     fn encode_decode_control_ack() {
-        let ack = AckSummary {
-            peer_id: PeerId::new("1"),
-            doc_id: DocId::new("d1"),
-            ack_checkpoint: None,
-            ack_frontier: Frontier::new(),
-            updated_at: std::time::SystemTime::now(),
-        };
+let ack = AckSummary {
+peer_id: PeerId::new("1"),
+doc_id: DocId::new("d1"),
+ack_checkpoint: None,
+ack_frontier: Frontier::new(),
+updated_at: std::time::SystemTime::now(),
+version_override: None,
+};
         let msg = CMsg::AckSummary(ack);
         let encoded = encode_control(&msg, 42).unwrap();
         let (decoded, sid) = decode_control(&encoded).unwrap();

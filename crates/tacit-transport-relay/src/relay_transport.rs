@@ -24,9 +24,7 @@ use parking_lot::{Mutex, RwLock};
 use quinn::{Connection, Endpoint};
 use tacit_core::{CoreError, CoreResult, DataFrame, NetworkType, PeerId, Priority};
 use tacit_transport::{ControlMsg, PathPreference, SyncTransport};
-use tacit_transport_quic::{
-    generate_self_signed_cert, make_client_config, make_server_config,
-};
+use tacit_transport_quic::{generate_self_signed_cert, make_client_config, make_server_config};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -78,11 +76,7 @@ impl RelayClientTransport {
     /// `peer_id`：本设备 peer_id。
     /// `secret`：relay 共享密钥。
     /// `relay_addr`：relay 服务端地址。
-    pub async fn new(
-        peer_id: PeerId,
-        secret: Vec<u8>,
-        relay_addr: SocketAddr,
-    ) -> CoreResult<Self> {
+    pub async fn new(peer_id: PeerId, secret: Vec<u8>, relay_addr: SocketAddr) -> CoreResult<Self> {
         Self::with_tier(peer_id, secret, relay_addr, RelayTier::Public).await
     }
 
@@ -184,9 +178,11 @@ impl RelayClientTransport {
     ///
     /// 使用独立 bi-stream 避免队头阻塞。
     async fn request_response(&self, msg: &RelayMessage) -> CoreResult<RelayMessage> {
-        let conn = self.conn.read().clone().ok_or_else(|| {
-            CoreError::Transport("未连接 relay 服务端".into())
-        })?;
+        let conn = self
+            .conn
+            .read()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -204,11 +200,7 @@ impl RelayClientTransport {
             match recv.read(&mut chunk).await {
                 Ok(Some(0)) | Ok(None) => break,
                 Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) => {
-                    return Err(CoreError::Transport(format!(
-                        "读取响应失败: {e}"
-                    )))
-                }
+                Err(e) => return Err(CoreError::Transport(format!("读取响应失败: {e}"))),
             }
         }
         RelayMessage::from_bytes(&buf)
@@ -329,9 +321,7 @@ impl RelayClientTransport {
             match recv.read(&mut chunk).await {
                 Ok(Some(0)) | Ok(None) => break,
                 Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) => {
-                    return Err(CoreError::Transport(format!("读取 Pong 失败: {e}")))
-                }
+                Err(e) => return Err(CoreError::Transport(format!("读取 Pong 失败: {e}"))),
             }
         }
         match RelayMessage::from_bytes(&buf)? {
@@ -386,8 +376,7 @@ const FRAME_TYPE_CONTROL: u8 = 0x02;
 
 /// 将帧类型前缀 + 序列化 payload 拼接为 relay 可转发的字节流。
 fn encode_relay_payload<T: serde::Serialize>(frame_type: u8, msg: &T) -> CoreResult<Vec<u8>> {
-    let json = serde_json::to_vec(msg)
-        .map_err(|e| CoreError::Serialize(e.to_string()))?;
+    let json = serde_json::to_vec(msg).map_err(|e| CoreError::Serialize(e.to_string()))?;
     let mut buf = Vec::with_capacity(1 + json.len());
     buf.push(frame_type);
     buf.extend_from_slice(&json);
@@ -417,7 +406,9 @@ impl SyncTransport for RelayClientTransport {
         _priority: Priority,
     ) -> CoreResult<()> {
         if !self.is_registered() {
-            return Err(CoreError::Transport("relay 未注册，无法发送控制消息".into()));
+            return Err(CoreError::Transport(
+                "relay 未注册，无法发送控制消息".into(),
+            ));
         }
         let payload = encode_relay_payload(FRAME_TYPE_CONTROL, &msg)?;
         self.forward(peer_id, payload).await
@@ -585,7 +576,13 @@ impl RelayServerRunner {
                     let conn_token = conn_token.clone();
                     tokio::spawn(async move {
                         Self::handle_request(
-                            server, push_channels, conn_clone, conn_peers, conn_token, send, recv,
+                            server,
+                            push_channels,
+                            conn_clone,
+                            conn_peers,
+                            conn_token,
+                            send,
+                            recv,
                         )
                         .await;
                     });
@@ -636,26 +633,21 @@ impl RelayServerRunner {
 
         // 处理请求并生成响应
         let (response, maybe_peer_id) = match &msg {
-            RelayMessage::Register(req) => {
-                match server.handle_register(&req.proof) {
-                    Ok(session_id) => {
-                        let peer_id = PeerId::new(&req.proof.peer_id);
-                        (
-                            RelayMessage::RegisterOk { session_id },
-                            Some(peer_id),
-                        )
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "注册失败");
-                        (
-                            RelayMessage::RegisterDenied {
-                                reason: e.to_string(),
-                            },
-                            None,
-                        )
-                    }
+            RelayMessage::Register(req) => match server.handle_register(&req.proof) {
+                Ok(session_id) => {
+                    let peer_id = PeerId::new(&req.proof.peer_id);
+                    (RelayMessage::RegisterOk { session_id }, Some(peer_id))
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "注册失败");
+                    (
+                        RelayMessage::RegisterDenied {
+                            reason: e.to_string(),
+                        },
+                        None,
+                    )
+                }
+            },
             RelayMessage::Forward(req) => {
                 // 验证 session 并获取 from_peer_id
                 let from_peer_id = match server.get_session_peer(&req.session_id) {
@@ -901,14 +893,9 @@ mod tests {
         // 启动 relay 服务端
         let secret = b"relay_e2e_secret".to_vec();
         let runner = Arc::new(
-            RelayServerRunner::with_cert(
-                secret.clone(),
-                "127.0.0.1:0".parse().unwrap(),
-                cert,
-                key,
-            )
-            .await
-            .unwrap(),
+            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
+                .await
+                .unwrap(),
         );
         let server_addr = runner.local_addr().unwrap();
 
@@ -922,25 +909,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 创建 client1
-        let client1 = RelayClientTransport::new(
-            PeerId::new("1"),
-            secret.clone(),
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
+            .await
+            .unwrap();
         client1.set_default_client_config(client_config.clone());
         client1.connect_and_register().await.unwrap();
         assert!(client1.is_registered());
 
         // 创建 client2，设置推送回调
-        let client2 = RelayClientTransport::new(
-            PeerId::new("2"),
-            secret.clone(),
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
+            .await
+            .unwrap();
         let received = Arc::new(Mutex::new(Vec::<RelayPushEvent>::new()));
         let received_clone = received.clone();
         client2.set_push_handler(move |event| {
@@ -955,7 +934,10 @@ mod tests {
 
         // client1 通过 relay 转发数据给 client2
         let data = b"hello via relay e2e".to_vec();
-        client1.forward(&PeerId::new("2"), data.clone()).await.unwrap();
+        client1
+            .forward(&PeerId::new("2"), data.clone())
+            .await
+            .unwrap();
 
         // 等待 client2 收到推送
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -963,7 +945,10 @@ mod tests {
         let events = received.lock();
         assert_eq!(events.len(), 1, "client2 应收到 1 条推送");
         match &events[0] {
-            RelayPushEvent::Incoming { from_peer_id, data: recv_data } => {
+            RelayPushEvent::Incoming {
+                from_peer_id,
+                data: recv_data,
+            } => {
                 assert_eq!(*from_peer_id, PeerId::new("1"));
                 assert_eq!(recv_data, &data);
             }
@@ -977,14 +962,9 @@ mod tests {
         let client_config = make_client_config(cert.clone()).unwrap();
         let secret = b"relay_disc_secret".to_vec();
         let runner = Arc::new(
-            RelayServerRunner::with_cert(
-                secret.clone(),
-                "127.0.0.1:0".parse().unwrap(),
-                cert,
-                key,
-            )
-            .await
-            .unwrap(),
+            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
+                .await
+                .unwrap(),
         );
         let server_addr = runner.local_addr().unwrap();
         let runner_clone = runner.clone();
@@ -993,13 +973,9 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client = RelayClientTransport::new(
-            PeerId::new("1"),
-            secret,
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client = RelayClientTransport::new(PeerId::new("1"), secret, server_addr)
+            .await
+            .unwrap();
         client.set_default_client_config(client_config);
         client.connect_and_register().await.unwrap();
         assert!(client.is_registered());
@@ -1014,14 +990,9 @@ mod tests {
         let client_config = make_client_config(cert.clone()).unwrap();
         let secret = b"relay_offline_secret".to_vec();
         let runner = Arc::new(
-            RelayServerRunner::with_cert(
-                secret.clone(),
-                "127.0.0.1:0".parse().unwrap(),
-                cert,
-                key,
-            )
-            .await
-            .unwrap(),
+            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
+                .await
+                .unwrap(),
         );
         let server_addr = runner.local_addr().unwrap();
         let runner_clone = runner.clone();
@@ -1030,13 +1001,9 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client = RelayClientTransport::new(
-            PeerId::new("1"),
-            secret,
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client = RelayClientTransport::new(PeerId::new("1"), secret, server_addr)
+            .await
+            .unwrap();
         client.set_default_client_config(client_config);
         client.connect_and_register().await.unwrap();
 
@@ -1083,14 +1050,9 @@ mod tests {
         let client_config = make_client_config(cert.clone()).unwrap();
         let secret = b"relay_online_secret".to_vec();
         let runner = Arc::new(
-            RelayServerRunner::with_cert(
-                secret.clone(),
-                "127.0.0.1:0".parse().unwrap(),
-                cert,
-                key,
-            )
-            .await
-            .unwrap(),
+            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
+                .await
+                .unwrap(),
         );
         let server_addr = runner.local_addr().unwrap();
         let runner_clone = runner.clone();
@@ -1100,13 +1062,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // client1 先注册，并设置推送回调（在 client2 注册之前，以便捕获 PeerOnline）
-        let client1 = RelayClientTransport::new(
-            PeerId::new("1"),
-            secret.clone(),
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
+            .await
+            .unwrap();
         client1.set_default_client_config(client_config.clone());
         let received = Arc::new(Mutex::new(Vec::<RelayPushEvent>::new()));
         let received_clone = received.clone();
@@ -1117,13 +1075,9 @@ mod tests {
         assert!(client1.is_registered());
 
         // client2 注册 → 服务端应向 client1 推送 PeerOnline { peer_id: "2" }
-        let client2 = RelayClientTransport::new(
-            PeerId::new("2"),
-            secret.clone(),
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
+            .await
+            .unwrap();
         client2.set_default_client_config(client_config);
         client2.connect_and_register().await.unwrap();
         assert!(client2.is_registered());
@@ -1180,14 +1134,9 @@ mod tests {
         let client_config = make_client_config(cert.clone()).unwrap();
         let secret = b"relay_ping_secret".to_vec();
         let runner = Arc::new(
-            RelayServerRunner::with_cert(
-                secret.clone(),
-                "127.0.0.1:0".parse().unwrap(),
-                cert,
-                key,
-            )
-            .await
-            .unwrap(),
+            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
+                .await
+                .unwrap(),
         );
         let server_addr = runner.local_addr().unwrap();
         let runner_clone = runner.clone();
@@ -1196,13 +1145,9 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let client = RelayClientTransport::new(
-            PeerId::new("1"),
-            secret,
-            server_addr,
-        )
-        .await
-        .unwrap();
+        let client = RelayClientTransport::new(PeerId::new("1"), secret, server_addr)
+            .await
+            .unwrap();
         client.set_default_client_config(client_config);
         client.connect_and_register().await.unwrap();
 

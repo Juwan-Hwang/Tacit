@@ -10,8 +10,8 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use tacit_core::{CheckpointId, CoreError, CoreResult, DocId, Frontier, SnapshotKind};
 
-use sha2::Digest;
 use crate::dao;
+use sha2::Digest;
 
 /// SQLite 持久化存储。
 #[derive(Clone)]
@@ -30,10 +30,13 @@ impl Store {
             .map_err(|e| tacit_core::CoreError::Store(format!("打开数据库失败: {e}")))?;
         // 开启 WAL 与外键约束，提升并发与数据完整性。
         // busy_timeout=5000 避免多进程访问时立即报 locked。
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
-            .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| tacit_core::CoreError::Store(format!("建表失败: {e}")))?;
+        run_migrations(&conn)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
@@ -45,10 +48,13 @@ impl Store {
     pub fn open_memory() -> CoreResult<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| tacit_core::CoreError::Store(format!("打开内存数据库失败: {e}")))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
-            .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| tacit_core::CoreError::Store(format!("设置 PRAGMA 失败: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| tacit_core::CoreError::Store(format!("建表失败: {e}")))?;
+        run_migrations(&conn)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
@@ -191,7 +197,10 @@ impl Store {
 
             // 3. 校验 snapshot 内容完整性：计算 SHA256 并与 state_hash 比对
             let stored = dao::get_snapshot(conn, &doc_id, &pending_id)?;
-            let blob_ok = stored.as_ref().map(|(blob, _, _)| blob.as_slice() == snapshot).unwrap_or(false);
+            let blob_ok = stored
+                .as_ref()
+                .map(|(blob, _, _)| blob.as_slice() == snapshot)
+                .unwrap_or(false);
             let hash_ok = if state_hash.is_empty() {
                 true
             } else {
@@ -222,21 +231,28 @@ impl Store {
                 // 校验失败：删除临时 snapshot 并回滚（事务会自动回滚）
                 let _ = dao::delete_snapshot(conn, &doc_id, &pending_id);
                 return Err(CoreError::Store(format!(
-                    "快照校验失败: blob_ok={}, hash_ok={}", blob_ok, hash_ok
+                    "快照校验失败: blob_ok={}, hash_ok={}",
+                    blob_ok, hash_ok
                 )));
             }
 
             // 4. 原子切换：更新 documents.current_frontier + current_snapshot_id
             let existing = dao::get_doc(conn, &doc_id)?;
-            let doc_kind = existing.as_ref().map(|d| d.kind.clone()).unwrap_or_else(|| "note".to_string());
+            let doc_kind = existing
+                .as_ref()
+                .map(|d| d.kind.clone())
+                .unwrap_or_else(|| "note".to_string());
             let current_snapshot_id = Some(pending_id.as_str().to_string());
-            dao::upsert_doc(conn, &dao::DocRecord {
-                doc_id: doc_id.clone(),
-                kind: doc_kind,
-                current_frontier: frontier.clone(),
-                current_snapshot_id,
-                updated_at: now,
-            })?;
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: doc_id.clone(),
+                    kind: doc_kind,
+                    current_frontier: frontier.clone(),
+                    current_snapshot_id,
+                    updated_at: now,
+                },
+            )?;
 
             // 5. 删除旧 pending snapshot
             if let Some(old_id) = old_pending {
@@ -284,6 +300,30 @@ impl TxnExecutor {
     pub fn store(&self) -> &Store {
         &self.store
     }
+}
+
+/// 执行增量迁移：为已有数据库补充新增列。
+///
+/// SQLite 的 `CREATE TABLE IF NOT EXISTS` 不会为已存在的表添加新列，
+/// 因此需要通过 `ALTER TABLE ... ADD COLUMN` 补充。
+/// 使用 `PRAGMA table_info` 检测列是否已存在，避免重复添加报错。
+fn run_migrations(conn: &Connection) -> CoreResult<()> {
+    // 迁移 1：acks 表添加 version_override 列
+    let has_version_override: bool = conn
+        .prepare("PRAGMA table_info(acks)")
+        .map_err(|e| CoreError::Store(format!("PRAGMA table_info 失败: {e}")))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| CoreError::Store(format!("查询 table_info 失败: {e}")))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "version_override");
+
+    if !has_version_override {
+        conn.execute_batch("ALTER TABLE acks ADD COLUMN version_override INTEGER")
+            .map_err(|e| CoreError::Store(format!("迁移 acks.version_override 失败: {e}")))?;
+        tracing::info!("迁移完成：acks 表新增 version_override 列");
+    }
+
+    Ok(())
 }
 
 /// 建表 SQL。对应蓝图 7.1 推荐表结构。
@@ -339,11 +379,12 @@ CREATE TABLE IF NOT EXISTS peers (
 );
 
 CREATE TABLE IF NOT EXISTS acks (
-    peer_id        TEXT NOT NULL,
-    doc_id         TEXT NOT NULL,
-    ack_checkpoint TEXT,
-    ack_frontier   TEXT NOT NULL,
-    updated_at     INTEGER NOT NULL,
+    peer_id          TEXT NOT NULL,
+    doc_id           TEXT NOT NULL,
+    ack_checkpoint   TEXT,
+    ack_frontier     TEXT NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    version_override INTEGER,
     PRIMARY KEY (peer_id, doc_id)
 );
 
@@ -380,10 +421,10 @@ mod tests {
     use super::*;
     use crate::dao;
     use sha2::{Digest, Sha256};
+    use std::time::SystemTime;
     use tacit_core::{
         AnchorCapabilities, Frontier, NatCapability, PeerId, SnapshotKind, TrustState,
     };
-    use std::time::SystemTime;
 
     fn pid(s: &str) -> PeerId {
         PeerId(s.into())
@@ -450,8 +491,15 @@ mod tests {
         let conn = store.conn();
         let doc = tacit_core::DocId::new("d1");
         let cp = tacit_core::CheckpointId::new("cp1");
-        dao::insert_snapshot(&conn, &doc, &cp, b"snap-bytes", SnapshotKind::Shallow, SystemTime::now())
-            .unwrap();
+        dao::insert_snapshot(
+            &conn,
+            &doc,
+            &cp,
+            b"snap-bytes",
+            SnapshotKind::Shallow,
+            SystemTime::now(),
+        )
+        .unwrap();
         let snap = dao::get_latest_snapshot(&conn, &doc).unwrap().unwrap();
         assert_eq!(snap.1, b"snap-bytes");
 
@@ -600,13 +648,7 @@ mod tests {
         // 验证空 snapshot 被拒绝
         let store = Store::open_memory().unwrap();
         let hash = content_hash(b"unused");
-        let r = store.install_snapshot_atomically(
-            "doc1",
-            b"",
-            &hash,
-            &Frontier::new(),
-            "Full",
-        );
+        let r = store.install_snapshot_atomically("doc1", b"", &hash, &Frontier::new(), "Full");
         assert!(r.is_err());
     }
 

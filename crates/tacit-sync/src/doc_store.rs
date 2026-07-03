@@ -304,6 +304,56 @@ impl DocStore {
         Ok(result)
     }
 
+    /// 批量导入多个 block delta/snapshot。
+    ///
+    /// 在单个事务中持久化所有变更的 block snapshot，减少事务开销。
+    /// 适用于大量 block 追赶场景（如长时间离线后恢复）。
+    ///
+    /// 返回每个 block 的导入结果，顺序与输入一致。
+    pub fn import_blocks_batch(
+        &self,
+        doc_id: &DocId,
+        blocks: &[(BlockId, Vec<u8>)],
+    ) -> CoreResult<Vec<ImportResult>> {
+        // 1. 逐个导入 delta（CRDT 操作，不涉及 I/O）
+        let mut results = Vec::with_capacity(blocks.len());
+        let mut changed_snaps: Vec<(BlockId, Vec<u8>)> = Vec::new();
+        for (block_id, bytes) in blocks {
+            let block = self.get_block(doc_id, block_id)?;
+            let result = block.import(bytes)?;
+            if result.changed {
+                let snap = block.export_snapshot()?;
+                changed_snaps.push((block_id.clone(), snap));
+            }
+            results.push(result);
+        }
+
+        // 2. 在单个事务中批量持久化所有变更的 snapshot
+        if !changed_snaps.is_empty() {
+            self.store.transaction(|conn| {
+                for (block_id, snap) in &changed_snaps {
+                    dao::insert_snapshot(
+                        conn,
+                        doc_id,
+                        &CheckpointId::new(block_id.as_str()),
+                        snap,
+                        tacit_core::SnapshotKind::Full,
+                        SystemTime::now(),
+                    )?;
+                }
+                Ok(())
+            })?;
+            tracing::debug!(
+                doc_id = %doc_id,
+                total = blocks.len(),
+                changed = changed_snaps.len(),
+                "批量导入完成"
+            );
+        }
+
+        Ok(results)
+    }
+
     /// 导入远端 MetaDoc delta/snapshot。
     pub fn import_meta(&self, doc_id: &DocId, bytes: &[u8]) -> CoreResult<ImportResult> {
         let meta = self.open_doc(doc_id)?;
@@ -358,11 +408,7 @@ impl DocStore {
     }
 
     /// 导出 block 完整 snapshot。
-    pub fn export_block_snapshot(
-        &self,
-        doc_id: &DocId,
-        block_id: &BlockId,
-    ) -> CoreResult<Vec<u8>> {
+    pub fn export_block_snapshot(&self, doc_id: &DocId, block_id: &BlockId) -> CoreResult<Vec<u8>> {
         let block = self.get_block(doc_id, block_id)?;
         block.export_snapshot()
     }

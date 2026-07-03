@@ -161,9 +161,9 @@ mod tests {
     fn high_priority_pops_first() {
         let q = PriorityQueue::new();
         // 先入 Low，再入 High
-        q.push(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
-            peer_id: pid(1),
-        }));
+        q.push(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::SyncCompleted { peer_id: pid(1) },
+        ));
         q.push(delta_action(1, "d1", Priority::High));
 
         let first = q.pop().unwrap();
@@ -190,13 +190,14 @@ mod tests {
         let q = PriorityQueue::new();
         q.push(SyncAction::SendControl {
             peer_id: pid(1),
-            msg: ControlMsg::AckSummary(tacit_core::AckSummary {
-                peer_id: pid(1),
-                doc_id: DocId::new("d1"),
-                ack_checkpoint: None,
-                ack_frontier: tacit_core::Frontier::new(),
-                updated_at: std::time::SystemTime::now(),
-            }),
+msg: ControlMsg::AckSummary(tacit_core::AckSummary {
+peer_id: pid(1),
+doc_id: DocId::new("d1"),
+ack_checkpoint: None,
+ack_frontier: tacit_core::Frontier::new(),
+updated_at: std::time::SystemTime::now(),
+version_override: None,
+}),
             priority: Priority::Medium,
         });
         q.push(delta_action(1, "d1", Priority::High));
@@ -213,9 +214,9 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(q.len(), 0);
 
-        q.push(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
-            peer_id: pid(1),
-        }));
+        q.push(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::SyncCompleted { peer_id: pid(1) },
+        ));
         assert!(!q.is_empty());
         assert_eq!(q.len(), 1);
     }
@@ -228,13 +229,19 @@ mod tests {
         // 按 Low → High → Medium 顺序入队，期望弹出顺序为 High, Medium, Low
         q.push(delta_action(1, "cold", Priority::Low));
         q.push(delta_action(2, "hot", Priority::High));
-        q.push(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncCompleted {
-            peer_id: pid(3),
-        }));
+        q.push(SyncAction::EmitEvent(
+            tacit_core::CoreEvent::SyncCompleted { peer_id: pid(3) },
+        ));
 
         let first = q.pop().unwrap();
         assert!(
-            matches!(first, SyncAction::RequestDelta { priority: Priority::High, .. } ),
+            matches!(
+                first,
+                SyncAction::RequestDelta {
+                    priority: Priority::High,
+                    ..
+                }
+            ),
             "High 应最先弹出"
         );
 
@@ -246,7 +253,13 @@ mod tests {
 
         let third = q.pop().unwrap();
         assert!(
-            matches!(third, SyncAction::RequestDelta { priority: Priority::Low, .. } ),
+            matches!(
+                third,
+                SyncAction::RequestDelta {
+                    priority: Priority::Low,
+                    ..
+                }
+            ),
             "Low 应最后弹出"
         );
 
@@ -261,7 +274,10 @@ mod tests {
         q.push(delta_action(2, "cold2", Priority::Low));
 
         let first = q.pop().unwrap();
-        if let SyncAction::RequestDelta { peer_id, priority, .. } = first {
+        if let SyncAction::RequestDelta {
+            peer_id, priority, ..
+        } = first
+        {
             assert_eq!(priority, Priority::Low);
             assert_eq!(peer_id, pid(1), "同优先级 Low 应 FIFO");
         } else {
@@ -280,14 +296,26 @@ mod tests {
         let drained = q.drain();
         assert_eq!(drained.len(), 3);
         // High 在前，两个 Low 在后（FIFO）
-        assert!(
-            matches!(drained[0], SyncAction::RequestDelta { priority: Priority::High, .. })
-        );
-        assert!(
-            matches!(drained[1], SyncAction::RequestDelta { priority: Priority::Low, .. })
-        );
-        assert!(
-            matches!(drained[2], SyncAction::RequestDelta { priority: Priority::Low, .. })
-        );
+        assert!(matches!(
+            drained[0],
+            SyncAction::RequestDelta {
+                priority: Priority::High,
+                ..
+            }
+        ));
+        assert!(matches!(
+            drained[1],
+            SyncAction::RequestDelta {
+                priority: Priority::Low,
+                ..
+            }
+        ));
+        assert!(matches!(
+            drained[2],
+            SyncAction::RequestDelta {
+                priority: Priority::Low,
+                ..
+            }
+        ));
     }
 }

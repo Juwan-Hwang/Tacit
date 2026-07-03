@@ -1,0 +1,27 @@
+[package]
+name = "tacit-transport-sms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Data SMS 实验性传输适配器（§2.2 / §11.1 优先级 X）"
+
+[features]
+default = []
+
+[dependencies]
+tacit-core.workspace = true
+tacit-transport.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+async-trait = "0.1"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
