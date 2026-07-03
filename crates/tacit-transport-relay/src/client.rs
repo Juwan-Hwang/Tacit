@@ -78,9 +78,7 @@ impl RelayClient {
     ) -> CoreResult<RelayMessage> {
         let state = self.state.lock();
         match &*state {
-            ClientState::Disconnected => {
-                Err(CoreError::Transport("未注册，无法转发".into()))
-            }
+            ClientState::Disconnected => Err(CoreError::Transport("未注册，无法转发".into())),
             ClientState::Registered { session_id } => Ok(RelayMessage::Forward(ForwardRequest {
                 session_id: session_id.clone(),
                 target_peer_id: target_peer_id.as_str().to_string(),

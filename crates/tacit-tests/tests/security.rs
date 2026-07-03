@@ -49,15 +49,34 @@ fn forged_signature_rejected() {
     let real_sig = signer.end_batch(&peer_id, &doc_id).unwrap();
 
     // 接收方验证正确签名（BatchEnd payload 为空，因最后一帧已作为 BatchStart 发送）
-    verifier.receive_frame(&peer_id, &doc_id, b"legitimate", BatchFlag::BatchStart, None);
-    let result = verifier.receive_frame(&peer_id, &doc_id, b"", BatchFlag::BatchEnd, Some(&real_sig));
+    verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"legitimate",
+        BatchFlag::BatchStart,
+        None,
+    );
+    let result =
+        verifier.receive_frame(&peer_id, &doc_id, b"", BatchFlag::BatchEnd, Some(&real_sig));
     assert_eq!(result, BatchVerifyResult::Verified);
 
     // 伪造签名（全零）
     let forged_sig = vec![0u8; 32];
     verifier.clear(&peer_id, &doc_id);
-    verifier.receive_frame(&peer_id, &doc_id, b"legitimate", BatchFlag::BatchStart, None);
-    let result = verifier.receive_frame(&peer_id, &doc_id, b"", BatchFlag::BatchEnd, Some(&forged_sig));
+    verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"legitimate",
+        BatchFlag::BatchStart,
+        None,
+    );
+    let result = verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"",
+        BatchFlag::BatchEnd,
+        Some(&forged_sig),
+    );
     assert_eq!(result, BatchVerifyResult::Mismatch, "伪造签名应被拒绝");
 }
 
@@ -80,7 +99,13 @@ fn tampered_middle_frame_detected() {
     // 接收方：中间帧被篡改
     verifier.receive_frame(&peer_id, &doc_id, b"frame1", BatchFlag::BatchStart, None);
     verifier.receive_frame(&peer_id, &doc_id, b"EVIL", BatchFlag::BatchMiddle, None);
-    let result = verifier.receive_frame(&peer_id, &doc_id, b"frame3", BatchFlag::BatchEnd, Some(&sig));
+    let result = verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"frame3",
+        BatchFlag::BatchEnd,
+        Some(&sig),
+    );
     assert_eq!(result, BatchVerifyResult::Mismatch, "篡改中间帧应被检测");
 }
 
@@ -117,11 +142,17 @@ fn relay_rejects_wrong_secret() {
 
     // 错误密钥
     let bad_proof = generate_proof(&pid(1), b"wrong_secret").unwrap();
-    assert!(server.handle_register(&bad_proof).is_err(), "错误密钥应被拒绝");
+    assert!(
+        server.handle_register(&bad_proof).is_err(),
+        "错误密钥应被拒绝"
+    );
 
     // 正确密钥
     let good_proof = generate_proof(&pid(1), &secret).unwrap();
-    assert!(server.handle_register(&good_proof).is_ok(), "正确密钥应通过");
+    assert!(
+        server.handle_register(&good_proof).is_ok(),
+        "正确密钥应通过"
+    );
 }
 
 /// 测试：Relay proof 过期后验证失败。
@@ -137,10 +168,16 @@ fn relay_proof_expiry() {
     sleep(Duration::from_secs(2));
 
     // 1 秒 TTL：已过期（proof 生成于 2 秒前）
-    assert!(verify_proof(&proof, &secret, 1).is_err(), "1 秒 TTL 应已过期");
+    assert!(
+        verify_proof(&proof, &secret, 1).is_err(),
+        "1 秒 TTL 应已过期"
+    );
 
     // 60 秒 TTL：仍有效（proof 生成于 2 秒前，60 秒内）
-    assert!(verify_proof(&proof, &secret, 60).is_ok(), "60 秒 TTL 应仍有效");
+    assert!(
+        verify_proof(&proof, &secret, 60).is_ok(),
+        "60 秒 TTL 应仍有效"
+    );
 }
 
 /// 测试：Relay proof 对错误密钥验证失败。
@@ -150,7 +187,10 @@ fn relay_proof_wrong_secret_fails() {
     let proof = generate_proof(&pid(1), &secret).unwrap();
 
     assert!(verify_proof(&proof, &secret, 60).is_ok(), "正确密钥应通过");
-    assert!(verify_proof(&proof, b"secret_b", 60).is_err(), "错误密钥应失败");
+    assert!(
+        verify_proof(&proof, b"secret_b", 60).is_err(),
+        "错误密钥应失败"
+    );
 }
 
 /// 测试：Noise_XX 握手完成后双方获得相同的会话密钥。
@@ -167,7 +207,10 @@ fn noise_handshake_produces_matching_keys() {
     let plaintext2 = b"hello from responder";
     let ciphertext2 = session_r.encrypt(plaintext2).unwrap();
     let decrypted2 = session_i.decrypt(&ciphertext2).unwrap();
-    assert_eq!(&decrypted2, plaintext2, "initiator 应能解密 responder 的消息");
+    assert_eq!(
+        &decrypted2, plaintext2,
+        "initiator 应能解密 responder 的消息"
+    );
 }
 
 /// 测试：设备身份签名验证。
@@ -181,16 +224,25 @@ fn device_identity_signature_verification() {
 
     // 用正确的公钥验证
     let pubkey = identity.public_key();
-    assert!(tacit_crypto::verify(message, &signature, &pubkey).is_ok(), "正确公钥应验证通过");
+    assert!(
+        tacit_crypto::verify(message, &signature, &pubkey).is_ok(),
+        "正确公钥应验证通过"
+    );
 
     // 用错误的公钥验证
     let other_identity = DeviceIdentity::generate().unwrap();
     let wrong_pubkey = other_identity.public_key();
-    assert!(tacit_crypto::verify(message, &signature, &wrong_pubkey).is_err(), "错误公钥应验证失败");
+    assert!(
+        tacit_crypto::verify(message, &signature, &wrong_pubkey).is_err(),
+        "错误公钥应验证失败"
+    );
 
     // 篡改消息后验证失败
     let tampered_message = b"tampered message";
-    assert!(tacit_crypto::verify(tampered_message, &signature, &pubkey).is_err(), "篡改消息应验证失败");
+    assert!(
+        tacit_crypto::verify(tampered_message, &signature, &pubkey).is_err(),
+        "篡改消息应验证失败"
+    );
 }
 
 /// 测试：会话加密后解密还原。
@@ -277,7 +329,10 @@ fn relay_forward_nonexistent_target_fails() {
     let result = server.handle_forward(&forward_req);
     assert!(result.is_ok(), "handle_forward 应返回 Ok");
     assert!(
-        matches!(result.unwrap(), tacit_transport_relay::RelayMessage::ForwardFailed { .. }),
+        matches!(
+            result.unwrap(),
+            tacit_transport_relay::RelayMessage::ForwardFailed { .. }
+        ),
         "向不存在的 peer 转发应返回 ForwardFailed"
     );
 }

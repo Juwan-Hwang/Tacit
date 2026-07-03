@@ -16,7 +16,7 @@ pub struct DocumentView {
 }
 
 /// 同步状态。
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct SyncStatus {
     /// 待执行的同步动作数。
     pub pending_actions: u32,
@@ -24,16 +24,6 @@ pub struct SyncStatus {
     pub pending_fetches: u32,
     /// 在线 peer 数。
     pub online_peers: u32,
-}
-
-impl Default for SyncStatus {
-    fn default() -> Self {
-        Self {
-            pending_actions: 0,
-            pending_fetches: 0,
-            online_peers: 0,
-        }
-    }
 }
 
 /// 发送数据动作（对应 SyncAction::SendData）。
