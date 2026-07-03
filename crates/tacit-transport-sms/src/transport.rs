@@ -23,6 +23,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use tacit_core::{CoreError, CoreResult, DataFrame, NetworkType, PeerId, PresenceHint, Priority};
@@ -54,6 +55,8 @@ struct ReassemblyEntry {
     phone: String,
     /// 已收到的段数（去重后）。
     received: usize,
+    /// 最近活跃时间（用于 LRU 驱逐）。
+    last_active: Instant,
 }
 
 /// SMS 传输：控制面 + 小型数据面。
@@ -86,6 +89,13 @@ impl SmsTransport {
     /// 在配对阶段从 `bootstrap_hints` 中提取 `sms:` 前缀的号码，
     /// 或由集成层直接注入。
     pub fn register_peer(&self, peer_id: PeerId, phone: String) {
+        // 清理旧的反向映射：如果此 peer 之前注册过不同号码，移除旧的 phone→peer 条目
+        if let Some(old_phone) = self.peer_phones.read().get(&peer_id).cloned() {
+            if old_phone != phone {
+                self.phone_peers.write().remove(&old_phone);
+            }
+        }
+        // 清理新号码上可能残留的旧 peer 映射
         self.phone_peers
             .write()
             .insert(phone.clone(), peer_id.clone());
@@ -251,11 +261,14 @@ impl SmsTransport {
         let key_remove = key.clone();
         let mut reasm = self.reassembly.write();
 
-        // 防止重组缓冲溢出
+        // 防止重组缓冲溢出：按 LRU 驱逐最久未活跃的条目
         if reasm.len() >= 64 && !reasm.contains_key(&key) {
             warn!(msg_id, "重组缓冲已满，丢弃最旧条目");
-            // 按 (phone, msg_id) 字典序找最旧的 key
-            if let Some(oldest_key) = reasm.keys().min().cloned() {
+            if let Some(oldest_key) = reasm
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_active)
+                .map(|(k, _)| k.clone())
+            {
                 reasm.remove(&oldest_key);
             }
         }
@@ -266,7 +279,9 @@ impl SmsTransport {
             total,
             phone: msg.phone.clone(),
             received: 0,
+            last_active: Instant::now(),
         });
+        entry.last_active = Instant::now();
 
         // 校验 frame_type + total + phone 一致性
         if entry.frame_type != frame_type || entry.total != total || entry.phone != msg.phone {
@@ -276,6 +291,7 @@ impl SmsTransport {
             entry.total = total;
             entry.phone = msg.phone.clone();
             entry.received = 0;
+            entry.last_active = Instant::now();
         }
 
         // 去重：仅在对应槽位为空时填入

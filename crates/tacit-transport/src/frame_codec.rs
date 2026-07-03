@@ -436,6 +436,7 @@ mod tests {
             peer_id: PeerId::new("1"),
             new_pubkey_hex: "deadbeef".to_string(),
             rotation_seq: 42,
+            signature: vec![0u8; 64],
         };
         let msg = CMsg::KeyRotate(rotate);
         let encoded = encode_control(&msg, 11).unwrap();

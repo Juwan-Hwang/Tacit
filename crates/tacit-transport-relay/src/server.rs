@@ -140,13 +140,12 @@ impl RelayServer {
             let mut p2s = self.peer_to_session.lock();
             p2s.insert(peer_id.clone(), session_id.clone());
         }
-        // 为 peer 初始化 token bucket（每次注册都重置，避免旧会话的限流状态影响新会话）
+        // 为 peer 初始化 token bucket（仅在首次注册时创建，重注册时保留现有 bucket 防止限流绕过）
         {
             let mut limiters = self.rate_limiters.lock();
-            limiters.insert(
-                peer_id,
-                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec),
-            );
+            limiters.entry(peer_id.clone()).or_insert_with(|| {
+                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec)
+            });
         }
 
         debug!(peer_id = %proof.peer_id, session_id = %session_id, "注册成功");
@@ -234,6 +233,9 @@ impl RelayServer {
         for sid in expired {
             if let Some(entry) = sessions.remove(&sid) {
                 p2s.remove(&entry.peer_id);
+                // 同步清理限流器，防止 rate_limiters 无限增长
+                let mut limiters = self.rate_limiters.lock();
+                limiters.remove(&entry.peer_id);
                 debug!(session_id = %sid, "清理过期 session");
             }
         }

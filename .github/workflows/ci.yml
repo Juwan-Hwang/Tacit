@@ -31,7 +31,9 @@ jobs:
 
       - name: Install protoc (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libdbus-1-dev pkg-config
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -48,10 +50,20 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-targets --all-features
 
-      - name: Test
+      - name: Clippy (Windows)
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo clippy --all-targets
+
+      - name: Test (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --all --verbose
+
+      - name: Test (Windows)
+        if: matrix.os != 'ubuntu-latest'
         run: cargo test --all --verbose
 
   cross-compile:

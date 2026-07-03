@@ -109,4 +109,8 @@ pub struct KeyRotateNotice {
     pub new_pubkey_hex: String,
     /// 轮换序号，单调递增。
     pub rotation_seq: u64,
+    /// 轮换签名：用**旧**私钥对 `peer_id:new_pubkey_hex:rotation_seq` 的 Ed25519 签名（64 字节）。
+    ///
+    /// 接收方用旧公钥验证，防止第三方伪造轮换通知劫持身份。
+    pub signature: Vec<u8>,
 }
