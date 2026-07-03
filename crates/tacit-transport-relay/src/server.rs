@@ -234,10 +234,12 @@ impl RelayServer {
 
         for sid in expired {
             if let Some(entry) = sessions.remove(&sid) {
-                p2s.remove(&entry.peer_id);
-                // 同步清理限流器，防止 rate_limiters 无限增长
-                let mut limiters = self.rate_limiters.lock();
-                limiters.remove(&entry.peer_id);
+                // 仅当 p2s 仍映射到此过期 sid 时才清理，避免误删已重注册的新 session
+                if p2s.get(&entry.peer_id) == Some(&sid) {
+                    p2s.remove(&entry.peer_id);
+                    let mut limiters = self.rate_limiters.lock();
+                    limiters.remove(&entry.peer_id);
+                }
                 debug!(session_id = %sid, "清理过期 session");
             }
         }

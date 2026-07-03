@@ -275,7 +275,7 @@ impl SmsTransport {
         if total == 1 {
             // 单段消息，直接解析
             let payload = &seg[4..];
-            return Ok(self.decode_payload(payload, frame_type, &msg.phone));
+            return Ok(Some(self.decode_payload(payload, frame_type, &msg.phone)?));
         }
 
         let key = (msg.phone.clone(), msg_id);
@@ -334,7 +334,11 @@ impl SmsTransport {
                 .map(|opt| opt.expect("所有槽位应已填满"))
                 .collect();
             let payload = SmsSegmentCodec::reassemble(&segments)?;
-            return Ok(self.decode_payload(&payload, entry.frame_type, &entry.phone));
+            return Ok(Some(self.decode_payload(
+                &payload,
+                entry.frame_type,
+                &entry.phone,
+            )?));
         }
 
         Ok(None)
@@ -346,43 +350,28 @@ impl SmsTransport {
         payload: &[u8],
         frame_type: u8,
         phone: &str,
-    ) -> Option<TransportEvent> {
+    ) -> CoreResult<TransportEvent> {
         let peer_id = self.phone_peers.read().get(phone).cloned();
 
         match frame_type {
             FRAME_TYPE_CONTROL => {
-                let msg: ControlMsg = match serde_json::from_slice(payload) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(error = %e, "SMS 控制消息反序列化失败");
-                        return None;
-                    }
-                };
-                // 控制消息中可能携带 peer_id，优先使用
+                let msg: ControlMsg = serde_json::from_slice(payload)
+                    .map_err(|e| CoreError::Transport(format!("SMS 控制消息反序列化失败: {e}")))?;
                 let pid = peer_id.unwrap_or_else(|| PeerId::new("sms-unknown"));
-                Some(TransportEvent::Control { peer_id: pid, msg })
+                Ok(TransportEvent::Control { peer_id: pid, msg })
             }
             FRAME_TYPE_DATA => {
                 use tacit_transport::decode_data;
-                match decode_data(payload) {
-                    Ok(wire) => {
-                        let frame = wire.to_data_frame();
-                        let pid = peer_id.unwrap_or_else(|| frame.actor_id.clone());
-                        Some(TransportEvent::Data {
-                            peer_id: pid,
-                            frame,
-                        })
-                    }
-                    Err(e) => {
-                        warn!(error = ?e, "SMS 数据帧解码失败");
-                        None
-                    }
-                }
+                let wire = decode_data(payload)
+                    .map_err(|e| CoreError::Transport(format!("SMS 数据帧解码失败: {e:?}")))?;
+                let frame = wire.to_data_frame();
+                let pid = peer_id.unwrap_or_else(|| frame.actor_id.clone());
+                Ok(TransportEvent::Data {
+                    peer_id: pid,
+                    frame,
+                })
             }
-            other => {
-                warn!(frame_type = other, "未知 SMS 帧类型，丢弃");
-                None
-            }
+            other => Err(CoreError::Transport(format!("未知 SMS 帧类型: {other}"))),
         }
     }
 

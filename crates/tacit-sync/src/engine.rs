@@ -51,7 +51,14 @@ fn parse_endpoint(addr: &str) -> tacit_core::Endpoint {
         return tacit_core::Endpoint::new(ip_addr.to_string(), 0);
     }
     // 3. hostname:port — 保留原始主机名供 TLS/SNI
-    if let Some(idx) = addr.rfind(':') {
+    //    对于带方括号的 IPv6（如 [2001:db8::1]:port），仅在 ']' 之后查找端口冒号
+    let colon_idx = if let Some(bracket_idx) = addr.rfind(']') {
+        addr[bracket_idx..].rfind(':').map(|i| bracket_idx + i)
+    } else {
+        addr.rfind(':')
+    };
+
+    if let Some(idx) = colon_idx {
         let host = &addr[..idx];
         let port: u16 = addr[idx + 1..].parse().unwrap_or(0);
         // 去除 IPv6 方括号 [::1]:port → ::1
@@ -61,8 +68,12 @@ fn parse_endpoint(addr: &str) -> tacit_core::Endpoint {
             .unwrap_or(host);
         tacit_core::Endpoint::new(host, port)
     } else {
-        // 4. 纯主机名
-        tacit_core::Endpoint::new(addr, 0)
+        // 4. 纯主机名或带方括号的裸 IPv6（如 [2001:db8::1]）
+        let host = addr
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(addr);
+        tacit_core::Endpoint::new(host, 0)
     }
 }
 
