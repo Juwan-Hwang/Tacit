@@ -18,6 +18,7 @@ tacit-transport.workspace = true
 tacit-transport-ble.workspace = true
 tacit-transport-quic.workspace = true
 tacit-transport-relay.workspace = true
+tacit-transport-sms.workspace = true
 tacit-sync.workspace = true
 tacit-ffi.workspace = true
 
