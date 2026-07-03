@@ -20,7 +20,9 @@ use tacit_transport::{
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-use crate::config::{generate_self_signed_cert, make_client_config, make_server_config, make_transport_config};
+use crate::config::{
+    generate_self_signed_cert, make_client_config, make_server_config, make_transport_config,
+};
 
 /// 接收数据回调类型。
 type DataHandler = Arc<RwLock<Option<Box<dyn Fn(TransportEvent) + Send + Sync>>>>;
@@ -87,10 +89,8 @@ impl QuicTransport {
     /// 否则仅创建 client endpoint。
     pub async fn new(config: QuicTransportConfig) -> CoreResult<Self> {
         // 构建 Quinn TransportConfig：应用 idle_timeout 与 keep_alive_interval
-        let transport_config = make_transport_config(
-            config.idle_timeout_secs,
-            config.keep_alive_interval_secs,
-        )?;
+        let transport_config =
+            make_transport_config(config.idle_timeout_secs, config.keep_alive_interval_secs)?;
 
         let (endpoint, cert, client_config) = if config.is_server {
             // server 模式：生成证书，监听
@@ -98,9 +98,8 @@ impl QuicTransport {
             let mut server_config = make_server_config(cert.clone(), key)?;
             // 将 TransportConfig 应用到 server（影响入站连接）
             server_config.transport_config(transport_config.clone());
-            let endpoint =
-                Endpoint::server(server_config, config.listen_addr)
-                    .map_err(|e| CoreError::Transport(format!("创建 endpoint 失败: {e}")))?;
+            let endpoint = Endpoint::server(server_config, config.listen_addr)
+                .map_err(|e| CoreError::Transport(format!("创建 endpoint 失败: {e}")))?;
             // server 也能主动发起连接，用自身证书作为信任根
             let mut client_config = make_client_config(cert.clone())?;
             // 出站连接同样应用 TransportConfig
@@ -321,9 +320,9 @@ impl QuicTransport {
                     // 集成层握手后可调用 register_incoming_peer 覆盖为真实 peer_id
                     let remote_peer = {
                         let map = addr_map.lock();
-                        map.get(&remote_addr)
-                            .cloned()
-                            .unwrap_or_else(|| PeerId::new(format!("peer_{}", stable_addr_hash(&remote_addr))))
+                        map.get(&remote_addr).cloned().unwrap_or_else(|| {
+                            PeerId::new(format!("peer_{}", stable_addr_hash(&remote_addr)))
+                        })
                     };
                     loop {
                         match conn.accept_uni().await {
@@ -347,8 +346,7 @@ impl QuicTransport {
                                         return;
                                     }
                                     // 尝试解码为 DataFrame 或 ControlMsg
-                                    let event = if let Ok(wire) =
-                                        tacit_transport::decode_data(&buf)
+                                    let event = if let Ok(wire) = tacit_transport::decode_data(&buf)
                                     {
                                         Some(TransportEvent::Data {
                                             peer_id,
@@ -357,15 +355,9 @@ impl QuicTransport {
                                     } else if let Ok((msg, _sid)) =
                                         tacit_transport::decode_control(&buf)
                                     {
-                                        Some(TransportEvent::Control {
-                                            peer_id,
-                                            msg,
-                                        })
+                                        Some(TransportEvent::Control { peer_id, msg })
                                     } else {
-                                        warn!(
-                                            len = buf.len(),
-                                            "无法解码收到的数据帧，丢弃"
-                                        );
+                                        warn!(len = buf.len(), "无法解码收到的数据帧，丢弃");
                                         None
                                     };
                                     // 调用回调
@@ -395,7 +387,12 @@ impl QuicTransport {
     /// 使用长度前缀（4 字节大端）+ 载荷的帧格式，防止粘包/拆包。
     /// 所有 stream 操作（open_uni / write_all / finish）均带超时，
     /// 超时返回 `CoreError::Transport("QUIC stream operation timed out")`。
-    async fn send_bytes(&self, peer_id: &PeerId, bytes: &[u8], priority: Priority) -> CoreResult<()> {
+    async fn send_bytes(
+        &self,
+        peer_id: &PeerId,
+        bytes: &[u8],
+        priority: Priority,
+    ) -> CoreResult<()> {
         let conn = self.get_or_connect(peer_id).await?;
         let op_timeout = Duration::from_secs(self.config.stream_op_timeout_secs);
         // open_uni 带超时
@@ -618,14 +615,16 @@ impl SyncTransport for QuicTransport {
                         debug!(peer_id = %peer_id, attempt, ?delay, "fast-resume 等待退避后重试");
                         tokio::time::sleep(delay).await;
                     }
-                    let connect = match endpoint.connect_with(client_config.clone(), addr, "tacit") {
+                    let connect = match endpoint.connect_with(client_config.clone(), addr, "tacit")
+                    {
                         Ok(c) => c,
                         Err(e) => {
                             warn!(peer_id = %peer_id, attempt, error = %e, "fast-resume 发起连接失败");
                             continue;
                         }
                     };
-                    match tokio::time::timeout(Duration::from_secs(connect_timeout), connect).await {
+                    match tokio::time::timeout(Duration::from_secs(connect_timeout), connect).await
+                    {
                         Ok(Ok(conn)) => {
                             connections.lock().insert(peer_id.clone(), conn);
                             addr_to_peer.lock().insert(addr, peer_id.clone());
@@ -700,12 +699,7 @@ mod tests {
             session_id: tacit_core::SessionId::new(1),
         };
         client
-            .send_data(
-                &peer_id,
-                frame,
-                Priority::High,
-                PathPreference::Any,
-            )
+            .send_data(&peer_id, frame, Priority::High, PathPreference::Any)
             .await
             .unwrap();
     }

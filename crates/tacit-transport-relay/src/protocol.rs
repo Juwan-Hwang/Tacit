@@ -8,7 +8,9 @@ use tacit_core::PeerId;
 /// - Tier 1：用户自己的桌面 Anchor（始终在线、完全信任）
 /// - Tier 2：社区志愿者（可信但可能间歇在线）
 /// - Tier 3：公共服务（最低信任，作为最后兜底）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum RelayTier {
     /// Tier 1：用户桌面 Anchor。
@@ -16,6 +18,7 @@ pub enum RelayTier {
     /// Tier 2：社区志愿者。
     Community = 2,
     /// Tier 3：公共服务。
+    #[default]
     Public = 3,
 }
 
@@ -32,12 +35,6 @@ impl RelayTier {
     /// 是否值得长期信任（用于决定是否缓存 peer 列表等）。
     pub fn is_trusted(&self) -> bool {
         matches!(self, Self::Desktop | Self::Community)
-    }
-}
-
-impl Default for RelayTier {
-    fn default() -> Self {
-        Self::Public
     }
 }
 
@@ -75,10 +72,7 @@ pub enum RelayMessage {
     /// 转发失败（目标不在线等）。
     ForwardFailed { reason: String },
     /// 收到转发的数据（由 relay 推送给目标客户端）。
-    Incoming {
-        from_peer_id: String,
-        data: Vec<u8>,
-    },
+    Incoming { from_peer_id: String, data: Vec<u8> },
     /// peer 上线通知（relay 推送给已注册客户端）。
     PeerOnline { peer_id: String },
     /// peer 下线通知（relay 推送给已注册客户端）。
