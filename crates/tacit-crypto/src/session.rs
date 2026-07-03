@@ -87,7 +87,7 @@ mod tests {
         let (mut s1, mut s2) = establish_session();
         let mut ct = s1.encrypt(b"original").unwrap();
         // 篡改密文
-        if ct.len() > 0 {
+        if !ct.is_empty() {
             ct[0] ^= 0xff;
         }
         assert!(s2.decrypt(&ct).is_err());

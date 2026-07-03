@@ -66,7 +66,11 @@ impl BlockDocCache {
     /// 调用方应将被 evict 的 BlockDoc 导出 snapshot 持久化。
     /// pinned block 不会被淘汰，除非所有条目都被 pinned 且超出容量，
     /// 此时强制淘汰最旧的 pinned 条目以防内存无限增长。
-    pub fn insert(&self, block_id: BlockId, doc: Arc<BlockDoc>) -> Option<(BlockId, Arc<BlockDoc>)> {
+    pub fn insert(
+        &self,
+        block_id: BlockId,
+        doc: Arc<BlockDoc>,
+    ) -> Option<(BlockId, Arc<BlockDoc>)> {
         // 在 entries 锁内：插入新条目、决定 evict_id、取出被淘汰的 doc
         let evicted = {
             let mut entries = self.entries.lock();

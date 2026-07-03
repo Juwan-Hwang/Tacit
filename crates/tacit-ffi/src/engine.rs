@@ -11,8 +11,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use tacit_core::{
-    BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId,
-    SyncReason,
+    BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId, SyncReason,
 };
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
@@ -21,8 +20,11 @@ use tracing::debug;
 use crate::command_bus::{Command, CommandBus};
 use crate::doc_executor::DocExecutorRegistry;
 use crate::event_bus::EventBus;
-use crate::listener::{EventDispatcher, ForeignListenerAdapter, ForeignEventListener};
-use crate::view::{DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus};
+use crate::listener::{EventDispatcher, ForeignEventListener, ForeignListenerAdapter};
+use crate::view::{
+    DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction,
+    SyncStatus,
+};
 
 /// Tacit 引擎：FFI 主入口。
 #[derive(uniffi::Object)]
@@ -202,7 +204,10 @@ impl TacitEngine {
     }
 
     /// 请求 fast-resume（带视口）。
-    pub fn request_fast_resume_with_viewport(&self, viewport: tacit_core::Viewport) -> CoreResult<()> {
+    pub fn request_fast_resume_with_viewport(
+        &self,
+        viewport: tacit_core::Viewport,
+    ) -> CoreResult<()> {
         self.engine.fast_resume(Some(viewport))
     }
 
@@ -233,7 +238,11 @@ impl TacitEngine {
         let was_offline = {
             let mut net = self.current_net.lock();
             let prev = *net;
-            *net = if online { new_net } else { NetworkType::Offline };
+            *net = if online {
+                new_net
+            } else {
+                NetworkType::Offline
+            };
             prev == NetworkType::Offline
         };
 
@@ -288,8 +297,7 @@ impl TacitEngine {
                     // 事件在内部完成分发
                     self.dispatch_event(event);
                     // 同时返回事件 JSON 供集成层记录日志
-                    let event_json = serde_json::to_string(event)
-                        .unwrap_or_else(|_| "{}".into());
+                    let event_json = serde_json::to_string(event).unwrap_or_else(|_| "{}".into());
                     result.push(FfiSyncAction::EmitEvent { event_json });
                 }
                 SyncAction::SendData {
@@ -355,6 +363,25 @@ impl TacitEngine {
         self.engine.process_pending(Instant::now())
     }
 
+    /// 检查所有文档是否需要 compaction，按需执行。
+    ///
+    /// 由 RuntimeSupervisor 周期调用，自动维护文档压缩。
+    /// 返回执行了 compaction 的文档数量。
+    pub fn maybe_compact_all(&self) -> CoreResult<usize> {
+        let doc_ids = self.doc_store.list_doc_ids()?;
+        let watermark_calc =
+            tacit_sync::WatermarkCalculator::new(std::time::Duration::from_secs(60 * 60 * 24 * 3));
+        let cp_mgr =
+            tacit_sync::CheckpointManager::new_ref(self.doc_store.as_ref(), watermark_calc);
+        let mut compacted = 0;
+        for doc_id in &doc_ids {
+            if cp_mgr.maybe_compact(doc_id)?.is_some() {
+                compacted += 1;
+            }
+        }
+        Ok(compacted)
+    }
+
     /// 触发 Hot-Path 模式（Apple 设备短暂唤醒）。
     pub fn trigger_hot_path(&self) {
         self.engine.trigger_hot_path();
@@ -368,8 +395,7 @@ impl TacitEngine {
     /// 获取 telemetry 快照（JSON 字符串）。
     pub fn get_telemetry_snapshot(&self) -> CoreResult<String> {
         let snap = self.engine.telemetry().snapshot();
-        serde_json::to_string(&snap)
-            .map_err(|e| CoreError::Serialize(e.to_string()))
+        serde_json::to_string(&snap).map_err(|e| CoreError::Serialize(e.to_string()))
     }
 
     /// 将待执行动作中的事件分发到监听器。
@@ -425,7 +451,10 @@ impl TacitEngine {
     /// `store_path`：SQLite 数据库路径。传空字符串使用内存数据库（仅测试）。
     /// `peer_id`：本设备 PeerId。
     #[uniffi::constructor]
-    pub fn open(store_path: String, peer_id: String) -> Result<Arc<Self>, crate::error::TacitFfiError> {
+    pub fn open(
+        store_path: String,
+        peer_id: String,
+    ) -> Result<Arc<Self>, crate::error::TacitFfiError> {
         if store_path.is_empty() {
             let engine = Self::new_memory(&peer_id)?;
             Ok(Arc::new(engine))
@@ -497,10 +526,7 @@ impl TacitEngine {
     }
 
     /// 通知 peer 上线。
-    pub fn ffi_on_peer_online(
-        &self,
-        peer_id: String,
-    ) -> Result<(), crate::error::TacitFfiError> {
+    pub fn ffi_on_peer_online(&self, peer_id: String) -> Result<(), crate::error::TacitFfiError> {
         Ok(self.on_peer_online(peer_id)?)
     }
 
@@ -576,7 +602,9 @@ mod tests {
     #[test]
     fn create_and_open_document() {
         let engine = TacitEngine::new_memory("1").unwrap();
-        engine.create_document("doc1".into(), "note".into()).unwrap();
+        engine
+            .create_document("doc1".into(), "note".into())
+            .unwrap();
         let view = engine.open_document("doc1".into()).unwrap();
         assert_eq!(view.doc_id, "doc1");
         assert_eq!(view.kind, "note");
@@ -586,7 +614,9 @@ mod tests {
     #[test]
     fn create_block_and_edit() {
         let engine = TacitEngine::new_memory("1").unwrap();
-        engine.create_document("doc1".into(), "note".into()).unwrap();
+        engine
+            .create_document("doc1".into(), "note".into())
+            .unwrap();
         engine
             .create_block("doc1".into(), "block1".into(), "text".into())
             .unwrap();
@@ -624,7 +654,9 @@ mod tests {
     #[test]
     fn peer_online_triggers_sync() {
         let engine = TacitEngine::new_memory("1").unwrap();
-        engine.create_document("doc1".into(), "note".into()).unwrap();
+        engine
+            .create_document("doc1".into(), "note".into())
+            .unwrap();
         engine.on_peer_online("2".into()).unwrap();
         let status = engine.get_sync_status().unwrap();
         assert_eq!(status.online_peers, 1);

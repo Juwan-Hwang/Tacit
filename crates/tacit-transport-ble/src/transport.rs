@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tacit_core::{CoreError, CoreResult, DataFrame, NetworkType, PeerId, PresenceHint, Priority};
-use tacit_transport::{SyncTransport, TransportManager, PathPreference, ControlMsg};
+use tacit_transport::{ControlMsg, PathPreference, SyncTransport, TransportManager};
 use tracing::{debug, warn};
 
 use crate::presence::BlePresence;
