@@ -246,15 +246,62 @@ impl RelayClientTransport {
     /// 启动后台接收 task，处理 relay 主动推送的消息。
     ///
     /// relay 通过 uni-stream 推送 Incoming / PeerOnline / PeerOffline。
+    ///
+    /// **并发读取 + 串行解密**：
+    /// - 每条 uni-stream 由独立 task 并发读取，避免慢流阻塞 accept 循环（HoL）。
+    /// - 需要解密的 Incoming 消息通过 mpsc channel 交给单一消费者串行处理，
+    ///   保证 Noise 状态化 AEAD nonce 顺序正确。
+    /// - 非加密消息（PeerOnline / PeerOffline 等）直接处理，无需排队。
     fn start_recv_loop(&self, conn: Connection) {
         let push_handler = self.push_handler.clone();
         let sessions = self.sessions.clone();
+
+        // 解密队列：所有需要 E2E 解密的消息串行通过此 channel 处理。
+        let (decrypt_tx, mut decrypt_rx) = mpsc::channel::<(String, Vec<u8>)>(256);
+
+        // 串行解密消费者：按 FIFO 顺序解密，保证 Noise nonce 顺序。
+        let handler_for_decrypt = push_handler.clone();
+        let sessions_for_decrypt = sessions.clone();
+        tokio::spawn(async move {
+            while let Some((from_peer_id, data)) = decrypt_rx.recv().await {
+                let from = PeerId::new(&from_peer_id);
+                let decrypted = match sessions_for_decrypt.read().get(&from) {
+                    Some(session) => {
+                        let mut s = session.lock();
+                        match s.decrypt(&data) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                warn!(
+                                    peer = %from,
+                                    error = %e,
+                                    "E2E 解密失败，丢弃消息",
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    None => data,
+                };
+                let msg = RelayMessage::Incoming {
+                    from_peer_id,
+                    data: decrypted,
+                };
+                if let Some(event) = convert_push_event(&msg) {
+                    let handler = handler_for_decrypt.read();
+                    if let Some(h) = handler.as_ref() {
+                        h(event);
+                    }
+                }
+            }
+        });
+
         tokio::spawn(async move {
             loop {
                 match conn.accept_uni().await {
                     Ok(mut stream) => {
                         let handler = push_handler.clone();
-                        let sessions = sessions.clone();
+                        let decrypt_tx = decrypt_tx.clone();
+                        // 并发读取每条流，避免慢流阻塞 accept 循环
                         tokio::spawn(async move {
                             let mut buf = Vec::new();
                             let mut chunk = vec![0u8; 4096];
@@ -273,39 +320,16 @@ impl RelayClientTransport {
                             }
                             match RelayMessage::from_bytes(&buf) {
                                 Ok(msg) => {
-                                    // E2E 解密：若该 peer 已注册 session，解密 Incoming 数据
-                                    let msg = if let RelayMessage::Incoming { from_peer_id, data } =
-                                        msg
-                                    {
-                                        let from = PeerId::new(&from_peer_id);
-                                        let decrypted = match sessions.read().get(&from) {
-                                            Some(session) => {
-                                                let mut s = session.lock();
-                                                match s.decrypt(&data) {
-                                                    Ok(pt) => pt,
-                                                    Err(e) => {
-                                                        warn!(
-                                                            peer = %from,
-                                                            error = %e,
-                                                            "E2E 解密失败，丢弃消息",
-                                                        );
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            None => data,
-                                        };
-                                        RelayMessage::Incoming {
-                                            from_peer_id,
-                                            data: decrypted,
-                                        }
+                                    // Incoming 需要解密：交给串行解密队列
+                                    if let RelayMessage::Incoming { from_peer_id, data } = msg {
+                                        let _ = decrypt_tx.send((from_peer_id, data)).await;
                                     } else {
-                                        msg
-                                    };
-                                    if let Some(event) = convert_push_event(&msg) {
-                                        let handler = handler.read();
-                                        if let Some(h) = handler.as_ref() {
-                                            h(event);
+                                        // 非加密消息直接处理
+                                        if let Some(event) = convert_push_event(&msg) {
+                                            let handler = handler.read();
+                                            if let Some(h) = handler.as_ref() {
+                                                h(event);
+                                            }
                                         }
                                     }
                                 }
