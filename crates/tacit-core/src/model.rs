@@ -163,6 +163,12 @@ pub struct PeerRecord {
     pub relay_hint: Option<PeerId>,
     /// 成功率指数移动平均（0.0 ~ 1.0），用于 Anchor 选举排序。
     pub success_ema: f64,
+    /// 密钥轮换序号（单调递增，防止重放攻击）。
+    ///
+    /// 初始为 0，每次密钥轮换后 +1。与 `anchor_priority` 独立存储，
+    /// 避免污染 Anchor 选举权重。
+    #[serde(default)]
+    pub rotation_seq: u64,
 }
 
 /// peer 在线状态摘要。

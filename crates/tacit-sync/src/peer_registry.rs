@@ -144,6 +144,7 @@ mod tests {
             nat_capability: NatCapability::Unknown,
             relay_hint: None,
             success_ema: 1.0,
+            rotation_seq: 0,
         }
     }
 

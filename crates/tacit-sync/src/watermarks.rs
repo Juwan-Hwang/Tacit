@@ -123,16 +123,16 @@ mod tests {
         PeerId(n.to_string())
     }
 
-fn ack(peer: PeerId, doc: &str, frontier: Frontier, updated: SystemTime) -> AckSummary {
-AckSummary {
-peer_id: peer,
-doc_id: DocId::new(doc),
-ack_checkpoint: None,
-ack_frontier: frontier,
-updated_at: updated,
-version_override: None,
-}
-}
+    fn ack(peer: PeerId, doc: &str, frontier: Frontier, updated: SystemTime) -> AckSummary {
+        AckSummary {
+            peer_id: peer,
+            doc_id: DocId::new(doc),
+            ack_checkpoint: None,
+            ack_frontier: frontier,
+            updated_at: updated,
+            version_override: None,
+        }
+    }
 
     #[test]
     fn empty_acks_returns_default() {

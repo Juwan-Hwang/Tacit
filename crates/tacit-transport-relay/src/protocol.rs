@@ -8,7 +8,9 @@ use tacit_core::PeerId;
 /// - Tier 1：用户自己的桌面 Anchor（始终在线、完全信任）
 /// - Tier 2：社区志愿者（可信但可能间歇在线）
 /// - Tier 3：公共服务（最低信任，作为最后兜底）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum RelayTier {
     /// Tier 1：用户桌面 Anchor。

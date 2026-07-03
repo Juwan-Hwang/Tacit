@@ -89,14 +89,14 @@ async fn real_quic_send_control_and_receive() {
     });
 
     // 发送控制帧
-let ack = tacit_core::AckSummary {
-peer_id: PeerId::new("client"),
-doc_id: DocId::new("d1"),
-ack_checkpoint: None,
-ack_frontier: tacit_core::Frontier::new(),
-updated_at: std::time::SystemTime::now(),
-version_override: None,
-};
+    let ack = tacit_core::AckSummary {
+        peer_id: PeerId::new("client"),
+        doc_id: DocId::new("d1"),
+        ack_checkpoint: None,
+        ack_frontier: tacit_core::Frontier::new(),
+        updated_at: std::time::SystemTime::now(),
+        version_override: None,
+    };
     let msg = tacit_transport::ControlMsg::AckSummary(ack);
     client
         .send_control(&peer_id, msg, Priority::Medium)

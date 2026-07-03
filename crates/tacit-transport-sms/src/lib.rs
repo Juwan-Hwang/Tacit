@@ -37,7 +37,7 @@ pub mod transport;
 
 pub use backend::{MockSmsBackend, SmsBackend, SmsMessage};
 pub use codec::{
-    SmsSegmentCodec, MAX_SMS_PAYLOAD_LEN, MAX_SEGMENT_PAYLOAD_LEN, FRAME_TYPE_CONTROL,
-    FRAME_TYPE_DATA,
+    SmsSegmentCodec, FRAME_TYPE_CONTROL, FRAME_TYPE_DATA, MAX_SEGMENT_PAYLOAD_LEN,
+    MAX_SMS_PAYLOAD_LEN,
 };
 pub use transport::{SmsTransport, MAX_SMS_DATA_PAYLOAD};

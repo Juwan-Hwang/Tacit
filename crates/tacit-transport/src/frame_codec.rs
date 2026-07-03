@@ -201,12 +201,16 @@ fn tlv_to_control_msg(ctrl_type: ControlType, payload: &[u8]) -> Result<CMsg, Fr
         ControlType::KnownCheckpoint => {
             let json: serde_json::Value = serde_json::from_slice(value)
                 .map_err(|_| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
-            let peer_id_str = json["peer_id"].as_str().ok_or(
-                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
-            )?;
-            let doc_id_str = json["doc_id"].as_str().ok_or(
-                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
-            )?;
+            let peer_id_str = json["peer_id"]
+                .as_str()
+                .ok_or(FrameError::UnknownControlType(
+                    ControlType::KnownCheckpoint as u8,
+                ))?;
+            let doc_id_str = json["doc_id"]
+                .as_str()
+                .ok_or(FrameError::UnknownControlType(
+                    ControlType::KnownCheckpoint as u8,
+                ))?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             let checkpoint = json["checkpoint"]
@@ -238,10 +242,14 @@ fn tlv_to_control_msg(ctrl_type: ControlType, payload: &[u8]) -> Result<CMsg, Fr
                 .map_err(|_| FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
             let peer_id_str = json["peer_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
+                .ok_or(FrameError::UnknownControlType(
+                    ControlType::SyncIntent as u8,
+                ))?;
             let doc_id_str = json["doc_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
+                .ok_or(FrameError::UnknownControlType(
+                    ControlType::SyncIntent as u8,
+                ))?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             Ok(CMsg::SyncIntent { peer_id, doc_id })
@@ -281,14 +289,14 @@ mod tests {
 
     #[test]
     fn encode_decode_control_ack() {
-let ack = AckSummary {
-peer_id: PeerId::new("1"),
-doc_id: DocId::new("d1"),
-ack_checkpoint: None,
-ack_frontier: Frontier::new(),
-updated_at: std::time::SystemTime::now(),
-version_override: None,
-};
+        let ack = AckSummary {
+            peer_id: PeerId::new("1"),
+            doc_id: DocId::new("d1"),
+            ack_checkpoint: None,
+            ack_frontier: Frontier::new(),
+            updated_at: std::time::SystemTime::now(),
+            version_override: None,
+        };
         let msg = CMsg::AckSummary(ack);
         let encoded = encode_control(&msg, 42).unwrap();
         let (decoded, sid) = decode_control(&encoded).unwrap();

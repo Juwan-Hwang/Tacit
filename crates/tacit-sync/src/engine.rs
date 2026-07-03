@@ -16,6 +16,7 @@
 //! 6. 退避重试，直至满足预期或会话结束
 //! 7. 达到条件时更新 ack 并评估 compaction
 
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -32,6 +33,32 @@ use crate::hot_path::HotPathController;
 use crate::pending::{PendingBlockFetch, PendingFetchQueue};
 use crate::priority_queue::PriorityQueue;
 use crate::watermarks::WatermarkCalculator;
+
+/// 解析 `host:port` 或 IPv6 端点字符串为 [`tacit_core::Endpoint`]。
+///
+/// 优先尝试 `SocketAddr` 解析（覆盖 IPv4/IPv6 + 端口），
+/// 回退到 `rfind(':')` 分割（覆盖 `host:port`），
+/// 最后回退为纯主机名（端口 0）。
+fn parse_endpoint(addr: &str) -> tacit_core::Endpoint {
+    // 1. 尝试 SocketAddr 解析（正确处理 IPv6 如 [2001:db8::1]:4433）
+    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        return tacit_core::Endpoint::new(socket_addr.ip().to_string(), socket_addr.port());
+    }
+    // 2. 尝试 ToSocketAddrs（覆盖无中括号的 IPv6 + 端口）
+    if let Ok(mut iter) = addr.to_socket_addrs() {
+        if let Some(socket_addr) = iter.next() {
+            return tacit_core::Endpoint::new(socket_addr.ip().to_string(), socket_addr.port());
+        }
+    }
+    // 3. 回退：rfind(':') 分割（仅对 IPv4:host:port 安全）
+    if let Some(idx) = addr.rfind(':') {
+        let host = &addr[..idx];
+        let port: u16 = addr[idx + 1..].parse().unwrap_or(0);
+        tacit_core::Endpoint::new(host, port)
+    } else {
+        tacit_core::Endpoint::new(addr, 0)
+    }
+}
 
 /// 同步动作：SyncEngine 产生的待执行动作。
 ///
@@ -414,15 +441,25 @@ impl DefaultSyncEngine {
             states.remove(revoked_peer).is_some()
         };
 
+        // 即使 peer_states 中不存在（例如 peer 仅在 DB 中注册但未在线），
+        // 也需要持久化撤销状态到数据库，防止重启后恢复信任。
+        // 2. 持久化撤销状态到数据库
+        {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::revoke_peer(&conn, revoked_peer)?;
+        }
+
         if was_known {
-            // 2. 清理该 peer 的依赖等待条目
+            // 3. 清理该 peer 的依赖等待条目
             self.pending.remove_peer(revoked_peer);
 
-            // 3. 发射事件
+            // 4. 发射事件
             self.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::PeerRevoked {
                 peer_id: revoked_peer.clone(),
             }));
-            debug!(peer = %revoked_peer, "peer 已被撤销，状态已清理");
+            debug!(peer = %revoked_peer, "peer 已被撤销，状态已清理并持久化");
+        } else {
+            debug!(peer = %revoked_peer, "peer 已被撤销，状态已持久化（无运行时状态需清理）");
         }
 
         Ok(())
@@ -468,19 +505,11 @@ impl DefaultSyncEngine {
                     trust_state: tacit_core::TrustState::Pending,
                     anchor_priority: 0,
                     last_seen_at: SystemTime::now(),
-                    last_endpoint: msg.endpoint.as_ref().map(|addr| {
-                        // 解析 "host:port" 格式
-                        if let Some(idx) = addr.rfind(':') {
-                            let host = &addr[..idx];
-                            let port: u16 = addr[idx + 1..].parse().unwrap_or(0);
-                            tacit_core::Endpoint::new(host, port)
-                        } else {
-                            tacit_core::Endpoint::new(addr, 0)
-                        }
-                    }),
+                    last_endpoint: msg.endpoint.as_ref().map(|addr| parse_endpoint(addr)),
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 0.0,
+                    rotation_seq: 0,
                 };
                 tacit_store::dao::upsert_peer(&conn, &record)?;
                 debug!(
@@ -533,11 +562,8 @@ impl DefaultSyncEngine {
             ))
         })?;
 
-        // 2. 校验 rotation_seq 单调递增
-        // 从 device_pubkey 字段中无法获取旧的 rotation_seq，因此使用 peers 表中的
-        // anchor_priority 字段暂存 rotation_seq（复用整数字段）。
-        // 若 anchor_priority < rotation_seq 则接受轮换。
-        let current_seq = record.anchor_priority as u64;
+        // 2. 校验 rotation_seq 单调递增（使用 peers 表中独立的 rotation_seq 列）
+        let current_seq = record.rotation_seq;
         if msg.rotation_seq <= current_seq {
             return Err(tacit_core::CoreError::Crypto(format!(
                 "密钥轮换序号不递增：当前 {}，收到 {}（可能是重放攻击）",
@@ -548,7 +574,7 @@ impl DefaultSyncEngine {
         // 3. 更新公钥与序号
         let old_pubkey = record.device_pubkey.clone();
         record.device_pubkey = msg.new_pubkey_hex.clone();
-        record.anchor_priority = msg.rotation_seq as i32;
+        record.rotation_seq = msg.rotation_seq;
         tacit_store::dao::upsert_peer(&conn, &record)?;
 
         debug!(
@@ -1074,6 +1100,7 @@ mod tests {
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 0.9,
+                    rotation_seq: 0,
                 },
             )
             .unwrap();
@@ -1112,12 +1139,13 @@ mod tests {
                     device_pubkey: "oldpubkey".to_string(),
                     capabilities: Default::default(),
                     trust_state: tacit_core::TrustState::Trusted,
-                    anchor_priority: 0, // 初始 rotation_seq = 0
+                    anchor_priority: 0,
                     last_seen_at: SystemTime::now(),
                     last_endpoint: None,
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 1.0,
+                    rotation_seq: 0,
                 },
             )
             .unwrap();
@@ -1135,7 +1163,7 @@ mod tests {
         let conn = doc_store.store().conn();
         let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
         assert_eq!(peer.device_pubkey, "newpubkey");
-        assert_eq!(peer.anchor_priority, 1); // rotation_seq 存储
+        assert_eq!(peer.rotation_seq, 1); // rotation_seq 存储
         assert_eq!(peer.trust_state, tacit_core::TrustState::Trusted); // 信任状态不变
     }
 
@@ -1159,6 +1187,7 @@ mod tests {
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 1.0,
+                    rotation_seq: 0,
                 },
             )
             .unwrap();
@@ -1201,7 +1230,7 @@ mod tests {
         let (engine, doc_store) = make_engine();
         register_online_peer(&engine, pid(2));
 
-        // 预注册，anchor_priority=3（表示已轮换到 seq=3）
+        // 预注册，rotation_seq=3（表示已轮换到 seq=3）
         {
             let conn = doc_store.store().conn();
             tacit_store::dao::upsert_peer(
@@ -1211,12 +1240,13 @@ mod tests {
                     device_pubkey: "key_v3".to_string(),
                     capabilities: Default::default(),
                     trust_state: tacit_core::TrustState::Trusted,
-                    anchor_priority: 3,
+                    anchor_priority: 0,
                     last_seen_at: SystemTime::now(),
                     last_endpoint: None,
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 1.0,
+                    rotation_seq: 3,
                 },
             )
             .unwrap();
@@ -1266,6 +1296,7 @@ mod tests {
                     nat_capability: tacit_core::NatCapability::Unknown,
                     relay_hint: None,
                     success_ema: 1.0,
+                    rotation_seq: 0,
                 },
             )
             .unwrap();
@@ -1284,6 +1315,6 @@ mod tests {
         let conn = doc_store.store().conn();
         let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
         assert_eq!(peer.device_pubkey, "key_v3");
-        assert_eq!(peer.anchor_priority, 3);
+        assert_eq!(peer.rotation_seq, 3);
     }
 }

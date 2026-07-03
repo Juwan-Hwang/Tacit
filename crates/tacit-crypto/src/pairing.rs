@@ -644,7 +644,8 @@ mod tests {
         let pubkey = test_pubkey();
 
         // 发起方创建会话
-        let initiator = PairingSession::initiator(group_id.clone(), pubkey.clone(), vec![]).unwrap();
+        let initiator =
+            PairingSession::initiator(group_id.clone(), pubkey.clone(), vec![]).unwrap();
         assert_eq!(initiator.role(), PairingRole::Initiator);
         assert!(!initiator.is_confirmed());
 
@@ -684,7 +685,8 @@ mod tests {
     #[test]
     fn pairing_session_confirm_is_idempotent() {
         let pubkey = test_pubkey();
-        let initiator = PairingSession::initiator("idempotent-group".into(), pubkey, vec![]).unwrap();
+        let initiator =
+            PairingSession::initiator("idempotent-group".into(), pubkey, vec![]).unwrap();
         let qr = initiator.qr_json().unwrap();
         let mut responder = PairingSession::responder_from_qr(&qr).unwrap();
 
@@ -757,9 +759,9 @@ mod tests {
         let pubkey = test_pubkey();
 
         // 1. 发起方
-        let initiator = PairingSession::initiator(group_id, pubkey, vec![
-            "relay://example.com".into(),
-        ]).unwrap();
+        let initiator =
+            PairingSession::initiator(group_id, pubkey, vec!["relay://example.com".into()])
+                .unwrap();
         let qr = initiator.qr_json().unwrap();
 
         // 2. 响应方扫码

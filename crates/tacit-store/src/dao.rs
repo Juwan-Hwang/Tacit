@@ -220,8 +220,8 @@ pub fn delete_snapshot(
 pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO peers
-         (peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         (peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema, rotation_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             peer.peer_id.as_str(),
             peer.device_pubkey,
@@ -233,6 +233,7 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
             ser_json(&peer.nat_capability),
             peer.relay_hint.as_ref().map(|p| p.as_str()),
             peer.success_ema,
+            peer.rotation_seq as i64,
         ],
     )
     .map_err(store_err)?;
@@ -241,7 +242,7 @@ pub fn upsert_peer(conn: &Connection, peer: &PeerRecord) -> CoreResult<()> {
 
 pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRecord>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema FROM peers WHERE peer_id = ?1")
+        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema, rotation_seq FROM peers WHERE peer_id = ?1")
         .map_err(store_err)?;
     let row = stmt
         .query_row(params![peer_id.as_str()], |r| {
@@ -256,12 +257,13 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
                 r.get::<_, String>(7)?,
                 r.get::<_, Option<String>>(8)?,
                 r.get::<_, f64>(9)?,
+                r.get::<_, i64>(10)?,
             ))
         })
         .optional()
         .map_err(store_err)?;
     match row {
-        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema)) => {
+        Some((id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema, rot_seq)) => {
             Ok(Some(PeerRecord {
                 peer_id: PeerId::new(id),
                 device_pubkey: pubkey,
@@ -273,6 +275,7 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
                 nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
                 relay_hint: relay.map(PeerId::new),
                 success_ema: ema,
+                rotation_seq: rot_seq as u64,
             }))
         }
         None => Ok(None),
@@ -281,7 +284,7 @@ pub fn get_peer(conn: &Connection, peer_id: &PeerId) -> CoreResult<Option<PeerRe
 
 pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
     let mut stmt = conn
-        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema FROM peers")
+        .prepare("SELECT peer_id, device_pubkey, capabilities, trust_state, anchor_priority, last_seen_at, last_endpoint, nat_capability, relay_hint, success_ema, rotation_seq FROM peers")
         .map_err(store_err)?;
     let rows = stmt
         .query_map([], |r| {
@@ -296,12 +299,13 @@ pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
                 r.get::<_, String>(7)?,
                 r.get::<_, Option<String>>(8)?,
                 r.get::<_, f64>(9)?,
+                r.get::<_, i64>(10)?,
             ))
         })
         .map_err(store_err)?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema) =
+        let (id, pubkey, caps, trust, prio, seen, endpoint, nat, relay, ema, rot_seq) =
             r.map_err(store_err)?;
         out.push(PeerRecord {
             peer_id: PeerId::new(id),
@@ -314,6 +318,7 @@ pub fn list_peers(conn: &Connection) -> CoreResult<Vec<PeerRecord>> {
             nat_capability: de_json(&nat).unwrap_or(NatCapability::Unknown),
             relay_hint: relay.map(PeerId::new),
             success_ema: ema,
+            rotation_seq: rot_seq as u64,
         });
     }
     Ok(out)

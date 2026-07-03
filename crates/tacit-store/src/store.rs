@@ -323,6 +323,21 @@ fn run_migrations(conn: &Connection) -> CoreResult<()> {
         tracing::info!("迁移完成：acks 表新增 version_override 列");
     }
 
+    // 迁移 2：peers 表添加 rotation_seq 列
+    let has_rotation_seq: bool = conn
+        .prepare("PRAGMA table_info(peers)")
+        .map_err(|e| CoreError::Store(format!("PRAGMA table_info 失败: {e}")))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| CoreError::Store(format!("查询 table_info 失败: {e}")))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "rotation_seq");
+
+    if !has_rotation_seq {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN rotation_seq INTEGER NOT NULL DEFAULT 0")
+            .map_err(|e| CoreError::Store(format!("迁移 peers.rotation_seq 失败: {e}")))?;
+        tracing::info!("迁移完成：peers 表新增 rotation_seq 列");
+    }
+
     Ok(())
 }
 
@@ -375,7 +390,8 @@ CREATE TABLE IF NOT EXISTS peers (
     last_endpoint    TEXT,
     nat_capability   TEXT NOT NULL,
     relay_hint       TEXT,
-    success_ema      REAL NOT NULL DEFAULT 1.0
+    success_ema      REAL NOT NULL DEFAULT 1.0,
+    rotation_seq     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS acks (
@@ -476,6 +492,7 @@ mod tests {
             nat_capability: NatCapability::Direct,
             relay_hint: None,
             success_ema: 1.0,
+            rotation_seq: 0,
         };
         dao::upsert_peer(&conn, &peer).unwrap();
         let got = dao::get_peer(&conn, &pid("1")).unwrap().unwrap();

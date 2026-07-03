@@ -1,17 +1,18 @@
 //! SMS 分片 / 重组 codec。
 //!
 //! Data SMS 单条二进制 payload 上限 140 字节（GSM 03.40 TP-UD）。
-//! 多段 SMS 使用 UDH（User Data Header），每段开销 6 字节，有效载荷 134 字节。
 //!
-//! 本 codec 实现与 UDH 无关的简单分片协议：
+//! 本 codec 实现自定义的简单分片协议（不依赖 UDH）：
 //! - 每段前 4 字节为头：
 //!   `segment_index(u8) | total_segments(u8) | message_id(u8) | frame_type(u8)`
-//! - 后续为有效载荷切片
+//! - 后续为有效载荷切片（每段最多 136 字节）
 //! - `message_id` 由发送端分配，用于区分并发分片流
 //! - `frame_type` 区分控制帧（0x01）与数据帧（0x02），接收端据此分路重组
 //!
 //! 接收端按 `(message_id, frame_type, segment_index)` 重组，
 //! 收齐 `total_segments` 段后拼接还原。
+//!
+//! 段数上限 255（u8 范围 1..=255），超过则拒绝。
 
 use tacit_core::{CoreError, CoreResult};
 
@@ -60,11 +61,12 @@ impl SmsSegmentCodec {
         }
 
         let total = payload.len().div_ceil(MAX_SEGMENT_PAYLOAD_LEN);
-        if total > MAX_SEGMENT_INDEX as usize + 1 {
+        // u8 范围为 0..=255，但 total=0 无意义，total=256 会溢出为 0。
+        // 因此最大允许 255 段（index 0..=254）。
+        if total > MAX_SEGMENT_INDEX as usize {
             return Err(CoreError::Transport(format!(
                 "payload 过大，需 {} 段，超过最大段数 {}",
-                total,
-                MAX_SEGMENT_INDEX as usize + 1
+                total, MAX_SEGMENT_INDEX
             )));
         }
         let total_u8 = total as u8;
@@ -120,7 +122,10 @@ impl SmsSegmentCodec {
         // 校验 message_id + frame_type 一致
         let msg_id = headers[0].message_id;
         let ftype = headers[0].frame_type;
-        if !headers.iter().all(|h| h.message_id == msg_id && h.frame_type == ftype) {
+        if !headers
+            .iter()
+            .all(|h| h.message_id == msg_id && h.frame_type == ftype)
+        {
             return Err(CoreError::Transport(
                 "分片 message_id 或 frame_type 不一致".into(),
             ));
@@ -194,7 +199,7 @@ mod tests {
         assert_eq!(segs[0][1], 3); // total
         assert_eq!(segs[1][0], 1); // index
         assert_eq!(segs[2][0], 2); // index
-        // 每段不超过 140 字节
+                                   // 每段不超过 140 字节
         for seg in &segs {
             assert!(seg.len() <= MAX_SMS_PAYLOAD_LEN);
         }
@@ -265,10 +270,30 @@ mod tests {
 
     #[test]
     fn segment_rejects_oversized() {
-        // 256 段 * 136 = 34816 bytes，需要 256 段 -> index 0..255 刚好
-        // 257 段会超出
+        // 255 段 * 136 = 34680 bytes：允许
+        // 256 段会 u8 溢出为 0，现在被拒绝
+        // 257 段同样超出
         let payload = vec![0x00; MAX_SEGMENT_PAYLOAD_LEN * 257];
         let result = SmsSegmentCodec::segment(&payload, 0, FRAME_TYPE_DATA);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn segment_rejects_exactly_256_segments() {
+        // 256 段时 total as u8 = 0，导致接收端永远无法重组
+        // 修复后应拒绝 256 段
+        let payload = vec![0x00; MAX_SEGMENT_PAYLOAD_LEN * 256];
+        let result = SmsSegmentCodec::segment(&payload, 0, FRAME_TYPE_DATA);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn segment_allows_exactly_255_segments() {
+        // 255 段是最大允许值（index 0..=254）
+        let payload = vec![0x00; MAX_SEGMENT_PAYLOAD_LEN * 255];
+        let segs = SmsSegmentCodec::segment(&payload, 0, FRAME_TYPE_DATA).unwrap();
+        assert_eq!(segs.len(), 255);
+        assert_eq!(segs[0][1], 255); // total = 255
+        assert_eq!(segs[254][0], 254); // last index = 254
     }
 }

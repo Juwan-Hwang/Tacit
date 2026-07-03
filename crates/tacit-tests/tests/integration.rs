@@ -524,26 +524,26 @@ fn watermarks_gc_computation() {
         let conn = ds.store().conn();
         dao::upsert_ack(
             &conn,
-&AckSummary {
-peer_id: pid(2),
-doc_id: doc_id.clone(),
-ack_checkpoint: None,
-ack_frontier: Frontier::from_iter([(pid(1), 10)]),
-updated_at: SystemTime::now(),
-version_override: None,
-},
+            &AckSummary {
+                peer_id: pid(2),
+                doc_id: doc_id.clone(),
+                ack_checkpoint: None,
+                ack_frontier: Frontier::from_iter([(pid(1), 10)]),
+                updated_at: SystemTime::now(),
+                version_override: None,
+            },
         )
         .unwrap();
         dao::upsert_ack(
             &conn,
-&AckSummary {
-peer_id: pid(3),
-doc_id: doc_id.clone(),
-ack_checkpoint: None,
-ack_frontier: Frontier::from_iter([(pid(1), 7)]),
-updated_at: SystemTime::now() - Duration::from_secs(120), // stale
-version_override: None,
-},
+            &AckSummary {
+                peer_id: pid(3),
+                doc_id: doc_id.clone(),
+                ack_checkpoint: None,
+                ack_frontier: Frontier::from_iter([(pid(1), 7)]),
+                updated_at: SystemTime::now() - Duration::from_secs(120), // stale
+                version_override: None,
+            },
         )
         .unwrap();
     }

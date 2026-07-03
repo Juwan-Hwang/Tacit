@@ -190,14 +190,14 @@ mod tests {
         let q = PriorityQueue::new();
         q.push(SyncAction::SendControl {
             peer_id: pid(1),
-msg: ControlMsg::AckSummary(tacit_core::AckSummary {
-peer_id: pid(1),
-doc_id: DocId::new("d1"),
-ack_checkpoint: None,
-ack_frontier: tacit_core::Frontier::new(),
-updated_at: std::time::SystemTime::now(),
-version_override: None,
-}),
+            msg: ControlMsg::AckSummary(tacit_core::AckSummary {
+                peer_id: pid(1),
+                doc_id: DocId::new("d1"),
+                ack_checkpoint: None,
+                ack_frontier: tacit_core::Frontier::new(),
+                updated_at: std::time::SystemTime::now(),
+                version_override: None,
+            }),
             priority: Priority::Medium,
         });
         q.push(delta_action(1, "d1", Priority::High));

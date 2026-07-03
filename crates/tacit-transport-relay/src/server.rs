@@ -140,12 +140,13 @@ impl RelayServer {
             let mut p2s = self.peer_to_session.lock();
             p2s.insert(peer_id.clone(), session_id.clone());
         }
-        // 为新 peer 初始化 token bucket
+        // 为 peer 初始化 token bucket（每次注册都重置，避免旧会话的限流状态影响新会话）
         {
             let mut limiters = self.rate_limiters.lock();
-            limiters.entry(peer_id).or_insert_with(|| {
-                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec)
-            });
+            limiters.insert(
+                peer_id,
+                TokenBucket::new(self.rate_burst_bytes, self.rate_bytes_per_sec),
+            );
         }
 
         debug!(peer_id = %proof.peer_id, session_id = %session_id, "注册成功");

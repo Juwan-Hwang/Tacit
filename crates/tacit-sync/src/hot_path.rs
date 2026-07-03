@@ -192,14 +192,14 @@ mod tests {
     fn control_action() -> SyncAction {
         SyncAction::SendControl {
             peer_id: pid(1),
-msg: ControlMsg::AckSummary(tacit_core::AckSummary {
-peer_id: pid(1),
-doc_id: DocId::new("d1"),
-ack_checkpoint: None,
-ack_frontier: Frontier::new(),
-updated_at: std::time::SystemTime::now(),
-version_override: None,
-}),
+            msg: ControlMsg::AckSummary(tacit_core::AckSummary {
+                peer_id: pid(1),
+                doc_id: DocId::new("d1"),
+                ack_checkpoint: None,
+                ack_frontier: Frontier::new(),
+                updated_at: std::time::SystemTime::now(),
+                version_override: None,
+            }),
             priority: tacit_core::Priority::Medium,
         }
     }

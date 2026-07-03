@@ -32,7 +32,7 @@ use tacit_transport::{
 use tracing::{debug, warn};
 
 use crate::backend::{extract_phone_from_hint, SmsBackend, SmsMessage};
-use crate::codec::{SmsSegmentCodec, MAX_SMS_PAYLOAD_LEN, FRAME_TYPE_CONTROL, FRAME_TYPE_DATA};
+use crate::codec::{SmsSegmentCodec, FRAME_TYPE_CONTROL, FRAME_TYPE_DATA, MAX_SMS_PAYLOAD_LEN};
 
 /// SMS 数据帧 payload 上限（10 KB）。
 ///
@@ -47,10 +47,13 @@ const MAX_SEGMENTS_PER_MESSAGE: usize = 256;
 #[derive(Debug)]
 struct ReassemblyEntry {
     frame_type: u8,
-    segments: Vec<Vec<u8>>,
+    /// 按 segment_index 去重存储的段。
+    segments: Vec<Option<Vec<u8>>>,
     total: u8,
     /// 发送方电话号码（用于回填 peer_id）。
     phone: String,
+    /// 已收到的段数（去重后）。
+    received: usize,
 }
 
 /// SMS 传输：控制面 + 小型数据面。
@@ -60,8 +63,8 @@ pub struct SmsTransport {
     peer_phones: RwLock<HashMap<PeerId, String>>,
     /// 电话号码 -> peer_id 映射（接收时反查发送方）。
     phone_peers: RwLock<HashMap<String, PeerId>>,
-    /// 分片重组缓冲：message_id -> ReassemblyEntry
-    reassembly: RwLock<HashMap<u8, ReassemblyEntry>>,
+    /// 分片重组缓冲：(phone, message_id) -> ReassemblyEntry
+    reassembly: RwLock<HashMap<(String, u8), ReassemblyEntry>>,
     /// 下一个 message_id（0..=255 循环）。
     next_msg_id: parking_lot::Mutex<u8>,
 }
@@ -83,7 +86,9 @@ impl SmsTransport {
     /// 在配对阶段从 `bootstrap_hints` 中提取 `sms:` 前缀的号码，
     /// 或由集成层直接注入。
     pub fn register_peer(&self, peer_id: PeerId, phone: String) {
-        self.phone_peers.write().insert(phone.clone(), peer_id.clone());
+        self.phone_peers
+            .write()
+            .insert(phone.clone(), peer_id.clone());
         self.peer_phones.write().insert(peer_id, phone);
     }
 
@@ -122,9 +127,8 @@ impl SmsTransport {
     fn send_control_sync(&self, peer_id: &PeerId, msg: &ControlMsg) -> CoreResult<()> {
         let phone = self.lookup_phone(peer_id)?;
 
-        let json = serde_json::to_vec(msg).map_err(|e| {
-            CoreError::Transport(format!("控制消息序列化失败: {e}"))
-        })?;
+        let json = serde_json::to_vec(msg)
+            .map_err(|e| CoreError::Transport(format!("控制消息序列化失败: {e}")))?;
 
         if json.len() > MAX_SMS_PAYLOAD_LEN * MAX_SEGMENTS_PER_MESSAGE {
             return Err(CoreError::Transport(format!(
@@ -206,9 +210,7 @@ impl SmsTransport {
             .get(peer_id)
             .cloned()
             .ok_or_else(|| {
-                CoreError::Transport(format!(
-                    "peer {peer_id} 未注册电话号码，无法发送 SMS"
-                ))
+                CoreError::Transport(format!("peer {peer_id} 未注册电话号码，无法发送 SMS"))
             })
     }
 
@@ -225,6 +227,19 @@ impl SmsTransport {
         let total = header.total;
         let msg_id = header.message_id;
         let frame_type = header.frame_type;
+        let index = header.index;
+
+        // 校验头部合法性：total 必须非零，index 必须在 [0, total) 范围内
+        if total == 0 {
+            return Err(CoreError::Transport(format!(
+                "非法分片头：total=0 (msg_id={msg_id})"
+            )));
+        }
+        if index >= total {
+            return Err(CoreError::Transport(format!(
+                "非法分片头：index={index} >= total={total} (msg_id={msg_id})"
+            )));
+        }
 
         if total == 1 {
             // 单段消息，直接解析
@@ -232,40 +247,56 @@ impl SmsTransport {
             return Ok(self.decode_payload(payload, frame_type, &msg.phone));
         }
 
+        let key = (msg.phone.clone(), msg_id);
+        let key_remove = key.clone();
         let mut reasm = self.reassembly.write();
 
         // 防止重组缓冲溢出
-        if reasm.len() >= 64 && !reasm.contains_key(&msg_id) {
+        if reasm.len() >= 64 && !reasm.contains_key(&key) {
             warn!(msg_id, "重组缓冲已满，丢弃最旧条目");
-            if let Some(&oldest_id) = reasm.keys().min() {
-                reasm.remove(&oldest_id);
+            // 按 (phone, msg_id) 字典序找最旧的 key
+            if let Some(oldest_key) = reasm.keys().min().cloned() {
+                reasm.remove(&oldest_key);
             }
         }
 
-        let entry = reasm.entry(msg_id).or_insert_with(|| ReassemblyEntry {
+        let entry = reasm.entry(key).or_insert_with(|| ReassemblyEntry {
             frame_type,
-            segments: Vec::with_capacity(total as usize),
+            segments: vec![None; total as usize],
             total,
             phone: msg.phone.clone(),
+            received: 0,
         });
 
-        // 校验 frame_type 一致
-        if entry.frame_type != frame_type {
-            warn!(msg_id, "frame_type 不匹配，丢弃已有分片");
+        // 校验 frame_type + total + phone 一致性
+        if entry.frame_type != frame_type || entry.total != total || entry.phone != msg.phone {
+            warn!(msg_id, "元数据不匹配，重置重组条目");
             entry.frame_type = frame_type;
-            entry.segments.clear();
+            entry.segments = vec![None; total as usize];
             entry.total = total;
             entry.phone = msg.phone.clone();
+            entry.received = 0;
         }
 
-        entry.segments.push(msg.payload);
+        // 去重：仅在对应槽位为空时填入
+        if entry.segments[index as usize].is_none() {
+            entry.segments[index as usize] = Some(msg.payload);
+            entry.received += 1;
+        } else {
+            debug!(msg_id, index, "收到重复分片，忽略");
+        }
 
-        if entry.segments.len() == total as usize {
+        if entry.received == total as usize {
             // 收齐，重组
-            let entry = reasm.remove(&msg_id).unwrap();
+            let entry = reasm.remove(&key_remove).unwrap();
             drop(reasm);
-            let segments = &entry.segments;
-            let payload = SmsSegmentCodec::reassemble(segments)?;
+            // 将 Option<Vec<u8>> 展平为 Vec<&Vec<u8>>
+            let segments: Vec<Vec<u8>> = entry
+                .segments
+                .into_iter()
+                .map(|opt| opt.expect("所有槽位应已填满"))
+                .collect();
+            let payload = SmsSegmentCodec::reassemble(&segments)?;
             return Ok(self.decode_payload(&payload, entry.frame_type, &entry.phone));
         }
 
@@ -292,10 +323,7 @@ impl SmsTransport {
                 };
                 // 控制消息中可能携带 peer_id，优先使用
                 let pid = peer_id.unwrap_or_else(|| PeerId::new("sms-unknown"));
-                Some(TransportEvent::Control {
-                    peer_id: pid,
-                    msg,
-                })
+                Some(TransportEvent::Control { peer_id: pid, msg })
             }
             FRAME_TYPE_DATA => {
                 use tacit_transport::decode_data;
@@ -303,7 +331,10 @@ impl SmsTransport {
                     Ok(wire) => {
                         let frame = wire.to_data_frame();
                         let pid = peer_id.unwrap_or_else(|| frame.actor_id.clone());
-                        Some(TransportEvent::Data { peer_id: pid, frame })
+                        Some(TransportEvent::Data {
+                            peer_id: pid,
+                            frame,
+                        })
                     }
                     Err(e) => {
                         warn!(error = ?e, "SMS 数据帧解码失败");
@@ -533,10 +564,7 @@ mod tests {
         // 轮询收件箱
         let incoming = transport.poll_incoming().unwrap();
         assert_eq!(incoming.len(), 1);
-        assert!(matches!(
-            incoming[0],
-            TransportEvent::Control { .. }
-        ));
+        assert!(matches!(incoming[0], TransportEvent::Control { .. }));
     }
 
     #[tokio::test]

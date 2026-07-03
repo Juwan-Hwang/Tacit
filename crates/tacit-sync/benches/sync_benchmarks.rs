@@ -212,7 +212,7 @@ fn bench_engine_peer_summary(c: &mut Criterion) {
                         peer_id: pid(1),
                         ..Default::default()
                     },
-               )
+                )
             },
             |engine| {
                 engine
