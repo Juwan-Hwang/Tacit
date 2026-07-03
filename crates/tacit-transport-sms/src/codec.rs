@@ -119,19 +119,19 @@ impl SmsSegmentCodec {
             .map(|s| Self::parse_header(s))
             .collect::<CoreResult<Vec<_>>>()?;
 
-        // 校验 message_id + frame_type 一致
+        // 校验 message_id + frame_type + total 一致
         let msg_id = headers[0].message_id;
         let ftype = headers[0].frame_type;
+        let total = headers[0].total;
         if !headers
             .iter()
-            .all(|h| h.message_id == msg_id && h.frame_type == ftype)
+            .all(|h| h.message_id == msg_id && h.frame_type == ftype && h.total == total)
         {
             return Err(CoreError::Transport(
-                "分片 message_id 或 frame_type 不一致".into(),
+                "分片元数据 (message_id, frame_type, total) 不一致".into(),
             ));
         }
 
-        let total = headers[0].total;
         if segments.len() != total as usize {
             return Err(CoreError::Transport(format!(
                 "分片数不匹配: 期望 {} 段，实际 {} 段",

@@ -103,6 +103,17 @@ impl SmsTransport {
             }
         }
 
+        // 如果该号码已被其他 peer 绑定，解除旧 peer 的正向映射以保持双向一致
+        if let Some(existing_peer) = phone_peers.get(&phone).cloned() {
+            if existing_peer != peer_id {
+                peer_phones.remove(&existing_peer);
+                warn!(
+                    %phone, old_peer = %existing_peer, new_peer = %peer_id,
+                    "电话号码重分配，解除旧 peer 绑定"
+                );
+            }
+        }
+
         phone_peers.insert(phone.clone(), peer_id.clone());
         peer_phones.insert(peer_id, phone);
     }

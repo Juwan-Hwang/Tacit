@@ -54,7 +54,9 @@ impl TokenBucket {
     /// 返回 true 表示允许通过，false 表示限流。
     fn try_consume(&mut self, cost: f64) -> bool {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
         self.last_refill = now;
 

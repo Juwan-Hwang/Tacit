@@ -316,22 +316,23 @@ impl DocStore {
         blocks: &[(BlockId, Vec<u8>)],
     ) -> CoreResult<Vec<ImportResult>> {
         // 1. 逐个导入 delta（CRDT 操作，不涉及 I/O）
+        //    使用 HashMap 去重：同一 block 在批次中出现多次时，只保留最终 snapshot
         let mut results = Vec::with_capacity(blocks.len());
-        let mut changed_snaps: Vec<(BlockId, Vec<u8>)> = Vec::new();
+        let mut changed_blocks: std::collections::HashMap<BlockId, Vec<u8>> =
+            std::collections::HashMap::new();
         for (block_id, bytes) in blocks {
             let block = self.get_block(doc_id, block_id)?;
             let result = block.import(bytes)?;
             if result.changed {
-                let snap = block.export_snapshot()?;
-                changed_snaps.push((block_id.clone(), snap));
+                changed_blocks.insert(block_id.clone(), block.export_snapshot()?);
             }
             results.push(result);
         }
 
-        // 2. 在单个事务中批量持久化所有变更的 snapshot
-        if !changed_snaps.is_empty() {
+        // 2. 在单个事务中批量持久化所有变更的 snapshot（每个 block 仅写一次）
+        if !changed_blocks.is_empty() {
             self.store.transaction(|conn| {
-                for (block_id, snap) in &changed_snaps {
+                for (block_id, snap) in &changed_blocks {
                     dao::insert_snapshot(
                         conn,
                         doc_id,
@@ -346,7 +347,7 @@ impl DocStore {
             tracing::debug!(
                 doc_id = %doc_id,
                 total = blocks.len(),
-                changed = changed_snaps.len(),
+                changed = changed_blocks.len(),
                 "批量导入完成"
             );
         }
