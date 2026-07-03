@@ -37,7 +37,8 @@ pub fn make_transport_config(
 /// 生成自签名证书（通用，CN 为 "tacit"）。
 ///
 /// 返回 (cert_der, key_der)。
-pub fn generate_self_signed_cert() -> CoreResult<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+pub fn generate_self_signed_cert() -> CoreResult<(CertificateDer<'static>, PrivateKeyDer<'static>)>
+{
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["tacit".into()])
             .map_err(|e| CoreError::Crypto(format!("生成证书失败: {e}")))?;

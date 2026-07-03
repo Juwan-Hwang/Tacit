@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tacit_core::{BatchFlag, BlockId, BlockKind, DocId, Frontier, PeerId};
 use tacit_store::Store;
-use tacit_sync::{DocStore, EngineConfig, DefaultSyncEngine, SyncEngine};
+use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tacit_transport::batch::{BatchSigner, BatchVerifier, BatchVerifyResult};
 
 fn pid(n: u64) -> PeerId {
@@ -42,7 +42,9 @@ fn transfer_block_delta(
         if !doc_exists {
             target.create_doc(doc_id.clone(), "note").unwrap();
         }
-        target.create_block(doc_id, block_id.clone(), BlockKind::Text).unwrap();
+        target
+            .create_block(doc_id, block_id.clone(), BlockKind::Text)
+            .unwrap();
     }
     let bytes = if since.is_empty() {
         source.export_block_snapshot(doc_id, block_id).unwrap()
@@ -52,12 +54,7 @@ fn transfer_block_delta(
     target.import_block(doc_id, block_id, &bytes).unwrap();
 }
 
-fn transfer_meta_delta(
-    source: &DocStore,
-    target: &DocStore,
-    doc_id: &DocId,
-    since: &Frontier,
-) {
+fn transfer_meta_delta(source: &DocStore, target: &DocStore, doc_id: &DocId, since: &Frontier) {
     let doc_exists = {
         let conn = target.store().conn();
         tacit_store::dao::get_doc(&conn, doc_id).unwrap().is_some()
@@ -84,16 +81,20 @@ fn disconnect_reconnect_converges() {
 
     // 初始同步
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-    ds1.apply_local_edit(&doc_id, &block_id, b"initial").unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b"initial")
+        .unwrap();
 
     let empty = Frontier::new();
     transfer_meta_delta(&ds1, &ds2, &doc_id, &empty);
     transfer_block_delta(&ds1, &ds2, &doc_id, &block_id, &empty);
 
     // 模拟断连：双方各自独立编辑
-    ds1.apply_local_edit(&doc_id, &block_id, b" + peer1 offline edit").unwrap();
-    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 offline edit").unwrap();
+    ds1.apply_local_edit(&doc_id, &block_id, b" + peer1 offline edit")
+        .unwrap();
+    ds2.apply_local_edit(&doc_id, &block_id, b" + peer2 offline edit")
+        .unwrap();
 
     // 重连后双向同步
     let f1 = ds1.block_frontier(&doc_id, &block_id).unwrap();
@@ -102,8 +103,16 @@ fn disconnect_reconnect_converges() {
     transfer_block_delta(&ds1, &ds2, &doc_id, &block_id, &f2);
 
     // 验证收敛
-    let r1 = ds1.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
     assert_eq!(r1, r2, "断连重连后应收敛");
 }
 
@@ -117,7 +126,8 @@ fn out_of_order_delivery_converges() {
     let block_id = BlockId::new("b1");
 
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
 
     // peer 1 做三次编辑，记录每次编辑后的 frontier
     ds1.apply_local_edit(&doc_id, &block_id, b"edit1").unwrap();
@@ -131,7 +141,8 @@ fn out_of_order_delivery_converges() {
 
     // peer 2 先创建空 block
     ds2.create_doc(doc_id.clone(), "note").unwrap();
-    ds2.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds2.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
 
     // 乱序导入：先导入 f2→f3 的 delta，再导入 empty→f1，再导入 f1→f2
     // CRDT 应能正确合并任意顺序的 delta
@@ -140,11 +151,20 @@ fn out_of_order_delivery_converges() {
 
     let delta_empty_f1 = ds1.export_block_snapshot(&doc_id, &block_id).unwrap();
     // 先导入 snapshot（包含到 f3 的完整状态），后续 delta 可能是 no-op
-    ds2.import_block(&doc_id, &block_id, &delta_empty_f1).unwrap();
+    ds2.import_block(&doc_id, &block_id, &delta_empty_f1)
+        .unwrap();
 
     // 最终状态应收敛
-    let r1 = ds1.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
     assert_eq!(r1, r2, "乱序 delta 应最终收敛");
 }
 
@@ -158,7 +178,8 @@ fn duplicate_frames_are_idempotent() {
     let block_id = BlockId::new("b1");
 
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
     ds1.apply_local_edit(&doc_id, &block_id, b"hello").unwrap();
 
     let empty = Frontier::new();
@@ -167,18 +188,30 @@ fn duplicate_frames_are_idempotent() {
 
     // 重复导入同一个 delta
     let f_before = ds2.block_frontier(&doc_id, &block_id).unwrap();
-    let _delta = ds1.export_block_delta(&doc_id, &block_id, &f_before).unwrap();
+    let _delta = ds1
+        .export_block_delta(&doc_id, &block_id, &f_before)
+        .unwrap();
     // peer 1 再编辑
     ds1.apply_local_edit(&doc_id, &block_id, b" world").unwrap();
-    let delta = ds1.export_block_delta(&doc_id, &block_id, &f_before).unwrap();
+    let delta = ds1
+        .export_block_delta(&doc_id, &block_id, &f_before)
+        .unwrap();
 
     // 导入两次
     ds2.import_block(&doc_id, &block_id, &delta).unwrap();
     ds2.import_block(&doc_id, &block_id, &delta).unwrap();
 
     // 验证内容正确且不重复
-    let r1 = ds1.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
     assert_eq!(r1, r2, "重复导入应幂等");
 }
 
@@ -198,8 +231,10 @@ fn kill_restart_preserves_data() {
         let store = Store::open(db_path_str).unwrap();
         let ds = Arc::new(DocStore::new(pid(1), store, 32));
         ds.create_doc(doc_id.clone(), "note").unwrap();
-        ds.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
-        ds.apply_local_edit(&doc_id, &block_id, b"persistent data").unwrap();
+        ds.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+            .unwrap();
+        ds.apply_local_edit(&doc_id, &block_id, b"persistent data")
+            .unwrap();
         // 显式 flush dirty blocks
         ds.flush_dirty_blocks().unwrap();
     }
@@ -211,8 +246,12 @@ fn kill_restart_preserves_data() {
         let ds = Arc::new(DocStore::new(pid(1), store, 32));
         let block = ds.get_block(&doc_id, &block_id).unwrap();
         let render = block.export_render_bytes().unwrap();
-        assert!(render.windows(b"persistent data".len()).any(|w| w == b"persistent data"),
-            "kill-restart 后数据应持久化");
+        assert!(
+            render
+                .windows(b"persistent data".len())
+                .any(|w| w == b"persistent data"),
+            "kill-restart 后数据应持久化"
+        );
     }
 }
 
@@ -242,7 +281,13 @@ fn batch_signature_detects_tampering() {
     assert_eq!(r2, BatchVerifyResult::Accepted);
 
     // BatchEnd — 签名不匹配
-    let r3 = verifier.receive_frame(&peer_id, &doc_id, b"frame3", BatchFlag::BatchEnd, Some(&signature));
+    let r3 = verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"frame3",
+        BatchFlag::BatchEnd,
+        Some(&signature),
+    );
     assert_eq!(r3, BatchVerifyResult::Mismatch, "篡改后签名应不匹配");
 }
 
@@ -267,7 +312,13 @@ fn batch_signature_correct_passes() {
     let r2 = verifier.receive_frame(&peer_id, &doc_id, b"frame2", BatchFlag::BatchMiddle, None);
     assert_eq!(r2, BatchVerifyResult::Accepted);
 
-    let r3 = verifier.receive_frame(&peer_id, &doc_id, b"frame3", BatchFlag::BatchEnd, Some(&signature));
+    let r3 = verifier.receive_frame(
+        &peer_id,
+        &doc_id,
+        b"frame3",
+        BatchFlag::BatchEnd,
+        Some(&signature),
+    );
     assert_eq!(r3, BatchVerifyResult::Verified, "正确批次应通过验证");
 }
 
@@ -291,7 +342,8 @@ fn network_switch_triggers_fast_resume() {
     let doc_id = DocId::new("doc1");
     let block_id = BlockId::new("b1");
     ds.create_doc(doc_id.clone(), "note").unwrap();
-    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
     ds.apply_local_edit(&doc_id, &block_id, b"initial").unwrap();
 
     // 初始状态无动作
@@ -332,7 +384,8 @@ fn serial_sync_chain_converges() {
 
     // A 创建并编辑
     ds1.create_doc(doc_id.clone(), "note").unwrap();
-    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text).unwrap();
+    ds1.create_block(&doc_id, block_id.clone(), BlockKind::Text)
+        .unwrap();
     ds1.apply_local_edit(&doc_id, &block_id, b"A").unwrap();
 
     // A→B
@@ -359,9 +412,21 @@ fn serial_sync_chain_converges() {
     transfer_block_delta(&ds1, &ds2, &doc_id, &block_id, &f2);
 
     // 验证三端收敛
-    let r1 = ds1.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r2 = ds2.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
-    let r3 = ds3.get_block(&doc_id, &block_id).unwrap().export_render_bytes().unwrap();
+    let r1 = ds1
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r2 = ds2
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
+    let r3 = ds3
+        .get_block(&doc_id, &block_id)
+        .unwrap()
+        .export_render_bytes()
+        .unwrap();
 
     assert_eq!(r1, r2, "A 和 B 应收敛");
     assert_eq!(r2, r3, "B 和 C 应收敛");

@@ -32,6 +32,8 @@ pub struct RuntimeConfig {
     pub pending_retry_interval: Duration,
     /// 动作分发间隔。
     pub drain_interval: Duration,
+    /// checkpoint compaction 检查间隔。
+    pub compaction_interval: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -40,6 +42,7 @@ impl Default for RuntimeConfig {
             poll_interval: Duration::from_millis(10),
             pending_retry_interval: Duration::from_secs(1),
             drain_interval: Duration::from_millis(50),
+            compaction_interval: Duration::from_secs(60),
         }
     }
 }
@@ -74,11 +77,7 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     /// 创建 RuntimeSupervisor（不持有自有 runtime，需在外部 tokio 上下文中启动）。
-    pub fn new(
-        command_bus: CommandBus,
-        event_bus: Arc<EventBus>,
-        config: RuntimeConfig,
-    ) -> Self {
+    pub fn new(command_bus: CommandBus, event_bus: Arc<EventBus>, config: RuntimeConfig) -> Self {
         Self {
             command_bus,
             event_bus,
@@ -100,10 +99,10 @@ impl RuntimeSupervisor {
     ) -> CoreResult<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-        .build()
-            .map_err(|e| tacit_core::CoreError::Internal(format!(
-                "创建 Tokio runtime 失败: {e}"
-            )))?;
+            .build()
+            .map_err(|e| {
+                tacit_core::CoreError::Internal(format!("创建 Tokio runtime 失败: {e}"))
+            })?;
         Ok(Self {
             command_bus,
             event_bus,
@@ -179,6 +178,19 @@ impl RuntimeSupervisor {
                     .await;
             });
             self.handles.lock().push(handle);
+
+            // checkpoint compaction 定期检查
+            let self_clone = self.clone();
+            let engine_clone = engine.clone();
+            let interval = self.config.compaction_interval;
+            let handle = rt.handle().spawn(async move {
+                self_clone
+                    .periodic_task_inner(engine_clone, interval, |eng| {
+                        eng.maybe_compact_all().map(|_| ())
+                    })
+                    .await;
+            });
+            self.handles.lock().push(handle);
         } else {
             drop(runtime_guard);
             // 使用当前 tokio 上下文
@@ -187,7 +199,9 @@ impl RuntimeSupervisor {
             let engine_clone = engine.clone();
             let self_clone = self.clone();
             let handle = tokio::spawn(async move {
-                self_clone.command_loop(engine_clone, cmd_bus, event_bus).await;
+                self_clone
+                    .command_loop(engine_clone, cmd_bus, event_bus)
+                    .await;
             });
             self.handles.lock().push(handle);
 
@@ -210,6 +224,19 @@ impl RuntimeSupervisor {
                 self_clone
                     .periodic_task(engine_clone, config.drain_interval, move |eng| {
                         eng.drain_actions().map(|_| ())
+                    })
+                    .await;
+            });
+            self.handles.lock().push(handle);
+
+            // checkpoint compaction 定期检查
+            let engine_clone = engine.clone();
+            let config = self.config.clone();
+            let self_clone = self.clone();
+            let handle = tokio::spawn(async move {
+                self_clone
+                    .periodic_task(engine_clone, config.compaction_interval, move |eng| {
+                        eng.maybe_compact_all().map(|_| ())
                     })
                     .await;
             });
@@ -279,12 +306,8 @@ impl RuntimeSupervisor {
     }
 
     /// 定期任务循环。
-    async fn periodic_task<F>(
-        &self,
-        engine: Arc<crate::TacitEngine>,
-        interval: Duration,
-        task: F,
-    ) where
+    async fn periodic_task<F>(&self, engine: Arc<crate::TacitEngine>, interval: Duration, task: F)
+    where
         F: Fn(&crate::TacitEngine) -> CoreResult<()> + Send + Sync + 'static,
     {
         let task = Arc::new(task);
@@ -296,8 +319,7 @@ impl RuntimeSupervisor {
             let task = task.clone();
             let eng = engine.clone();
             // 在阻塞线程池中执行（避免阻塞 tokio runtime）
-            let _ = tokio::task::spawn_blocking(move || task(&eng))
-                .await;
+            let _ = tokio::task::spawn_blocking(move || task(&eng)).await;
             tokio::time::sleep(interval).await;
         }
     }
@@ -378,13 +400,10 @@ impl RuntimeSupervisor {
             RequestSync { peer_id, reason: _ } => {
                 engine.on_peer_online(peer_id.as_str().to_string())
             }
-            PeerOnline { peer_id } => {
-                engine.on_peer_online(peer_id.as_str().to_string())
+            PeerOnline { peer_id } => engine.on_peer_online(peer_id.as_str().to_string()),
+            NetworkChanged { online, net_type } => {
+                engine.notify_network_changed(*online, net_type.clone())
             }
-            NetworkChanged { online, net_type } => engine.notify_network_changed(
-                *online,
-                net_type.clone(),
-            ),
             TriggerHotPath => {
                 engine.trigger_hot_path();
                 Ok(())
@@ -580,9 +599,7 @@ mod tests {
     async fn send_command_via_engine() {
         // 验证 TacitEngine::send_command 入队命令
         let engine = crate::TacitEngine::new_memory("1").unwrap();
-        engine
-            .send_command(Command::RequestFastResume)
-            .unwrap();
+        engine.send_command(Command::RequestFastResume).unwrap();
 
         // 命令应在总线中
         let cmd = engine.command_bus().try_recv().unwrap();

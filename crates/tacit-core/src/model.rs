@@ -163,6 +163,12 @@ pub struct PeerRecord {
     pub relay_hint: Option<PeerId>,
     /// 成功率指数移动平均（0.0 ~ 1.0），用于 Anchor 选举排序。
     pub success_ema: f64,
+    /// 密钥轮换序号（单调递增，防止重放攻击）。
+    ///
+    /// 初始为 0，每次密钥轮换后 +1。与 `anchor_priority` 独立存储，
+    /// 避免污染 Anchor 选举权重。
+    #[serde(default)]
+    pub rotation_seq: u64,
 }
 
 /// peer 在线状态摘要。
@@ -184,6 +190,12 @@ pub struct AckSummary {
     /// 当前 ack frontier。
     pub ack_frontier: Frontier,
     pub updated_at: SystemTime,
+    /// 可选版本覆盖信息（§13.2）。
+    ///
+    /// 当 peer 声明的协议/格式版本与本地不同时，携带此字段覆盖默认版本协商结果。
+    /// v1.0 中通常为 `None`；后续多版本能力协商时启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_override: Option<u32>,
 }
 
 /// 双水位：强安全与软安全。
