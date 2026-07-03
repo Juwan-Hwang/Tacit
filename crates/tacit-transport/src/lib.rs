@@ -32,8 +32,8 @@ pub use control::{
 };
 pub use event::TransportEvent;
 pub use frame_codec::{
-    decode_control, decode_data, decode_discovery, encode_control, encode_data,
-    encode_discovery, MAX_FRAME_SIZE,
+    decode_control, decode_data, decode_discovery, encode_control, encode_data, encode_discovery,
+    MAX_FRAME_SIZE,
 };
 pub use mdns::{DiscoveredPeer, MdnsDiscovery, MDNS_SERVICE_TYPE};
 pub use multiplexer::{ChannelKind, TransportMultiplexer};

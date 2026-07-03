@@ -52,10 +52,9 @@ impl From<tacit_core::CoreError> for TacitFfiError {
         use tacit_core::CoreError;
         match e {
             CoreError::DocNotFound(s) => Self::DocNotFound(s),
-            CoreError::BlockNotFound { doc_id, block_id } => Self::BlockNotFound {
-                doc_id,
-                block_id,
-            },
+            CoreError::BlockNotFound { doc_id, block_id } => {
+                Self::BlockNotFound { doc_id, block_id }
+            }
             CoreError::InvalidFrontier(s) => Self::InvalidFrontier(s),
             CoreError::PeerNotFound(s) => Self::Internal(s),
             CoreError::Serialize(s) => Self::Internal(format!("序列化失败: {s}")),

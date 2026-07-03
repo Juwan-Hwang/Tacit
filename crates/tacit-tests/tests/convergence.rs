@@ -118,13 +118,13 @@ proptest! {
         let meta_a = MetaDoc::new(doc_id.clone(), &pid(1)).unwrap();
         for i in 0..block_count {
             meta_a.add_block(
-                BlockId::new(&format!("b{}", i)),
+                BlockId::new(format!("b{}", i)),
                 BlockKind::Text,
             ).unwrap();
         }
         // soft-delete 一个 block（如果索引在范围内）
         let delete_idx = (delete_index as usize) % (block_count as usize);
-        let deleted_id = BlockId::new(&format!("b{}", delete_idx));
+        let deleted_id = BlockId::new(format!("b{}", delete_idx));
         meta_a.soft_delete(&deleted_id).unwrap();
 
         // 导出 snapshot 并导入到 B
@@ -223,6 +223,72 @@ proptest! {
             let r = restored.import(last_delta).unwrap();
             // 最后一个 delta 可能已包含在 snapshot 中，changed 应为 false
             let _ = r;
+        }
+    }
+
+    /// 性质 6：多 peer 星型拓扑并发编辑后状态收敛。
+    ///
+    /// 构造：N 个 peer（3-6），每个从同一初始快照分叉后各自编辑，
+    /// 然后通过中心节点收集所有 delta 并广播。
+    /// 验证：所有 peer 最终渲染内容一致。
+    #[test]
+    fn star_topology_multi_peer_converges(
+        peer_count in 3u8..7,
+        edits_per_peer in prop::collection::vec(arb_text_chunk(), 1..4),
+    ) {
+        let block_id = BlockId::new("b1");
+
+        // 初始节点：创建 block 并导出初始 snapshot
+        let seed = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(0)).unwrap();
+        let seed_snap = seed.export_snapshot().unwrap();
+
+        // 每个 peer 从 seed snapshot 分叉，各自独立编辑
+        let mut peer_deltas = Vec::new();
+        for i in 1..=peer_count {
+            let peer = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(i as u64)).unwrap();
+            peer.import(&seed_snap).unwrap();
+            let peer_frontier = peer.frontier().unwrap();
+            // 每个 peer 追加相同的编辑序列（但 peer_id 不同，产生不同的 op）
+            for chunk in &edits_per_peer {
+                peer.apply_edit(chunk.as_bytes()).unwrap();
+            }
+            let delta = peer.export_delta_since(&peer_frontier).unwrap();
+            peer_deltas.push(delta);
+        }
+
+        // 中心节点：收集所有 delta 后，以所有可能的顺序导入到两个不同的节点
+        // 验证两种导入顺序都收敛到相同状态
+        let hub_a = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(100)).unwrap();
+        hub_a.import(&seed_snap).unwrap();
+        for delta in &peer_deltas {
+            hub_a.import(delta).unwrap();
+        }
+        let render_a = hub_a.export_render_bytes().unwrap();
+
+        // 反向导入
+        let hub_b = BlockDoc::new(block_id.clone(), BlockKind::Text, &pid(101)).unwrap();
+        hub_b.import(&seed_snap).unwrap();
+        for delta in peer_deltas.iter().rev() {
+            hub_b.import(delta).unwrap();
+        }
+        let render_b = hub_b.export_render_bytes().unwrap();
+
+        // 先转字符串，避免后续 borrow 问题
+        let render_a_str = String::from_utf8_lossy(&render_a).into_owned();
+        let render_b_str = String::from_utf8_lossy(&render_b).into_owned();
+        prop_assert!(
+            render_a_str == render_b_str,
+            "星型拓扑：正序与反序导入应收敛到相同状态: \n  A: {:?}\n  B: {:?}",
+            render_a_str, render_b_str
+        );
+
+        // 验证最终内容包含所有 peer 的编辑
+        for chunk in &edits_per_peer {
+            prop_assert!(
+                render_a_str.contains(chunk.as_str()),
+                "最终状态应包含所有 peer 的编辑: 缺少 '{}'",
+                chunk
+            );
         }
     }
 }
