@@ -4,11 +4,11 @@
 //! 主版本不兼容时拒绝，次版本差异通过 capability 降级。
 
 use parking_lot::Mutex;
+use tacit_core::PeerId;
 use tacit_core::{
     negotiate, AnchorCapabilities, NegotiatedCapabilities, NegotiationResult, ProtocolVersion,
     MAJOR_VERSION, MINOR_VERSION,
 };
-use tacit_core::PeerId;
 
 /// 能力协商器：管理每个 peer 的协商结果。
 pub struct CapabilityNegotiator {
@@ -127,6 +127,9 @@ mod tests {
     fn effective_caps_default() {
         let negotiator = CapabilityNegotiator::new(AnchorCapabilities::default());
         let peer = PeerId::new("unknown");
-        assert_eq!(negotiator.effective_caps(&peer), AnchorCapabilities::default());
+        assert_eq!(
+            negotiator.effective_caps(&peer),
+            AnchorCapabilities::default()
+        );
     }
 }

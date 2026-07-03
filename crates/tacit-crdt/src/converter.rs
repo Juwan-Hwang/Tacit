@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use loro::{ExportMode, Frontiers, ID, LoroDoc, VersionVector};
+use loro::{ExportMode, Frontiers, LoroDoc, VersionVector, ID};
 use tacit_core::{CoreError, CoreResult, Frontier};
 
 /// Loro PeerID 类型别名。
@@ -83,10 +83,7 @@ impl LoroExport<'_> {
             LoroExport::ShallowSnapshot(f) => {
                 let frontiers = frontier_to_frontiers(f)?;
                 // ShallowSnapshot 接受单个 Frontiers（以最新状态为基准）。
-                let f0 = frontiers
-                    .into_iter()
-                    .next()
-                    .unwrap_or(Frontiers::None);
+                let f0 = frontiers.into_iter().next().unwrap_or(Frontiers::None);
                 ExportMode::ShallowSnapshot(Cow::Owned(f0))
             }
         };

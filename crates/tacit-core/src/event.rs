@@ -83,4 +83,29 @@ pub enum CoreEvent {
         scope: ErrorScope,
         message: String,
     },
+    PeerRevoked {
+        peer_id: PeerId,
+    },
+    /// 远程信任链引入：收到 IntroducePeer 后发射，供上层（PeerRegistry）将新 peer
+    /// 注册为 Pending 状态，等待后续直接连接验证。
+    PeerIntroduced {
+        /// 介绍人。
+        introducer: PeerId,
+        /// 被介绍的 peer。
+        introduced_peer: PeerId,
+        /// 被介绍的 peer 的公钥（hex）。
+        introduced_pubkey_hex: String,
+        /// 被介绍的 peer 的可达地址（可选）。
+        endpoint: Option<String>,
+    },
+    /// 密钥轮换通知：收到 KeyRotateNotice 后发射，供上层（PeerRegistry / Crypto 层）
+    /// 更新 peer 的公钥并验证新密钥的合法性。
+    PeerKeyRotated {
+        /// 轮换密钥的 peer。
+        peer_id: PeerId,
+        /// 新公钥（hex）。
+        new_pubkey_hex: String,
+        /// 轮换序号。
+        rotation_seq: u64,
+    },
 }

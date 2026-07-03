@@ -94,9 +94,8 @@ impl NoiseHandshake {
                 }
                 1 => {
                     // <- e, ee, s, es
-                    let received = received.ok_or_else(|| {
-                        CoreError::Crypto("initiator step 1 需要收到消息".into())
-                    })?;
+                    let received = received
+                        .ok_or_else(|| CoreError::Crypto("initiator step 1 需要收到消息".into()))?;
                     self.state
                         .read_message(received, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("read_message 失败: {e}")))?;
@@ -113,9 +112,8 @@ impl NoiseHandshake {
             NoiseRole::Responder => match self.step {
                 0 => {
                     // <- e
-                    let received = received.ok_or_else(|| {
-                        CoreError::Crypto("responder step 0 需要收到消息".into())
-                    })?;
+                    let received = received
+                        .ok_or_else(|| CoreError::Crypto("responder step 0 需要收到消息".into()))?;
                     self.state
                         .read_message(received, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("read_message 失败: {e}")))?;
@@ -129,9 +127,8 @@ impl NoiseHandshake {
                 }
                 1 => {
                     // <- s, se
-                    let received = received.ok_or_else(|| {
-                        CoreError::Crypto("responder step 1 需要收到消息".into())
-                    })?;
+                    let received = received
+                        .ok_or_else(|| CoreError::Crypto("responder step 1 需要收到消息".into()))?;
                     self.state
                         .read_message(received, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("read_message 失败: {e}")))?;
@@ -158,7 +155,7 @@ impl NoiseHandshake {
             .get_remote_static()
             .ok_or_else(|| CoreError::Crypto("无法获取对端静态公钥".into()))?;
         let mut remote_pubkey = [0u8; 32];
-        remote_pubkey.copy_from_slice(&remote_static);
+        remote_pubkey.copy_from_slice(remote_static);
         let transport = self
             .state
             .into_transport_mode()

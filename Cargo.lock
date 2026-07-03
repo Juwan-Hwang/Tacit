@@ -3014,11 +3014,13 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "dashmap",
+ "hex",
  "parking_lot",
  "serde_json",
  "sha2",
  "tacit-core",
  "tacit-crdt",
+ "tacit-crypto",
  "tacit-store",
  "tacit-transport",
  "thiserror 1.0.69",
@@ -3043,6 +3045,7 @@ dependencies = [
  "tacit-transport-ble",
  "tacit-transport-quic",
  "tacit-transport-relay",
+ "tacit-transport-sms",
  "tempfile",
  "tokio",
 ]
@@ -3121,12 +3124,29 @@ dependencies = [
  "serde_json",
  "sha2",
  "tacit-core",
+ "tacit-crypto",
  "tacit-transport",
  "tacit-transport-quic",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tacit-transport-sms"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tacit-core",
+ "tacit-transport",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

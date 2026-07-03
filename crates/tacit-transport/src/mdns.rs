@@ -72,11 +72,7 @@ pub struct MdnsDiscovery {
 }
 
 impl MdnsDiscovery {
-    pub fn new(
-        group_id: String,
-        device_id: PeerId,
-        capabilities: AnchorCapabilities,
-    ) -> Self {
+    pub fn new(group_id: String, device_id: PeerId, capabilities: AnchorCapabilities) -> Self {
         Self {
             group_id,
             device_id,
@@ -133,10 +129,7 @@ impl MdnsDiscovery {
             group_id: frame.group_id.clone(),
             endpoint: endpoint.clone(),
             capabilities: frame.capabilities,
-            discovered_at: peers
-                .get(&peer_id)
-                .map(|p| p.discovered_at)
-                .unwrap_or(now),
+            discovered_at: peers.get(&peer_id).map(|p| p.discovered_at).unwrap_or(now),
             last_seen: now,
         };
         peers.insert(peer_id.clone(), entry.clone());
@@ -230,8 +223,7 @@ mod tests {
     fn ignores_own_broadcast() {
         let discovery = make_discovery();
         let frame = discovery.encode_discovery_frame();
-        let result =
-            discovery.handle_discovery_frame(&frame, Endpoint::new("127.0.0.1", 8080));
+        let result = discovery.handle_discovery_frame(&frame, Endpoint::new("127.0.0.1", 8080));
         assert!(result.is_none());
     }
 
@@ -267,8 +259,7 @@ mod tests {
         };
         let data = external_frame.encode();
 
-        let result =
-            discovery.handle_discovery_frame(&data, Endpoint::new("127.0.0.1", 8080));
+        let result = discovery.handle_discovery_frame(&data, Endpoint::new("127.0.0.1", 8080));
         assert!(result.is_none());
     }
 
