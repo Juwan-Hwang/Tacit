@@ -14,8 +14,9 @@
 //!   当收到 Forward 时，通过目标 peer 的推送通道发送 Incoming。
 //! - 客户端启动后台 task 接收 relay 主动推送的消息（Incoming / PeerOnline / PeerOffline）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -246,15 +247,153 @@ impl RelayClientTransport {
     /// 启动后台接收 task，处理 relay 主动推送的消息。
     ///
     /// relay 通过 uni-stream 推送 Incoming / PeerOnline / PeerOffline。
+    ///
+    /// **并发读取 + 重排序串行解密**：
+    /// 1. **并发读取**：每条 uni-stream 由独立 task 并发读取，避免慢流阻塞
+    ///    accept 循环（Head-of-Line blocking）。
+    /// 2. **重排序缓冲**：每条流在 accept 时获得一个全局递增序号 `seq`。
+    ///    由于服务端串行发送（写完一条流再开下一条），同一 peer 的消息
+    ///    的 `seq` 严格递增。解密消费者维护 per-peer `BTreeMap<seq, data>`
+    ///    和全局 `max_contiguous` watermark，确保按 `seq` 升序解密，
+    ///    从而保证 Noise 状态化 AEAD nonce 顺序正确。
+    /// 3. **非加密消息**（PeerOnline / PeerOffline 等）无需排队，直接处理。
+    ///
+    /// **注意**：回调 `h(event)` 在解密 task 中同步调用，必须快速返回。
+    /// 如需执行耗时操作，请在回调内部 `tokio::spawn`。
     fn start_recv_loop(&self, conn: Connection) {
         let push_handler = self.push_handler.clone();
         let sessions = self.sessions.clone();
+
+        // 解密队列：(accept_seq, from_peer_id, ciphertext)
+        let (decrypt_tx, mut decrypt_rx) = mpsc::channel::<(u64, String, Vec<u8>)>(256);
+
+        // ── 串行解密消费者（含重排序缓冲） ──
+        let handler_for_decrypt = push_handler.clone();
+        let sessions_for_decrypt = sessions.clone();
+        tokio::spawn(async move {
+            // 全局连续 watermark：max_contiguous = N 表示 seq 0..=N 均已到达。
+            // 用于判断 per-peer gap 是否已被其他 peer 的消息填补。
+            let mut max_contiguous: Option<u64> = None;
+            let mut pending_seqs: BTreeSet<u64> = BTreeSet::new();
+
+            // Per-peer 重排序状态：(last_processed, buffered)
+            type PeerReorder = (Option<u64>, BTreeMap<u64, Vec<u8>>);
+            let mut peer_state: HashMap<String, PeerReorder> = HashMap::new();
+
+            while let Some((seq, from_peer_id, data)) = decrypt_rx.recv().await {
+                // ── 更新全局 watermark ──
+                match max_contiguous {
+                    None => {
+                        if seq == 0 {
+                            max_contiguous = Some(0);
+                        } else {
+                            pending_seqs.insert(seq);
+                        }
+                    }
+                    Some(mc) => {
+                        if seq == mc + 1 {
+                            // 连续：推进 watermark 并吸收 pending
+                            max_contiguous = Some(seq);
+                            while pending_seqs.remove(&(max_contiguous.unwrap() + 1)) {
+                                max_contiguous = Some(max_contiguous.unwrap() + 1);
+                            }
+                        } else if seq > mc + 1 {
+                            pending_seqs.insert(seq);
+                            // 防止无界增长：超过 512 条积压时跳过 gap
+                            if pending_seqs.len() > 512 {
+                                let new_mc = *pending_seqs.iter().next().unwrap() - 1;
+                                max_contiguous = Some(new_mc);
+                                pending_seqs.retain(|&s| s > new_mc);
+                                warn!(
+                                    max_contiguous = new_mc,
+                                    "重排序 watermark 跳进（部分流可能已丢失或属于其他 peer）"
+                                );
+                            }
+                        }
+                        // seq <= mc：重复，忽略
+                    }
+                }
+
+                // ── 加入 peer 的重排序缓冲 ──
+                let (_, buffer) = peer_state
+                    .entry(from_peer_id.clone())
+                    .or_insert_with(|| (None, BTreeMap::new()));
+                buffer.insert(seq, data);
+
+                // ── 尝试处理所有 peer 的可消费消息 ──
+                let mut to_process: Vec<(String, Vec<u8>)> = Vec::new();
+                for (pid, (lp, buf)) in peer_state.iter_mut() {
+                    while let Some(&min_seq) = buf.keys().next() {
+                        let can_process = match *lp {
+                            None => true, // 该 peer 的第一条消息
+                            Some(last) => {
+                                if min_seq <= last {
+                                    buf.remove(&min_seq); // 过期/重复
+                                    continue;
+                                }
+                                // 所有 seq < min_seq 的消息已到达（属于其他 peer
+                                // 或已处理），可安全解密
+                                match max_contiguous {
+                                    Some(mc) => min_seq <= mc + 1,
+                                    None => false,
+                                }
+                            }
+                        };
+
+                        if can_process {
+                            let d = buf.remove(&min_seq).unwrap();
+                            *lp = Some(min_seq);
+                            to_process.push((pid.clone(), d));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                // ── 串行解密并分发 ──
+                for (pid, data) in to_process {
+                    let from = PeerId::new(&pid);
+                    let decrypted = match sessions_for_decrypt.read().get(&from) {
+                        Some(session) => {
+                            let mut s = session.lock();
+                            match s.decrypt(&data) {
+                                Ok(pt) => pt,
+                                Err(e) => {
+                                    warn!(
+                                        peer = %from,
+                                        error = %e,
+                                        "E2E 解密失败，丢弃消息",
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        None => data,
+                    };
+                    let msg = RelayMessage::Incoming {
+                        from_peer_id: pid,
+                        data: decrypted,
+                    };
+                    if let Some(event) = convert_push_event(&msg) {
+                        let handler = handler_for_decrypt.read();
+                        if let Some(h) = handler.as_ref() {
+                            h(event);
+                        }
+                    }
+                }
+            }
+        });
+
+        // ── Accept 循环：并发读取 + accept 序号 ──
+        let accept_seq = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             loop {
                 match conn.accept_uni().await {
                     Ok(mut stream) => {
                         let handler = push_handler.clone();
-                        let sessions = sessions.clone();
+                        let decrypt_tx = decrypt_tx.clone();
+                        let seq = accept_seq.fetch_add(1, Ordering::Relaxed);
+                        // 并发读取每条流，避免慢流阻塞 accept 循环
                         tokio::spawn(async move {
                             let mut buf = Vec::new();
                             let mut chunk = vec![0u8; 4096];
@@ -273,39 +412,23 @@ impl RelayClientTransport {
                             }
                             match RelayMessage::from_bytes(&buf) {
                                 Ok(msg) => {
-                                    // E2E 解密：若该 peer 已注册 session，解密 Incoming 数据
-                                    let msg = if let RelayMessage::Incoming { from_peer_id, data } =
-                                        msg
-                                    {
-                                        let from = PeerId::new(&from_peer_id);
-                                        let decrypted = match sessions.read().get(&from) {
-                                            Some(session) => {
-                                                let mut s = session.lock();
-                                                match s.decrypt(&data) {
-                                                    Ok(pt) => pt,
-                                                    Err(e) => {
-                                                        warn!(
-                                                            peer = %from,
-                                                            error = %e,
-                                                            "E2E 解密失败，丢弃消息",
-                                                        );
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            None => data,
-                                        };
-                                        RelayMessage::Incoming {
-                                            from_peer_id,
-                                            data: decrypted,
+                                    // Incoming 需要解密：携带 seq 交给重排序队列
+                                    if let RelayMessage::Incoming { from_peer_id, data } = msg {
+                                        if let Err(e) =
+                                            decrypt_tx.send((seq, from_peer_id, data)).await
+                                        {
+                                            warn!(
+                                                error = %e,
+                                                "发送消息到解密队列失败，解密后台任务可能已退出"
+                                            );
                                         }
                                     } else {
-                                        msg
-                                    };
-                                    if let Some(event) = convert_push_event(&msg) {
-                                        let handler = handler.read();
-                                        if let Some(h) = handler.as_ref() {
-                                            h(event);
+                                        // 非加密消息直接处理
+                                        if let Some(event) = convert_push_event(&msg) {
+                                            let handler = handler.read();
+                                            if let Some(h) = handler.as_ref() {
+                                                h(event);
+                                            }
                                         }
                                     }
                                 }
