@@ -246,6 +246,9 @@ impl RelayClientTransport {
     /// 启动后台接收 task，处理 relay 主动推送的消息。
     ///
     /// relay 通过 uni-stream 推送 Incoming / PeerOnline / PeerOffline。
+    ///
+    /// **串行处理**：每个 uni-stream 在同一个 task 中顺序读取并解密，
+    /// 避免 Noise 协议状态化 AEAD nonce 因并发解密而乱序导致解密失败。
     fn start_recv_loop(&self, conn: Connection) {
         let push_handler = self.push_handler.clone();
         let sessions = self.sessions.clone();
@@ -255,65 +258,63 @@ impl RelayClientTransport {
                     Ok(mut stream) => {
                         let handler = push_handler.clone();
                         let sessions = sessions.clone();
-                        tokio::spawn(async move {
-                            let mut buf = Vec::new();
-                            let mut chunk = vec![0u8; 4096];
-                            loop {
-                                match stream.read(&mut chunk).await {
-                                    Ok(Some(0)) | Ok(None) => break,
-                                    Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                                    Err(e) => {
-                                        debug!(error = %e, "读取推送流失败");
-                                        break;
-                                    }
+                        // 不 spawn 新 task：串行读取 + 解密，保证 Noise nonce 顺序
+                        let mut buf = Vec::new();
+                        let mut chunk = vec![0u8; 4096];
+                        loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(Some(0)) | Ok(None) => break,
+                                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                                Err(e) => {
+                                    debug!(error = %e, "读取推送流失败");
+                                    break;
                                 }
                             }
-                            if buf.is_empty() {
-                                return;
-                            }
-                            match RelayMessage::from_bytes(&buf) {
-                                Ok(msg) => {
-                                    // E2E 解密：若该 peer 已注册 session，解密 Incoming 数据
-                                    let msg = if let RelayMessage::Incoming { from_peer_id, data } =
-                                        msg
-                                    {
-                                        let from = PeerId::new(&from_peer_id);
-                                        let decrypted = match sessions.read().get(&from) {
-                                            Some(session) => {
-                                                let mut s = session.lock();
-                                                match s.decrypt(&data) {
-                                                    Ok(pt) => pt,
-                                                    Err(e) => {
-                                                        warn!(
-                                                            peer = %from,
-                                                            error = %e,
-                                                            "E2E 解密失败，丢弃消息",
-                                                        );
-                                                        return;
-                                                    }
+                        }
+                        if buf.is_empty() {
+                            continue;
+                        }
+                        match RelayMessage::from_bytes(&buf) {
+                            Ok(msg) => {
+                                // E2E 解密：若该 peer 已注册 session，解密 Incoming 数据
+                                let msg = if let RelayMessage::Incoming { from_peer_id, data } = msg
+                                {
+                                    let from = PeerId::new(&from_peer_id);
+                                    let decrypted = match sessions.read().get(&from) {
+                                        Some(session) => {
+                                            let mut s = session.lock();
+                                            match s.decrypt(&data) {
+                                                Ok(pt) => pt,
+                                                Err(e) => {
+                                                    warn!(
+                                                        peer = %from,
+                                                        error = %e,
+                                                        "E2E 解密失败，丢弃消息",
+                                                    );
+                                                    continue;
                                                 }
                                             }
-                                            None => data,
-                                        };
-                                        RelayMessage::Incoming {
-                                            from_peer_id,
-                                            data: decrypted,
                                         }
-                                    } else {
-                                        msg
+                                        None => data,
                                     };
-                                    if let Some(event) = convert_push_event(&msg) {
-                                        let handler = handler.read();
-                                        if let Some(h) = handler.as_ref() {
-                                            h(event);
-                                        }
+                                    RelayMessage::Incoming {
+                                        from_peer_id,
+                                        data: decrypted,
+                                    }
+                                } else {
+                                    msg
+                                };
+                                if let Some(event) = convert_push_event(&msg) {
+                                    let handler = handler.read();
+                                    if let Some(h) = handler.as_ref() {
+                                        h(event);
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "解析推送消息失败");
-                                }
                             }
-                        });
+                            Err(e) => {
+                                warn!(error = %e, "解析推送消息失败");
+                            }
+                        }
                     }
                     Err(e) => {
                         debug!(error = %e, "relay 连接关闭，退出接收循环");

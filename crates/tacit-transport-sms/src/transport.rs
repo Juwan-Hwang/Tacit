@@ -175,86 +175,6 @@ impl SmsTransport {
         current
     }
 
-    /// 发送控制消息：序列化 -> 分片 -> 逐段发送。
-    fn send_control_sync(&self, peer_id: &PeerId, msg: &ControlMsg) -> CoreResult<()> {
-        let phone = self.lookup_phone(peer_id)?;
-
-        let json = serde_json::to_vec(msg)
-            .map_err(|e| CoreError::Transport(format!("控制消息序列化失败: {e}")))?;
-
-        if json.len() > MAX_SEGMENT_PAYLOAD_LEN * MAX_SEGMENT_INDEX as usize {
-            return Err(CoreError::Transport(format!(
-                "控制消息过大: {} 字节，超过 SMS 最大承载能力",
-                json.len()
-            )));
-        }
-
-        let msg_id = self.alloc_msg_id();
-        let segments = SmsSegmentCodec::segment(&json, msg_id, FRAME_TYPE_CONTROL)?;
-
-        debug!(
-            peer = %peer_id,
-            phone = %phone,
-            segments = segments.len(),
-            msg_id,
-            "发送 SMS 控制消息"
-        );
-
-        for seg in segments {
-            self.backend.send(SmsMessage {
-                phone: phone.clone(),
-                payload: seg,
-            })?;
-        }
-
-        Ok(())
-    }
-
-    /// 发送数据帧：编码 -> 分片 -> 逐段发送。
-    fn send_data_sync(&self, peer_id: &PeerId, frame: &DataFrame) -> CoreResult<()> {
-        let phone = self.lookup_phone(peer_id)?;
-
-        // 编码为二进制帧格式
-        let encoded = encode_data(
-            &frame.doc_id,
-            &frame.actor_id,
-            frame.seq,
-            frame.kind,
-            &frame.payload,
-            tacit_core::BatchFlag::Single,
-            [0u8; 8],
-        );
-
-        if encoded.len() > MAX_SMS_DATA_PAYLOAD {
-            return Err(CoreError::Transport(format!(
-                "DataFrame 过大: {} 字节，超过 SMS 数据面上限 {} 字节（等待 IP 恢复后走 QUIC）",
-                encoded.len(),
-                MAX_SMS_DATA_PAYLOAD
-            )));
-        }
-
-        let msg_id = self.alloc_msg_id();
-        let segments = SmsSegmentCodec::segment(&encoded, msg_id, FRAME_TYPE_DATA)?;
-
-        debug!(
-            peer = %peer_id,
-            phone = %phone,
-            segments = segments.len(),
-            msg_id,
-            bytes = encoded.len(),
-            "发送 SMS 数据帧"
-        );
-
-        for seg in segments {
-            self.backend.send(SmsMessage {
-                phone: phone.clone(),
-                payload: seg,
-            })?;
-        }
-
-        Ok(())
-    }
-
     /// 查找 peer 的电话号码。
     fn lookup_phone(&self, peer_id: &PeerId) -> CoreResult<String> {
         self.peer_phones
@@ -451,6 +371,12 @@ impl SmsTransport {
         }
         Ok(completed)
     }
+
+    /// 测试专用：获取 backend 引用，用于注入测试消息。
+    #[doc(hidden)]
+    pub fn backend_for_test(&self) -> Arc<dyn SmsBackend> {
+        self.backend.clone()
+    }
 }
 
 #[async_trait]
@@ -462,7 +388,38 @@ impl SyncTransport for SmsTransport {
         _priority: Priority,
         _preferred_path: PathPreference,
     ) -> CoreResult<()> {
-        self.send_data_sync(peer_id, &frame)
+        let phone = self.lookup_phone(peer_id)?;
+        let backend = self.backend.clone();
+        let msg_id = self.alloc_msg_id();
+        // SMS 后端为同步阻塞 I/O，offload 到 blocking 线程池避免饿死 async executor
+        tokio::task::spawn_blocking(move || {
+            let encoded = encode_data(
+                &frame.doc_id,
+                &frame.actor_id,
+                frame.seq,
+                frame.kind,
+                &frame.payload,
+                tacit_core::BatchFlag::Single,
+                [0u8; 8],
+            );
+            if encoded.len() > MAX_SMS_DATA_PAYLOAD {
+                return Err(CoreError::Transport(format!(
+                    "DataFrame 过大: {} 字节，超过 SMS 数据面上限 {} 字节（等待 IP 恢复后走 QUIC）",
+                    encoded.len(),
+                    MAX_SMS_DATA_PAYLOAD
+                )));
+            }
+            let segments = SmsSegmentCodec::segment(&encoded, msg_id, FRAME_TYPE_DATA)?;
+            for seg in segments {
+                backend.send(SmsMessage {
+                    phone: phone.clone(),
+                    payload: seg,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Transport(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn send_control(
@@ -471,7 +428,30 @@ impl SyncTransport for SmsTransport {
         msg: ControlMsg,
         _priority: Priority,
     ) -> CoreResult<()> {
-        self.send_control_sync(peer_id, &msg)
+        let phone = self.lookup_phone(peer_id)?;
+        let backend = self.backend.clone();
+        let msg_id = self.alloc_msg_id();
+        // SMS 后端为同步阻塞 I/O，offload 到 blocking 线程池避免饿死 async executor
+        tokio::task::spawn_blocking(move || {
+            let json = serde_json::to_vec(&msg)
+                .map_err(|e| CoreError::Transport(format!("控制消息序列化失败: {e}")))?;
+            if json.len() > MAX_SEGMENT_PAYLOAD_LEN * MAX_SEGMENT_INDEX as usize {
+                return Err(CoreError::Transport(format!(
+                    "控制消息过大: {} 字节，超过 SMS 最大承载能力",
+                    json.len()
+                )));
+            }
+            let segments = SmsSegmentCodec::segment(&json, msg_id, FRAME_TYPE_CONTROL)?;
+            for seg in segments {
+                backend.send(SmsMessage {
+                    phone: phone.clone(),
+                    payload: seg,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| CoreError::Transport(format!("spawn_blocking 失败: {e}")))?
     }
 
     async fn reconnect_peer(&self, _peer_id: &PeerId) -> CoreResult<()> {
