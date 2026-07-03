@@ -331,7 +331,7 @@ impl BluerBackend {
             };
 
             // 先解码 payload（peer_id 参数未使用），从 device_id 获取 peer_id
-            let temp_peer_id = PeerId::new(&addr.to_string());
+            let temp_peer_id = PeerId::new(addr.to_string());
             match decode_presence_payload(&payload, &temp_peer_id) {
                 Ok(hint) => {
                     // 用 payload 中的 device_id 作为 peer_id，不使用 MAC 作为 fallback

@@ -26,7 +26,7 @@ pub const MAX_SEGMENT_PAYLOAD_LEN: usize = MAX_SMS_PAYLOAD_LEN - SEGMENT_HEADER_
 const SEGMENT_HEADER_LEN: usize = 4;
 
 /// 分片头中 index 的最大值（含）。
-const MAX_SEGMENT_INDEX: u8 = 255;
+pub const MAX_SEGMENT_INDEX: u8 = 255;
 
 /// 帧类型：控制帧。
 pub const FRAME_TYPE_CONTROL: u8 = 0x01;

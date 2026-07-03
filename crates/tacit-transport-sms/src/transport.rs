@@ -33,16 +33,16 @@ use tacit_transport::{
 use tracing::{debug, warn};
 
 use crate::backend::{extract_phone_from_hint, SmsBackend, SmsMessage};
-use crate::codec::{SmsSegmentCodec, FRAME_TYPE_CONTROL, FRAME_TYPE_DATA, MAX_SMS_PAYLOAD_LEN};
+use crate::codec::{
+    SmsSegmentCodec, FRAME_TYPE_CONTROL, FRAME_TYPE_DATA, MAX_SEGMENT_INDEX,
+    MAX_SEGMENT_PAYLOAD_LEN,
+};
 
 /// SMS 数据帧 payload 上限（10 KB）。
 ///
 /// 超过此大小的 DataFrame 被拒绝，避免单次同步产生数百条 SMS。
 /// 10 KB 对应约 75 条 SMS，覆盖绝大多数文本 delta 和小型 snapshot 分片。
 pub const MAX_SMS_DATA_PAYLOAD: usize = 10 * 1024;
-
-/// SMS 重组缓冲中每个 message_id 的最大段数（256）。
-const MAX_SEGMENTS_PER_MESSAGE: usize = 256;
 
 /// 重组缓冲条目。
 #[derive(Debug)]
@@ -89,17 +89,22 @@ impl SmsTransport {
     /// 在配对阶段从 `bootstrap_hints` 中提取 `sms:` 前缀的号码，
     /// 或由集成层直接注入。
     pub fn register_peer(&self, peer_id: PeerId, phone: String) {
+        // 先读取旧号码（释放读锁后再获取写锁，避免死锁）
+        let old_phone = self.peer_phones.read().get(&peer_id).cloned();
+
+        // 统一锁顺序：peer_phones -> phone_peers（与 unregister_peer 一致）
+        let mut peer_phones = self.peer_phones.write();
+        let mut phone_peers = self.phone_peers.write();
+
         // 清理旧的反向映射：如果此 peer 之前注册过不同号码，移除旧的 phone→peer 条目
-        if let Some(old_phone) = self.peer_phones.read().get(&peer_id).cloned() {
-            if old_phone != phone {
-                self.phone_peers.write().remove(&old_phone);
+        if let Some(ref old) = old_phone {
+            if old != &phone {
+                phone_peers.remove(old);
             }
         }
-        // 清理新号码上可能残留的旧 peer 映射
-        self.phone_peers
-            .write()
-            .insert(phone.clone(), peer_id.clone());
-        self.peer_phones.write().insert(peer_id, phone);
+
+        phone_peers.insert(phone.clone(), peer_id.clone());
+        peer_phones.insert(peer_id, phone);
     }
 
     /// 从配对 hints 注册 peer。
@@ -115,8 +120,14 @@ impl SmsTransport {
 
     /// 注销 peer。
     pub fn unregister_peer(&self, peer_id: &PeerId) {
-        if let Some(phone) = self.peer_phones.write().remove(peer_id) {
-            self.phone_peers.write().remove(&phone);
+        // 统一锁顺序：peer_phones -> phone_peers（与 register_peer 一致）
+        let mut peer_phones = self.peer_phones.write();
+        if let Some(phone) = peer_phones.remove(peer_id) {
+            let mut phone_peers = self.phone_peers.write();
+            // 仅当反向映射仍指向此 peer 时才删除，防止误删已重分配的号码
+            if phone_peers.get(&phone) == Some(peer_id) {
+                phone_peers.remove(&phone);
+            }
         }
     }
 
@@ -140,7 +151,7 @@ impl SmsTransport {
         let json = serde_json::to_vec(msg)
             .map_err(|e| CoreError::Transport(format!("控制消息序列化失败: {e}")))?;
 
-        if json.len() > MAX_SMS_PAYLOAD_LEN * MAX_SEGMENTS_PER_MESSAGE {
+        if json.len() > MAX_SEGMENT_PAYLOAD_LEN * MAX_SEGMENT_INDEX as usize {
             return Err(CoreError::Transport(format!(
                 "控制消息过大: {} 字节，超过 SMS 最大承载能力",
                 json.len()
@@ -432,6 +443,7 @@ impl TransportManager for SmsTransport {
 mod tests {
     use super::*;
     use crate::backend::MockSmsBackend;
+    use crate::codec::MAX_SMS_PAYLOAD_LEN;
     use tacit_core::{
         AckSummary, DataFrameKind, DocId, Frontier, PeerId as TacitPeerId, SessionId,
     };

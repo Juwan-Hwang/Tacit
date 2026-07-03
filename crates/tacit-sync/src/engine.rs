@@ -514,8 +514,18 @@ impl DefaultSyncEngine {
             let conn = self.doc_store.store().conn();
             let existing = tacit_store::dao::get_peer(&conn, &msg.introduced_peer)?;
 
-            // 仅在 peer 不存在时创建；已存在的 peer 不覆盖（避免降级信任状态）
-            if existing.is_none() {
+            // 仅在 peer 不存在时创建；已存在的 peer 不覆盖公钥与信任状态（防止降级/劫持），
+            // 但允许更新 endpoint，以便连接到地址变更后的已注册 peer。
+            if let Some(mut record) = existing {
+                if let Some(addr) = &msg.endpoint {
+                    record.last_endpoint = Some(parse_endpoint(addr));
+                    tacit_store::dao::upsert_peer(&conn, &record)?;
+                    debug!(
+                        introduced = %msg.introduced_peer,
+                        "远程信任链引入：更新已存在 peer 的 endpoint"
+                    );
+                }
+            } else {
                 let record = tacit_core::PeerRecord {
                     peer_id: msg.introduced_peer.clone(),
                     device_pubkey: msg.introduced_pubkey_hex.clone(),
@@ -534,11 +544,6 @@ impl DefaultSyncEngine {
                     introducer = %msg.introducer,
                     introduced = %msg.introduced_peer,
                     "远程信任链引入：新 peer 已注册为 Pending"
-                );
-            } else {
-                debug!(
-                    introduced = %msg.introduced_peer,
-                    "远程信任链引入：peer 已存在，跳过注册"
                 );
             }
         }
