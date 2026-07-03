@@ -25,9 +25,7 @@
 
 use std::sync::Arc;
 
-use tacit_core::{
-    BlockId, CoreResult, DocId, Frontier, FrontierOps, PeerId, Priority,
-};
+use tacit_core::{BlockId, CoreResult, DocId, Frontier, FrontierOps, PeerId, Priority};
 use tracing::{debug, info, warn};
 
 use crate::doc_store::DocStore;
@@ -95,11 +93,7 @@ impl RecoveryCoordinator {
     /// 3. 若 peer frontier 的任何 seq 小于 checkpoint frontier 的对应 seq，
     ///    说明 peer 落在剪裁点之前，需要 shallow snapshot 恢复
     /// 4. 若无 checkpoint 记录，退化为 meta frontier 覆盖判定
-    pub fn is_peer_stale(
-        &self,
-        doc_id: &DocId,
-        peer_frontier: &Frontier,
-    ) -> CoreResult<bool> {
+    pub fn is_peer_stale(&self, doc_id: &DocId, peer_frontier: &Frontier) -> CoreResult<bool> {
         if peer_frontier.is_empty() {
             // 空 frontier 视为全新 peer，需要完整恢复
             return Ok(true);
@@ -163,11 +157,9 @@ impl RecoveryCoordinator {
 
         let blocks = self.doc_store.list_active_blocks(doc_id)?;
         for block in &blocks {
-            let shallow = self.doc_store.export_block_shallow(
-                doc_id,
-                &block.block_id,
-                &baseline,
-            )?;
+            let shallow =
+                self.doc_store
+                    .export_block_shallow(doc_id, &block.block_id, &baseline)?;
             engine.push_action(SyncAction::SendData {
                 peer_id: peer_id.clone(),
                 doc_id: doc_id.clone(),
@@ -224,19 +216,18 @@ impl RecoveryCoordinator {
         for doc in &docs {
             // 打开 doc 触发 MetaDoc 恢复
             self.doc_store.open_doc(&doc.doc_id)?;
-            engine.push_action(SyncAction::EmitEvent(
-                tacit_core::CoreEvent::SyncProgress {
-                    doc_id: doc.doc_id.clone(),
-                    stage: tacit_core::SyncStage::MetaDoc,
-                    progress: 0.1,
-                },
-            ));
+            engine.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncProgress {
+                doc_id: doc.doc_id.clone(),
+                stage: tacit_core::SyncStage::MetaDoc,
+                progress: 0.1,
+            }));
         }
 
         // 2. 可见 block（视口内）
         stages.push(FirstScreenStage::VisibleBlocks);
         // 记录已加载的 (doc_id, block_id) 集合，避免后续阶段重复加载
-        let mut loaded_blocks: std::collections::HashSet<(DocId, BlockId)> = std::collections::HashSet::new();
+        let mut loaded_blocks: std::collections::HashSet<(DocId, BlockId)> =
+            std::collections::HashSet::new();
         if let Some(vp) = viewport {
             for doc in &docs {
                 let blocks = self.doc_store.list_active_blocks(&doc.doc_id)?;
@@ -249,13 +240,11 @@ impl RecoveryCoordinator {
                     let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
                     loaded_blocks.insert((doc.doc_id.clone(), block.block_id.clone()));
                 }
-                engine.push_action(SyncAction::EmitEvent(
-                    tacit_core::CoreEvent::SyncProgress {
-                        doc_id: doc.doc_id.clone(),
-                        stage: tacit_core::SyncStage::PullBlocks,
-                        progress: 0.5,
-                    },
-                ));
+                engine.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncProgress {
+                    doc_id: doc.doc_id.clone(),
+                    stage: tacit_core::SyncStage::PullBlocks,
+                    progress: 0.5,
+                }));
             }
         } else {
             // 无视口信息，加载所有活跃 block
@@ -279,13 +268,11 @@ impl RecoveryCoordinator {
                 }
                 let _ = self.doc_store.get_block(&doc.doc_id, &block.block_id);
             }
-            engine.push_action(SyncAction::EmitEvent(
-                tacit_core::CoreEvent::SyncProgress {
-                    doc_id: doc.doc_id.clone(),
-                    stage: tacit_core::SyncStage::PullBlocks,
-                    progress: 0.8,
-                },
-            ));
+            engine.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncProgress {
+                doc_id: doc.doc_id.clone(),
+                stage: tacit_core::SyncStage::PullBlocks,
+                progress: 0.8,
+            }));
         }
 
         // 4. 冷文档追赶（后台低优先级）
@@ -298,10 +285,7 @@ impl RecoveryCoordinator {
             for doc_id in &doc_ids {
                 // 本地 meta frontier 作为 since（请求此之后的增量）；
                 // 若文档尚无 meta（刚创建），用空 frontier 兜底
-                let since = self
-                    .doc_store
-                    .meta_frontier(doc_id)
-                    .unwrap_or_default();
+                let since = self.doc_store.meta_frontier(doc_id).unwrap_or_default();
                 for peer_id in &online_peers {
                     engine.push_action(SyncAction::RequestDelta {
                         peer_id: peer_id.clone(),
@@ -321,13 +305,11 @@ impl RecoveryCoordinator {
 
         stages.push(FirstScreenStage::Done);
         for doc in &docs {
-            engine.push_action(SyncAction::EmitEvent(
-                tacit_core::CoreEvent::SyncProgress {
-                    doc_id: doc.doc_id.clone(),
-                    stage: tacit_core::SyncStage::Done,
-                    progress: 1.0,
-                },
-            ));
+            engine.push_action(SyncAction::EmitEvent(tacit_core::CoreEvent::SyncProgress {
+                doc_id: doc.doc_id.clone(),
+                stage: tacit_core::SyncStage::Done,
+                progress: 1.0,
+            }));
         }
 
         debug!(docs = docs.len(), "首屏恢复完成");
@@ -431,7 +413,7 @@ mod tests {
     fn make_env() -> (RecoveryCoordinator, DefaultSyncEngine, Arc<DocStore>) {
         let store = Store::open_memory().unwrap();
         let doc_store = Arc::new(DocStore::new(pid(1), store, 32));
-        let _ = doc_store.create_doc(DocId::new("d1"), "note").unwrap();
+        doc_store.create_doc(DocId::new("d1"), "note").unwrap();
         let engine = DefaultSyncEngine::new(
             doc_store.clone(),
             EngineConfig {
@@ -467,27 +449,18 @@ mod tests {
             .unwrap();
 
         let state = coord
-            .recover_stale_peer(
-                &engine,
-                &pid(2),
-                &DocId::new("d1"),
-                &Frontier::new(),
-            )
+            .recover_stale_peer(&engine, &pid(2), &DocId::new("d1"), &Frontier::new())
             .unwrap();
 
         assert_eq!(state.stage, RecoveryStage::Done);
         let actions = engine.drain_actions();
         // 应有 SendData（shallow snapshot）和 RequestDelta（tail delta）
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, SyncAction::SendData { .. }))
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, SyncAction::RequestDelta { .. }))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::SendData { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::RequestDelta { .. })));
     }
 
     #[test]
@@ -501,9 +474,7 @@ mod tests {
             )
             .unwrap();
 
-        let stages = coord
-            .first_screen_recovery(&engine, None)
-            .unwrap();
+        let stages = coord.first_screen_recovery(&engine, None).unwrap();
 
         assert_eq!(stages.len(), 5);
         assert_eq!(stages[0], FirstScreenStage::MetaSkeleton);
@@ -511,11 +482,9 @@ mod tests {
 
         let actions = engine.drain_actions();
         // 应有 SyncProgress 事件
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, SyncAction::EmitEvent(_)))
-        );
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::EmitEvent(_))));
     }
 
     /// 验证冷文档追赶阶段：有在线 peer 时，为每个文档生成 Priority::Low 的 RequestDelta。
@@ -584,10 +553,7 @@ mod tests {
         let has_delta = actions
             .iter()
             .any(|a| matches!(a, SyncAction::RequestDelta { .. }));
-        assert!(
-            !has_delta,
-            "无在线 peer 时不应产生 RequestDelta"
-        );
+        assert!(!has_delta, "无在线 peer 时不应产生 RequestDelta");
     }
 
     #[test]
@@ -595,7 +561,11 @@ mod tests {
         let (_coord, _engine, doc_store) = make_env();
         let block_id = BlockId::new("b1");
         doc_store
-            .create_block(&DocId::new("d1"), block_id.clone(), tacit_core::BlockKind::Text)
+            .create_block(
+                &DocId::new("d1"),
+                block_id.clone(),
+                tacit_core::BlockKind::Text,
+            )
             .unwrap();
         doc_store
             .apply_local_edit(&DocId::new("d1"), &block_id, b"old data")

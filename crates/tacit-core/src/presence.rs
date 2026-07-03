@@ -19,10 +19,7 @@ pub enum PresenceState {
     /// 设备在线。
     Online,
     /// 正在编辑指定 block。
-    Editing {
-        doc_id: DocId,
-        block_id: BlockId,
-    },
+    Editing { doc_id: DocId, block_id: BlockId },
     /// 光标位置。
     Cursor {
         doc_id: DocId,

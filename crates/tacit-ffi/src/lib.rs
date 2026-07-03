@@ -20,16 +20,19 @@ pub mod runtime;
 pub mod view;
 
 pub use ble::{
-    ffi_clear_ble_backend, ffi_has_ble_backend, ffi_set_ble_backend, ForeignPresenceBackend,
-    FfiAnchorCapabilities, FfiDiscoveryEvent, FfiEndpoint, FfiPresenceHint,
+    ffi_clear_ble_backend, ffi_has_ble_backend, ffi_set_ble_backend, FfiAnchorCapabilities,
+    FfiDiscoveryEvent, FfiEndpoint, FfiPresenceHint, ForeignPresenceBackend,
 };
-pub use command_bus::{Command, CommandBus, CommandBusError, CommandBuffer};
+pub use command_bus::{Command, CommandBuffer, CommandBus, CommandBusError};
 pub use doc_executor::{DocActor, DocExecutorRegistry};
 pub use engine::TacitEngine;
 pub use error::TacitFfiError;
 pub use event_bus::{EventBus, EventFilter, SubscriptionId};
 pub use listener::{ForeignEventListener, TacitEventListener};
 pub use runtime::{RuntimeConfig, RuntimeState, RuntimeSupervisor};
-pub use view::{DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus};
+pub use view::{
+    DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction,
+    SyncStatus,
+};
 
 uniffi::setup_scaffolding!();

@@ -20,23 +20,22 @@ pub use config::TacitConfig;
 pub use error::{CoreError, CoreResult};
 pub use event::{CoreEvent, ErrorScope, SyncReason, SyncStage};
 pub use frame::{
-    BatchFlag, ControlFrame, ControlType, DataFrameWire, DiscoveryFrame, FrameError, Tlv,
-    MAGIC, PROTOCOL_VERSION,
+    BatchFlag, ControlFrame, ControlType, DataFrameWire, DiscoveryFrame, FrameError, Tlv, MAGIC,
+    PROTOCOL_VERSION,
 };
 pub use frontier::{Frontier, FrontierOps};
 pub use hlc::{Hlc, LocalSeq};
 pub use ids::{BlockId, CheckpointId, DocId, PeerId, SessionId};
 pub use model::{
     AckSummary, AnchorCapabilities, ApplyResult, BlockKind, BlockRecord, BlockRender,
-    ChangeEnvelope, DataFrame, DataFrameKind, DocumentView, Endpoint, ImportResult,
-    NatCapability, NetworkType, PathHint, PeerRecord, PeerSummary, PortHint, PortRange,
-    PresenceHint, Priority, RenderModel, SnapshotChunk, SnapshotKind, SnapshotMeta, TrustState,
-    UserEdit, Viewport, Watermarks,
+    ChangeEnvelope, DataFrame, DataFrameKind, DocumentView, Endpoint, ImportResult, NatCapability,
+    NetworkType, PathHint, PeerRecord, PeerSummary, PortHint, PortRange, PresenceHint, Priority,
+    RenderModel, SnapshotChunk, SnapshotKind, SnapshotMeta, TrustState, UserEdit, Viewport,
+    Watermarks,
 };
 pub use presence::{PresenceEntry, PresenceRegistry, PresenceState, DEFAULT_PRESENCE_TTL};
 pub use telemetry::{
-    ChannelStats, QueueBacklog, SyncLag, TelemetryCollector, TelemetrySnapshot,
-    DEFAULT_EMA_ALPHA,
+    ChannelStats, QueueBacklog, SyncLag, TelemetryCollector, TelemetrySnapshot, DEFAULT_EMA_ALPHA,
 };
 pub use version::{
     negotiate, NegotiatedCapabilities, NegotiationResult, ProtocolVersion, MAJOR_VERSION,
