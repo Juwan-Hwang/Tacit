@@ -14,9 +14,8 @@
 //!   当收到 Forward 时，通过目标 peer 的推送通道发送 Incoming。
 //! - 客户端启动后台 task 接收 relay 主动推送的消息（Incoming / PeerOnline / PeerOffline）。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +27,7 @@ use tacit_crypto::Session;
 use tacit_transport::{ControlMsg, PathPreference, SyncTransport};
 use tacit_transport_quic::{generate_self_signed_cert, make_client_config, make_server_config};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::client::RelayClient;
@@ -66,13 +66,16 @@ pub struct RelayClientTransport {
     push_handler: PushHandler,
     /// 心跳 task 的关闭信号（disconnect 时发送）。
     heartbeat_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    /// 连接锁：串行化 connect_and_register 的临界区，
+    /// 防止并发重连导致 conn 替换与心跳更新之间的竞态条件。
+    connect_lock: Mutex<()>,
     /// relay 服务端层级。
     tier: RelayTier,
     /// E2E 加密会话表：peer_id -> Session。
     ///
     /// 由集成层在 Noise 握手完成后注入。注册后，所有经 relay 转发的
     /// payload（帧类型 + JSON）会被透明加密/解密，relay 服务端仅看到密文。
-    /// 未注册 session 的 peer 仍以明文传输（向后兼容）。
+    /// 未注册 session 的 peer 通信将被拒绝（强制 E2E 加密）。
     sessions: Arc<RwLock<HashMap<PeerId, Arc<Mutex<Session>>>>>,
 }
 
@@ -109,6 +112,7 @@ impl RelayClientTransport {
             client_config: RwLock::new(client_config),
             push_handler: Arc::new(RwLock::new(None)),
             heartbeat_shutdown: Mutex::new(None),
+            connect_lock: Mutex::new(()),
             tier,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -137,14 +141,16 @@ impl RelayClientTransport {
         self.sessions.write().remove(peer_id);
     }
 
-    /// 加密 payload（若该 peer 已注册 session），否则返回原始 payload。
+    /// 加密 payload。若该 peer 未注册 session，返回错误（强制 E2E 加密）。
     fn encrypt_if_session(&self, peer_id: &PeerId, plaintext: Vec<u8>) -> CoreResult<Vec<u8>> {
         match self.sessions.read().get(peer_id) {
             Some(session) => {
                 let mut s = session.lock();
                 s.encrypt(&plaintext)
             }
-            None => Ok(plaintext),
+            None => Err(CoreError::Transport(format!(
+                "peer {peer_id} 未注册 E2E 加密会话，拒绝明文传输"
+            ))),
         }
     }
 
@@ -179,18 +185,39 @@ impl RelayClientTransport {
             .map_err(|e| CoreError::Transport(format!("连接 relay 失败: {e}")))?;
         debug!(addr = %self.relay_addr, "已连接 relay 服务端");
 
-        *self.conn.write() = Some(conn.clone());
+        // 使用局部 conn 完成注册——仅在注册完全成功后才更新 self.conn。
+        // 这样若注册失败，self.conn 保持旧值（或 None），reconnect_peer 不会误判连接正常。
+        // 注册失败时显式关闭 conn，防止 QUIC 连接泄漏。
+        let register_msg = match self.client.create_register_message() {
+            Ok(msg) => msg,
+            Err(e) => {
+                conn.close(0u32.into(), b"register message creation failed");
+                return Err(e);
+            }
+        };
+        let response = match self.request_response(&conn, &register_msg).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                conn.close(0u32.into(), b"registration request failed");
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.handle_register_response(&response) {
+            conn.close(0u32.into(), b"registration response rejected");
+            return Err(e);
+        }
 
-        // 发送 Register 消息
-        let register_msg = self.client.create_register_message()?;
-        let response = self.request_response(&register_msg).await?;
+        // 临界区：串行化 conn 替换 + 心跳更新，防止并发 connect_and_register
+        // 导致活跃连接丢失心跳任务的竞态条件。
+        let _connect_guard = self.connect_lock.lock();
 
-        // 处理注册响应
-        self.client.handle_register_response(&response)?;
+        // 注册成功后，替换 self.conn 并关闭旧连接。
+        if let Some(old) = self.conn.write().replace(conn.clone()) {
+            debug!("重连：显式关闭旧 relay 连接");
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
 
         // 启动后台接收 task。
-        // 每次连接都启动新的接收循环（旧连接的循环会因 conn.close 自然退出），
-        // 不使用 recv_started 守卫——重连后旧标志仍为 true 会导致新连接无接收循环。
         self.start_recv_loop(conn.clone());
 
         // 启动心跳 task（每 30s 发送 Ping，连续 2 次超时则关闭连接触发重连）。
@@ -208,48 +235,54 @@ impl RelayClientTransport {
     /// 通过 bi-stream 发送请求并等待响应。
     ///
     /// 使用独立 bi-stream 避免队头阻塞。
-    async fn request_response(&self, msg: &RelayMessage) -> CoreResult<RelayMessage> {
-        let conn = self
-            .conn
-            .read()
-            .clone()
-            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| CoreError::Transport(format!("打开 bi-stream 失败: {e}")))?;
-        let bytes = msg.to_bytes()?;
-        send.write_all(&bytes)
-            .await
-            .map_err(|e| CoreError::Transport(format!("写入失败: {e}")))?;
-        send.finish()
-            .map_err(|e| CoreError::Transport(format!("finish 失败: {e}")))?;
-        // 读取响应
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; 4096];
-        loop {
-            match recv.read(&mut chunk).await {
-                Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                Err(e) => return Err(CoreError::Transport(format!("读取响应失败: {e}"))),
+    /// 接受外部传入的 `conn`，使调用方可以在更新 `self.conn` 之前完成注册。
+    ///
+    /// 整个流程（open_bi + write + read）受 15s 超时保护，
+    /// 防止 relay 服务端无响应时无限阻塞。
+    async fn request_response(
+        &self,
+        conn: &quinn::Connection,
+        msg: &RelayMessage,
+    ) -> CoreResult<RelayMessage> {
+        timeout(Duration::from_secs(15), async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| CoreError::Transport(format!("打开 bi-stream 失败: {e}")))?;
+            let bytes = msg.to_bytes()?;
+            send.write_all(&bytes)
+                .await
+                .map_err(|e| CoreError::Transport(format!("写入失败: {e}")))?;
+            send.finish()
+                .map_err(|e| CoreError::Transport(format!("finish 失败: {e}")))?;
+            // 读取响应
+            let mut buf = Vec::new();
+            let mut chunk = vec![0u8; 4096];
+            loop {
+                match recv.read(&mut chunk).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) => return Err(CoreError::Transport(format!("读取响应失败: {e}"))),
+                }
             }
-        }
-        RelayMessage::from_bytes(&buf)
+            RelayMessage::from_bytes(&buf)
+        })
+        .await
+        .map_err(|_| CoreError::Transport("请求-响应超时（15s）".into()))?
     }
 
     /// 启动后台接收 task，处理 relay 主动推送的消息。
     ///
     /// relay 通过 uni-stream 推送 Incoming / PeerOnline / PeerOffline。
     ///
-    /// **并发读取 + 重排序串行解密**：
-    /// 1. **并发读取**：每条 uni-stream 由独立 task 并发读取，避免慢流阻塞
-    ///    accept 循环（Head-of-Line blocking）。
-    /// 2. **重排序缓冲**：每条流在 accept 时获得一个全局递增序号 `seq`。
-    ///    由于服务端串行发送（写完一条流再开下一条），同一 peer 的消息
-    ///    的 `seq` 严格递增。解密消费者维护 per-peer `BTreeMap<seq, data>`
-    ///    和全局 `max_contiguous` watermark，确保按 `seq` 升序解密，
-    ///    从而保证 Noise 状态化 AEAD nonce 顺序正确。
-    /// 3. **非加密消息**（PeerOnline / PeerOffline 等）无需排队，直接处理。
+    /// **顺序读取 + 串行解密**：
+    /// 服务端 `run_push_sender` 串行发送（写完一条流再开下一条），
+    /// 因此顺序读取 uni-stream 即可保证消息到达顺序 = 服务端发送顺序，
+    /// 无需全局 accept_seq / 重排序缓冲 / watermark。
+    ///
+    /// 这消除了之前全局 watermark 设计的两个根本缺陷：
+    /// 1. 跨 peer 队头阻塞（一个 peer 的慢流卡住所有 peer）
+    /// 2. 跳进逻辑丢弃消息导致 Noise nonce 永久失步
     ///
     /// **注意**：回调 `h(event)` 在解密 task 中同步调用，必须快速返回。
     /// 如需执行耗时操作，请在回调内部 `tokio::spawn`。
@@ -257,197 +290,98 @@ impl RelayClientTransport {
         let push_handler = self.push_handler.clone();
         let sessions = self.sessions.clone();
 
-        // 解密队列：(accept_seq, from_peer_id, ciphertext)
-        let (decrypt_tx, mut decrypt_rx) = mpsc::channel::<(u64, String, Vec<u8>)>(256);
+        // 解密队列：(from_peer_id, ciphertext)
+        let (decrypt_tx, mut decrypt_rx) = mpsc::channel::<(String, Vec<u8>)>(256);
 
-        // ── 串行解密消费者（含重排序缓冲） ──
+        // ── 串行解密消费者 ──
+        // 消息按服务端发送顺序到达（由顺序读取保证），直接解密即可。
         let handler_for_decrypt = push_handler.clone();
         let sessions_for_decrypt = sessions.clone();
         tokio::spawn(async move {
-            // 全局连续 watermark：max_contiguous = N 表示 seq 0..=N 均已到达。
-            // 用于判断 per-peer gap 是否已被其他 peer 的消息填补。
-            let mut max_contiguous: Option<u64> = None;
-            let mut pending_seqs: BTreeSet<u64> = BTreeSet::new();
-
-            // Per-peer 重排序状态：(last_processed, buffered)
-            type PeerReorder = (Option<u64>, BTreeMap<u64, Vec<u8>>);
-            let mut peer_state: HashMap<String, PeerReorder> = HashMap::new();
-
-            while let Some((seq, from_peer_id, data)) = decrypt_rx.recv().await {
-                // ── 更新全局 watermark ──
-                // 统一逻辑：推进 watermark 时吸收 pending_seqs 中的连续序号。
-                // 使用局部变量避免反复 unwrap。
-                match max_contiguous {
+            while let Some((from_peer_id, data)) = decrypt_rx.recv().await {
+                let from = PeerId::new(&from_peer_id);
+                let decrypted = match sessions_for_decrypt.read().get(&from) {
+                    Some(session) => {
+                        let mut s = session.lock();
+                        match s.decrypt(&data) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                warn!(
+                                    peer = %from,
+                                    error = %e,
+                                    "E2E 解密失败，丢弃消息",
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     None => {
-                        if seq == 0 {
-                            let mut mc: u64 = 0;
-                            while pending_seqs.remove(&(mc + 1)) {
-                                mc += 1;
-                            }
-                            max_contiguous = Some(mc);
-                        } else {
-                            pending_seqs.insert(seq);
-                        }
+                        warn!(
+                            peer = %from,
+                            "未注册 E2E 加密会话，丢弃明文消息",
+                        );
+                        continue;
                     }
-                    Some(mc) => {
-                        if seq <= mc {
-                            // 重复，忽略
-                        } else if seq == mc + 1 {
-                            // 连续：推进 watermark 并吸收 pending
-                            let mut new_mc = seq;
-                            while pending_seqs.remove(&(new_mc + 1)) {
-                                new_mc += 1;
-                            }
-                            max_contiguous = Some(new_mc);
-                        } else {
-                            // seq > mc + 1：有 gap，加入 pending
-                            pending_seqs.insert(seq);
-                        }
-                    }
-                }
-
-                // 统一的积压跳进逻辑（适用于 None 和 Some 两个分支）
-                if pending_seqs.len() > 512 {
-                    let min_pending = *pending_seqs.iter().next().unwrap();
-                    pending_seqs.remove(&min_pending);
-                    let mut new_mc = min_pending;
-                    // 吸收后续连续序号
-                    while pending_seqs.remove(&(new_mc + 1)) {
-                        new_mc += 1;
-                    }
-                    max_contiguous = Some(new_mc);
-                    warn!(
-                        max_contiguous = new_mc,
-                        "重排序 watermark 跳进（部分流可能已丢失或属于其他 peer）"
-                    );
-                }
-
-                // ── 加入 peer 的重排序缓冲 ──
-                // 跳过空 peer_id，避免无意义条目污染 peer_state。
-                if !from_peer_id.is_empty() {
-                    let (_, buffer) = peer_state
-                        .entry(from_peer_id.clone())
-                        .or_insert_with(|| (None, BTreeMap::new()));
-                    buffer.insert(seq, data);
-                }
-
-                // ── 尝试处理所有 peer 的可消费消息 ──
-                let mut to_process: Vec<(String, Vec<u8>)> = Vec::new();
-                for (pid, (lp, buf)) in peer_state.iter_mut() {
-                    while let Some(&min_seq) = buf.keys().next() {
-                        // 统一约束：所有 peer（包括第一条消息）必须满足
-                        // min_seq <= max_contiguous + 1，确保所有更小的 seq
-                        // 都已到达，防止乱序解密破坏 Noise nonce。
-                        let can_process = match max_contiguous {
-                            Some(mc) => {
-                                if let Some(last) = *lp {
-                                    if min_seq <= last {
-                                        buf.remove(&min_seq); // 过期/重复
-                                        continue;
-                                    }
-                                }
-                                min_seq <= mc + 1
-                            }
-                            None => false,
-                        };
-
-                        if can_process {
-                            let d = buf.remove(&min_seq).unwrap();
-                            *lp = Some(min_seq);
-                            to_process.push((pid.clone(), d));
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                // ── 串行解密并分发 ──
-                for (pid, data) in to_process {
-                    let from = PeerId::new(&pid);
-                    let decrypted = match sessions_for_decrypt.read().get(&from) {
-                        Some(session) => {
-                            let mut s = session.lock();
-                            match s.decrypt(&data) {
-                                Ok(pt) => pt,
-                                Err(e) => {
-                                    warn!(
-                                        peer = %from,
-                                        error = %e,
-                                        "E2E 解密失败，丢弃消息",
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        None => data,
-                    };
-                    let msg = RelayMessage::Incoming {
-                        from_peer_id: pid,
-                        data: decrypted,
-                    };
-                    if let Some(event) = convert_push_event(&msg) {
-                        let handler = handler_for_decrypt.read();
-                        if let Some(h) = handler.as_ref() {
-                            h(event);
-                        }
+                };
+                let msg = RelayMessage::Incoming {
+                    from_peer_id,
+                    data: decrypted,
+                };
+                if let Some(event) = convert_push_event(&msg) {
+                    let handler = handler_for_decrypt.read();
+                    if let Some(h) = handler.as_ref() {
+                        h(event);
                     }
                 }
             }
         });
 
-        // ── Accept 循环：并发读取 + accept 序号 ──
-        let accept_seq = Arc::new(AtomicU64::new(0));
+        // ── Accept + 顺序读取循环 ──
+        // 顺序读取保证消息到达顺序 = 服务端发送顺序 = 正确的解密顺序。
+        // 服务端串行发送（写完一条流再开下一条），因此不会引入额外的 HoL 阻塞。
         tokio::spawn(async move {
             loop {
                 match conn.accept_uni().await {
                     Ok(mut stream) => {
-                        let handler = push_handler.clone();
-                        let decrypt_tx = decrypt_tx.clone();
-                        let seq = accept_seq.fetch_add(1, Ordering::Relaxed);
-                        // 并发读取每条流，避免慢流阻塞 accept 循环
-                        tokio::spawn(async move {
-                            let mut buf = Vec::new();
-                            let mut chunk = vec![0u8; 4096];
-                            loop {
-                                match stream.read(&mut chunk).await {
-                                    Ok(Some(0)) | Ok(None) => break,
-                                    Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
-                                    Err(e) => {
-                                        debug!(error = %e, "读取推送流失败");
+                        let mut buf = Vec::new();
+                        let mut chunk = vec![0u8; 4096];
+                        loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(Some(0)) | Ok(None) => break,
+                                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                                Err(e) => {
+                                    debug!(error = %e, "读取推送流失败");
+                                    break;
+                                }
+                            }
+                        }
+                        if buf.is_empty() {
+                            continue;
+                        }
+                        match RelayMessage::from_bytes(&buf) {
+                            Ok(msg) => {
+                                if let RelayMessage::Incoming { from_peer_id, data } = msg {
+                                    if let Err(e) = decrypt_tx.send((from_peer_id, data)).await {
+                                        warn!(
+                                            error = %e,
+                                            "发送消息到解密队列失败，解密后台任务可能已退出"
+                                        );
                                         break;
                                     }
-                                }
-                            }
-                            if buf.is_empty() {
-                                return;
-                            }
-                            match RelayMessage::from_bytes(&buf) {
-                                Ok(msg) => {
-                                    // Incoming 需要解密：携带 seq 交给重排序队列
-                                    if let RelayMessage::Incoming { from_peer_id, data } = msg {
-                                        if let Err(e) =
-                                            decrypt_tx.send((seq, from_peer_id, data)).await
-                                        {
-                                            warn!(
-                                                error = %e,
-                                                "发送消息到解密队列失败，解密后台任务可能已退出"
-                                            );
-                                        }
-                                    } else {
-                                        // 非加密消息直接处理
-                                        if let Some(event) = convert_push_event(&msg) {
-                                            let handler = handler.read();
-                                            if let Some(h) = handler.as_ref() {
-                                                h(event);
-                                            }
+                                } else {
+                                    // 非加密消息（PeerOnline / PeerOffline）直接处理
+                                    if let Some(event) = convert_push_event(&msg) {
+                                        let handler = push_handler.read();
+                                        if let Some(h) = handler.as_ref() {
+                                            h(event);
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "解析推送消息失败");
-                                }
                             }
-                        });
+                            Err(e) => {
+                                warn!(error = %e, "解析推送消息失败");
+                            }
+                        }
                     }
                     Err(e) => {
                         debug!(error = %e, "relay 连接关闭，退出接收循环");
@@ -544,7 +478,12 @@ impl RelayClientTransport {
     pub async fn forward(&self, target: &PeerId, data: Vec<u8>) -> CoreResult<()> {
         let encrypted = self.encrypt_if_session(target, data)?;
         let forward_msg = self.client.create_forward_message(target, encrypted)?;
-        let response = self.request_response(&forward_msg).await?;
+        let conn = self
+            .conn
+            .read()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
+        let response = self.request_response(&conn, &forward_msg).await?;
         match response {
             RelayMessage::ForwardOk => Ok(()),
             RelayMessage::ForwardFailed { reason } => {
@@ -1110,15 +1049,19 @@ mod tests {
         // 等待服务端就绪
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // 创建 client1
+        // 建立 E2E 加密会话
+        let (session1, session2) = establish_e2e_sessions();
+
+        // 创建 client1，注册到 peer2 的 session
         let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
             .await
             .unwrap();
         client1.set_default_client_config(client_config.clone());
+        client1.register_session(PeerId::new("2"), session1);
         client1.connect_and_register().await.unwrap();
         assert!(client1.is_registered());
 
-        // 创建 client2，设置推送回调
+        // 创建 client2，注册到 peer1 的 session
         let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
             .await
             .unwrap();
@@ -1127,6 +1070,7 @@ mod tests {
         client2.set_push_handler(move |event| {
             received_clone.lock().push(event);
         });
+        client2.register_session(PeerId::new("1"), session2);
         client2.set_default_client_config(client_config);
         client2.connect_and_register().await.unwrap();
         assert!(client2.is_registered());
@@ -1354,7 +1298,11 @@ mod tests {
         client.connect_and_register().await.unwrap();
 
         // 直接通过 bi-stream 发送 Ping，验证收到 Pong（心跳 send_ping 的核心路径）
-        let resp = client.request_response(&RelayMessage::Ping).await.unwrap();
+        let conn = client.conn.read().clone().unwrap();
+        let resp = client
+            .request_response(&conn, &RelayMessage::Ping)
+            .await
+            .unwrap();
         assert!(matches!(resp, RelayMessage::Pong), "期望 Pong 响应");
 
         client.disconnect().await;
@@ -1447,72 +1395,6 @@ mod tests {
                 assert_eq!(*from_peer_id, PeerId::new("1"));
                 // 收到的应是解密后的原始明文
                 assert_eq!(recv_data, &data, "E2E 解密后数据应匹配原始明文");
-            }
-            _ => panic!("期望 Incoming 事件"),
-        }
-
-        client1.disconnect().await;
-        client2.disconnect().await;
-    }
-
-    #[tokio::test]
-    async fn relay_e2e_unencrypted_backward_compatible() {
-        // 验证：未注册 session 时，仍以明文传输（向后兼容）。
-        let (cert, key) = generate_self_signed_cert().unwrap();
-        let client_config = make_client_config(cert.clone()).unwrap();
-        let secret = b"relay_compat_secret".to_vec();
-        let runner = Arc::new(
-            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
-                .await
-                .unwrap(),
-        );
-        let server_addr = runner.local_addr().unwrap();
-        let runner_clone = runner.clone();
-        tokio::spawn(async move {
-            runner_clone.run().await.unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // 不注册 session — 明文传输
-        let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
-            .await
-            .unwrap();
-        client1.set_default_client_config(client_config.clone());
-        client1.connect_and_register().await.unwrap();
-
-        let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
-            .await
-            .unwrap();
-        let received = Arc::new(Mutex::new(Vec::<RelayPushEvent>::new()));
-        let received_clone = received.clone();
-        client2.set_push_handler(move |event| {
-            received_clone.lock().push(event);
-        });
-        client2.set_default_client_config(client_config);
-        client2.connect_and_register().await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let data = b"plaintext via relay".to_vec();
-        client1
-            .forward(&PeerId::new("2"), data.clone())
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let events = {
-            let guard = received.lock();
-            guard.clone()
-        };
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            RelayPushEvent::Incoming {
-                from_peer_id,
-                data: recv_data,
-            } => {
-                assert_eq!(*from_peer_id, PeerId::new("1"));
-                assert_eq!(recv_data, &data);
             }
             _ => panic!("期望 Incoming 事件"),
         }
