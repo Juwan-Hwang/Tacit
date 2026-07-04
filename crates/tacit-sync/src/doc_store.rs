@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 use tacit_core::{
@@ -21,6 +21,7 @@ use tacit_core::{
 };
 use tacit_crdt::{BlockDoc, BlockDocCache, MetaDoc};
 use tacit_store::{dao, Store};
+use tracing::debug;
 
 use tacit_core::CheckpointId;
 
@@ -587,6 +588,44 @@ impl DocStore {
         Ok(tacit_core::RenderModel {
             doc_id: doc_id.clone(),
             blocks: renders,
+        })
+    }
+
+    /// 启动冷 block snapshot 后台 GC task。
+    ///
+    /// 定期清理 `BlockDocCache.cold` 中过期的 snapshot，防止内存无限增长。
+    ///
+    /// - `max_age`：冷 snapshot 最大保留时间（超过则被清理）。
+    /// - `interval`：GC 执行间隔。
+    ///
+    /// 返回 `JoinHandle`，调用方可通过 `abort()` 停止 GC。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let doc_store = Arc::new(DocStore::new(...));
+    /// let _gc = doc_store.spawn_cold_gc(Duration::from_secs(300), Duration::from_secs(60));
+    /// ```
+    pub fn spawn_cold_gc(
+        self: &Arc<Self>,
+        max_age: Duration,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak_this = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                // 使用弱引用：当 DocStore 的所有强引用释放后，upgrade 失败，退出循环。
+                // 避免后台任务无限持有 Arc 导致内存泄漏。
+                if let Some(this) = weak_this.upgrade() {
+                    let cleaned = this.cache.cleanup_stale_cold(max_age);
+                    if cleaned > 0 {
+                        debug!(cleaned, "冷 block GC 清理完成");
+                    }
+                } else {
+                    debug!("DocStore 已释放，停止冷 block GC 后台任务");
+                    break;
+                }
+            }
         })
     }
 }
