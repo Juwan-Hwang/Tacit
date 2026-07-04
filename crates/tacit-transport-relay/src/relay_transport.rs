@@ -179,18 +179,19 @@ impl RelayClientTransport {
             .map_err(|e| CoreError::Transport(format!("连接 relay 失败: {e}")))?;
         debug!(addr = %self.relay_addr, "已连接 relay 服务端");
 
-        *self.conn.write() = Some(conn.clone());
-
-        // 发送 Register 消息
+        // 使用局部 conn 完成注册——仅在注册完全成功后才更新 self.conn。
+        // 这样若注册失败，self.conn 保持旧值（或 None），reconnect_peer 不会误判连接正常。
         let register_msg = self.client.create_register_message()?;
-        let response = self.request_response(&register_msg).await?;
-
-        // 处理注册响应
+        let response = self.request_response(&conn, &register_msg).await?;
         self.client.handle_register_response(&response)?;
 
+        // 注册成功后，替换 self.conn 并关闭旧连接。
+        if let Some(old) = self.conn.write().replace(conn.clone()) {
+            debug!("重连：显式关闭旧 relay 连接");
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
+
         // 启动后台接收 task。
-        // 每次连接都启动新的接收循环（旧连接的循环会因 conn.close 自然退出），
-        // 不使用 recv_started 守卫——重连后旧标志仍为 true 会导致新连接无接收循环。
         self.start_recv_loop(conn.clone());
 
         // 启动心跳 task（每 30s 发送 Ping，连续 2 次超时则关闭连接触发重连）。
@@ -208,12 +209,12 @@ impl RelayClientTransport {
     /// 通过 bi-stream 发送请求并等待响应。
     ///
     /// 使用独立 bi-stream 避免队头阻塞。
-    async fn request_response(&self, msg: &RelayMessage) -> CoreResult<RelayMessage> {
-        let conn = self
-            .conn
-            .read()
-            .clone()
-            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
+    /// 接受外部传入的 `conn`，使调用方可以在更新 `self.conn` 之前完成注册。
+    async fn request_response(
+        &self,
+        conn: &quinn::Connection,
+        msg: &RelayMessage,
+    ) -> CoreResult<RelayMessage> {
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -544,7 +545,12 @@ impl RelayClientTransport {
     pub async fn forward(&self, target: &PeerId, data: Vec<u8>) -> CoreResult<()> {
         let encrypted = self.encrypt_if_session(target, data)?;
         let forward_msg = self.client.create_forward_message(target, encrypted)?;
-        let response = self.request_response(&forward_msg).await?;
+        let conn = self
+            .conn
+            .read()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
+        let response = self.request_response(&conn, &forward_msg).await?;
         match response {
             RelayMessage::ForwardOk => Ok(()),
             RelayMessage::ForwardFailed { reason } => {
@@ -1354,7 +1360,11 @@ mod tests {
         client.connect_and_register().await.unwrap();
 
         // 直接通过 bi-stream 发送 Ping，验证收到 Pong（心跳 send_ping 的核心路径）
-        let resp = client.request_response(&RelayMessage::Ping).await.unwrap();
+        let conn = client.conn.read().clone().unwrap();
+        let resp = client
+            .request_response(&conn, &RelayMessage::Ping)
+            .await
+            .unwrap();
         assert!(matches!(resp, RelayMessage::Pong), "期望 Pong 响应");
 
         client.disconnect().await;
