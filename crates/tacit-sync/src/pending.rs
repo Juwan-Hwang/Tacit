@@ -9,10 +9,11 @@
 //! - 到达上限后不报致命错误，降级为后台静默拉取。
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tacit_core::{BlockId, DocId, Frontier, PeerId};
+use tacit_store::{dao, Store};
 
 /// 退避阶段：区分正常重试与降级后的后台静默拉取。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -265,6 +266,139 @@ impl PendingFetchQueue {
     /// 队列是否为空。
     pub fn is_empty(&self) -> bool {
         self.entries.lock().is_empty()
+    }
+
+    // ===== 持久化 =====
+
+    /// 将所有内存条目持久化到 `block_sync_state` 表。
+    ///
+    /// 在引擎关闭或定期 checkpoint 时调用。
+    /// `retry_at: Instant` 转为 epoch 毫秒时间戳存储。
+    /// `retries` 和 `phase` 不持久化——重启后重置为 0 / Normal，
+    /// 这意味着退避从头开始，对用户体验无实质影响。
+    pub fn persist(&self, store: &Store) {
+        let entries = self.entries.lock();
+        if entries.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        // 收集所有条目的快照（clone），随后释放 entries 锁。
+        let entries_vec: Vec<_> = entries.values().cloned().collect();
+        drop(entries);
+
+        // 使用事务批量写入，避免 autocommit 模式下每条记录触发独立磁盘写入。
+        let conn = store.conn();
+        if let Err(e) = store.transaction_with_conn(&conn, |conn| {
+            for fetch in &entries_vec {
+                let retry_after_ms = if fetch.retry_at > now {
+                    let delta = fetch.retry_at.duration_since(now).as_millis() as i64;
+                    now_epoch + delta
+                } else {
+                    now_epoch
+                };
+                let rec = dao::BlockSyncStateRecord {
+                    doc_id: fetch.doc_id.clone(),
+                    block_id: fetch.block_id.clone(),
+                    peer_id: fetch.peer_id.clone(),
+                    expected_frontier: fetch.expected_frontier.clone(),
+                    observed_frontier: fetch.observed_frontier.clone(),
+                    retry_after_ms,
+                    updated_at: SystemTime::now(),
+                };
+                if let Err(e) = dao::upsert_block_sync_state(conn, &rec) {
+                    tracing::warn!(
+                        doc_id = %fetch.doc_id,
+                        block_id = %fetch.block_id,
+                        error = %e,
+                        "持久化 block_sync_state 失败"
+                    );
+                }
+            }
+            Ok(())
+        }) {
+            tracing::warn!(error = %e, "persist 事务提交失败");
+        }
+    }
+
+    /// 从 `block_sync_state` 表恢复所有待拉取条目到内存。
+    ///
+    /// 在引擎启动时调用。已过期的条目（`retry_after_ms <= now`）
+    /// 的 `retry_at` 设为 `Instant::now()`（立即可重试）。
+    pub fn restore(&self, store: &Store) {
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let conn = store.conn();
+        let records = match dao::list_pending_blocks(&conn, i64::MAX) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "恢复 block_sync_state 失败");
+                return;
+            }
+        };
+        drop(conn);
+
+        let now = Instant::now();
+        for rec in records {
+            let retry_at = if rec.retry_after_ms <= now_epoch {
+                now
+            } else {
+                now + Duration::from_millis((rec.retry_after_ms - now_epoch) as u64)
+            };
+            self.enqueue(PendingBlockFetch {
+                doc_id: rec.doc_id,
+                block_id: rec.block_id,
+                expected_frontier: rec.expected_frontier,
+                observed_frontier: rec.observed_frontier,
+                peer_id: rec.peer_id,
+                retry_at,
+                retries: 0,
+                phase: BackoffPhase::Normal,
+            });
+        }
+        tracing::info!(
+            restored = self.len(),
+            "从 block_sync_state 恢复依赖等待队列"
+        );
+    }
+
+    /// 从 `block_sync_state` 表中删除指定条目。
+    ///
+    /// 在拉取成功后调用，确保重启后不会恢复已完成的条目。
+    pub fn remove_persisted(
+        &self,
+        store: &Store,
+        doc_id: &DocId,
+        block_id: &BlockId,
+        peer_id: &PeerId,
+    ) {
+        let conn = store.conn();
+        if let Err(e) = conn.execute(
+            "DELETE FROM block_sync_state WHERE doc_id = ?1 AND block_id = ?2 AND peer_id = ?3",
+            rusqlite::params![doc_id.as_str(), block_id.as_str(), peer_id.as_str()],
+        ) {
+            tracing::warn!(
+                doc_id = %doc_id,
+                block_id = %block_id,
+                error = %e,
+                "删除 block_sync_state 记录失败"
+            );
+        }
+    }
+
+    /// 清空 `block_sync_state` 表中的所有记录。
+    pub fn clear_persisted(&self, store: &Store) {
+        let conn = store.conn();
+        if let Err(e) = conn.execute_batch("DELETE FROM block_sync_state") {
+            tracing::warn!(error = %e, "清空 block_sync_state 表失败");
+        }
     }
 }
 
