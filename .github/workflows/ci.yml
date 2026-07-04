@@ -12,12 +12,12 @@ env:
 
 jobs:
   test:
-    name: Test & Lint
+    name: Test & Lint (${{ matrix.os }} / Rust ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         rust: [stable, "1.96.0"]
 
     steps:
@@ -34,6 +34,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libdbus-1-dev pkg-config
+
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -54,16 +58,11 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-targets --all-features
 
-      - name: Clippy (Windows)
+      - name: Clippy (Windows/macOS)
         if: matrix.os != 'ubuntu-latest'
         run: cargo clippy --all-targets
 
-      - name: Test (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test --all --verbose
-
-      - name: Test (Windows)
-        if: matrix.os != 'ubuntu-latest'
+      - name: Test
         run: cargo test --all --verbose
 
   cross-compile:

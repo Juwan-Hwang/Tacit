@@ -203,6 +203,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    /// 轮询等待条件满足，最多等待 `timeout`。避免固定 sleep 在 CI 上 flaky。
+    async fn wait_for<F: Fn() -> bool>(cond: F, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond() {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn doc_actor_serializes_ops() {
         let registry = DocExecutorRegistry::new();
@@ -233,8 +244,12 @@ mod tests {
                 .unwrap();
         }
 
-        // 等待所有操作完成（给 spawn_blocking 线程池足够时间）
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // 轮询等待所有操作完成（CI 环境线程调度延迟较大，固定 sleep 不可靠）
+        wait_for(
+            || counter.load(Ordering::SeqCst) == 10,
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(counter.load(Ordering::SeqCst), 10);
         // 应串行执行，最大并发为 1
         assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
@@ -259,8 +274,12 @@ mod tests {
                 .unwrap();
         }
 
-        // 等待完成
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 轮询等待完成（CI 环境线程调度延迟较大，固定 sleep 不可靠）
+        wait_for(
+            || counter.load(Ordering::SeqCst) == 2,
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
