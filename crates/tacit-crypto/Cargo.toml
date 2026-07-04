@@ -20,6 +20,8 @@ ed25519-dalek.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rand = { workspace = true, features = ["std_rng"] }
+tracing.workspace = true

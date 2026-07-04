@@ -5,6 +5,7 @@
 //! - 提供 peer/ack/snapshot/checkpoint/block_sync_state/transport_stats 等 DAO。
 //! - 快照安装通过事务保证原子性（双缓冲由调用方配合临时行 + 原子切换实现）。
 
+pub mod compression;
 pub mod dao;
 pub mod store;
 
