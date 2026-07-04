@@ -179,7 +179,12 @@ impl RelayClientTransport {
             .map_err(|e| CoreError::Transport(format!("连接 relay 失败: {e}")))?;
         debug!(addr = %self.relay_addr, "已连接 relay 服务端");
 
-        *self.conn.write() = Some(conn.clone());
+        // 显式关闭旧连接（重连场景）：避免旧连接资源泄漏与服务端重复注册。
+        // 旧连接的 recv_loop / heartbeat 会因 conn.close 自然退出。
+        if let Some(old) = self.conn.write().replace(conn.clone()) {
+            debug!("重连：显式关闭旧 relay 连接");
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
 
         // 发送 Register 消息
         let register_msg = self.client.create_register_message()?;

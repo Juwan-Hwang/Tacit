@@ -654,3 +654,172 @@ fn noise_handshake_and_encrypted_sync() {
         "错误公钥应验签失败"
     );
 }
+
+// ===== Noise rekey 前向安全性 =====
+
+#[test]
+fn noise_rekey_preserves_sync_communication() {
+    use tacit_crypto::{DeviceIdentity, NoiseHandshake};
+
+    let id1 = DeviceIdentity::generate().unwrap();
+    let id2 = DeviceIdentity::generate().unwrap();
+
+    let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
+    let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+
+    let msg1 = init.step(None).unwrap();
+    let msg2 = resp.step(Some(&msg1)).unwrap();
+    let msg3 = init.step(Some(&msg2)).unwrap();
+    let _ = resp.step(Some(&msg3)).unwrap();
+
+    let r1 = init.into_transport().unwrap();
+    let r2 = resp.into_transport().unwrap();
+    let (mut s1, mut s2) = (r1.session, r2.session);
+
+    // rekey 前通信
+    let ct = s1.encrypt(b"before rekey").unwrap();
+    assert_eq!(s2.decrypt(&ct).unwrap(), b"before rekey");
+
+    // 双方 rekey
+    s1.rekey().unwrap();
+    s2.rekey().unwrap();
+
+    // rekey 后通信仍正常
+    let ct = s1.encrypt(b"after rekey").unwrap();
+    assert_eq!(s2.decrypt(&ct).unwrap(), b"after rekey");
+
+    // 计数器已重置
+    assert_eq!(s1.encrypt_count(), 1);
+    assert_eq!(s2.decrypt_count(), 1);
+}
+
+// ===== Snapshot zstd 压缩端到端 =====
+
+#[test]
+fn snapshot_compression_roundtrip_through_store() {
+    use tacit_core::SnapshotKind;
+    use tacit_store::dao;
+
+    let store = Store::open_memory().unwrap();
+    let doc_id = DocId::new("compress-doc");
+    let snapshot_id = tacit_core::CheckpointId::new("snap-1");
+
+    // 构造大 snapshot（高度可压缩的重复数据）
+    let large_blob = b"repeat pattern ".repeat(500); // ~7000 bytes
+
+    let conn = store.conn();
+    dao::insert_snapshot(
+        &conn,
+        &doc_id,
+        &snapshot_id,
+        &large_blob,
+        SnapshotKind::Full,
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+
+    // 读回并解压
+    let (id, blob, kind, _) = dao::get_latest_snapshot(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(id, snapshot_id);
+    assert_eq!(blob, large_blob);
+    assert_eq!(kind, SnapshotKind::Full);
+
+    // 精确查找也正常
+    let (blob2, _, _) = dao::get_snapshot(&conn, &doc_id, &snapshot_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(blob2, large_blob);
+}
+
+// ===== PendingFetchQueue 持久化/恢复 =====
+
+#[test]
+fn pending_queue_persistence_roundtrip() {
+    use std::time::{Duration, Instant};
+    use tacit_sync::{BackoffPhase, PendingBlockFetch, PendingFetchQueue};
+
+    let store = Store::open_memory().unwrap();
+    let q = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
+
+    // 入队 3 个条目
+    let now = Instant::now();
+    q.enqueue(PendingBlockFetch {
+        doc_id: DocId::new("d1"),
+        block_id: BlockId::new("b1"),
+        expected_frontier: tacit_core::Frontier::new(),
+        observed_frontier: tacit_core::Frontier::new(),
+        peer_id: pid(1),
+        retry_at: now + Duration::from_secs(10),
+        retries: 5,
+        phase: BackoffPhase::Background,
+    });
+    q.enqueue(PendingBlockFetch {
+        doc_id: DocId::new("d1"),
+        block_id: BlockId::new("b2"),
+        expected_frontier: tacit_core::Frontier::new(),
+        observed_frontier: tacit_core::Frontier::new(),
+        peer_id: pid(2),
+        retry_at: now,
+        retries: 0,
+        phase: BackoffPhase::Normal,
+    });
+    assert_eq!(q.len(), 2);
+
+    // 持久化
+    q.persist(&store);
+
+    // 创建新队列并恢复
+    let q2 = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
+    q2.restore(&store);
+    assert_eq!(q2.len(), 2, "应恢复 2 个条目");
+
+    // 验证恢复的条目（retries 和 phase 重置）
+    assert_eq!(
+        q2.get(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)),
+        Some(0),
+        "retries 应重置为 0"
+    );
+    assert_eq!(
+        q2.phase(&DocId::new("d1"), &BlockId::new("b1"), &pid(1)),
+        BackoffPhase::Normal,
+        "phase 应重置为 Normal"
+    );
+
+    // 清理持久化数据
+    q2.clear_persisted(&store);
+    let q3 = PendingFetchQueue::new(Duration::from_millis(200), Duration::from_secs(2));
+    q3.restore(&store);
+    assert_eq!(q3.len(), 0, "清空后应无条目");
+}
+
+// ===== 冷 block GC 集成 =====
+
+#[tokio::test]
+async fn cold_block_gc_integration() {
+    use std::time::Duration;
+    use tacit_crdt::{BlockDoc, BlockDocCache};
+
+    let cache = BlockDocCache::new(2); // 小容量，强制 LRU 驱逐
+
+    // 插入 5 个 block，容量 2，应驱逐 3 个到 cold 区（insert 内部自动保存 snapshot）
+    for i in 0..5 {
+        let block_id = BlockId::new(format!("gc-block-{i}"));
+        let doc = Arc::new(
+            BlockDoc::new(
+                block_id.clone(),
+                tacit_core::BlockKind::Text,
+                &tacit_core::PeerId("1".into()),
+            )
+            .unwrap(),
+        );
+        cache.insert(block_id, doc);
+    }
+
+    // cold 区应有被驱逐的 block snapshot
+    assert!(cache.cold_len() > 0, "应有 cold 条目");
+
+    // cleanup_stale_cold(max_age=0) 应清理所有过期条目
+    let cleaned = cache.cleanup_stale_cold(Duration::from_secs(0));
+    assert!(cleaned > 0, "应清理至少一个 cold 条目");
+    assert_eq!(cache.cold_len(), 0, "清理后 cold 区应为空");
+}

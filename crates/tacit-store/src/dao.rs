@@ -11,6 +11,8 @@ use tacit_core::{
     NatCapability, PeerId, PeerRecord, SnapshotKind, TrustState,
 };
 
+use crate::compression;
+
 // ===== 序列化辅助 =====
 
 fn ser_frontier(f: &Frontier) -> String {
@@ -127,13 +129,14 @@ pub fn insert_snapshot(
     kind: SnapshotKind,
     created_at: SystemTime,
 ) -> CoreResult<()> {
+    let compressed = compression::compress(blob);
     conn.execute(
         "INSERT OR REPLACE INTO document_snapshots (doc_id, snapshot_id, snapshot_blob, snapshot_kind, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             doc_id.as_str(),
             snapshot_id.as_str(),
-            blob,
+            &compressed,
             ser_json(&kind),
             to_millis(created_at),
         ],
@@ -164,7 +167,7 @@ pub fn get_latest_snapshot(
     match row {
         Some((id, blob, kind, created)) => Ok(Some((
             CheckpointId::new(id),
-            blob,
+            compression::decompress(&blob)?,
             de_json(&kind).unwrap_or(SnapshotKind::Full),
             from_millis(created),
         ))),
@@ -193,7 +196,7 @@ pub fn get_snapshot(
         .map_err(store_err)?;
     match row {
         Some((blob, kind, created)) => Ok(Some((
-            blob,
+            compression::decompress(&blob)?,
             de_json(&kind).unwrap_or(SnapshotKind::Full),
             from_millis(created),
         ))),
