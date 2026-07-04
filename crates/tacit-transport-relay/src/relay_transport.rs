@@ -66,13 +66,16 @@ pub struct RelayClientTransport {
     push_handler: PushHandler,
     /// 心跳 task 的关闭信号（disconnect 时发送）。
     heartbeat_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    /// 连接锁：串行化 connect_and_register 的临界区，
+    /// 防止并发重连导致 conn 替换与心跳更新之间的竞态条件。
+    connect_lock: Mutex<()>,
     /// relay 服务端层级。
     tier: RelayTier,
     /// E2E 加密会话表：peer_id -> Session。
     ///
     /// 由集成层在 Noise 握手完成后注入。注册后，所有经 relay 转发的
     /// payload（帧类型 + JSON）会被透明加密/解密，relay 服务端仅看到密文。
-    /// 未注册 session 的 peer 仍以明文传输（向后兼容）。
+    /// 未注册 session 的 peer 通信将被拒绝（强制 E2E 加密）。
     sessions: Arc<RwLock<HashMap<PeerId, Arc<Mutex<Session>>>>>,
 }
 
@@ -109,6 +112,7 @@ impl RelayClientTransport {
             client_config: RwLock::new(client_config),
             push_handler: Arc::new(RwLock::new(None)),
             heartbeat_shutdown: Mutex::new(None),
+            connect_lock: Mutex::new(()),
             tier,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -137,14 +141,16 @@ impl RelayClientTransport {
         self.sessions.write().remove(peer_id);
     }
 
-    /// 加密 payload（若该 peer 已注册 session），否则返回原始 payload。
+    /// 加密 payload。若该 peer 未注册 session，返回错误（强制 E2E 加密）。
     fn encrypt_if_session(&self, peer_id: &PeerId, plaintext: Vec<u8>) -> CoreResult<Vec<u8>> {
         match self.sessions.read().get(peer_id) {
             Some(session) => {
                 let mut s = session.lock();
                 s.encrypt(&plaintext)
             }
-            None => Ok(plaintext),
+            None => Err(CoreError::Transport(format!(
+                "peer {peer_id} 未注册 E2E 加密会话，拒绝明文传输"
+            ))),
         }
     }
 
@@ -179,18 +185,39 @@ impl RelayClientTransport {
             .map_err(|e| CoreError::Transport(format!("连接 relay 失败: {e}")))?;
         debug!(addr = %self.relay_addr, "已连接 relay 服务端");
 
-        *self.conn.write() = Some(conn.clone());
+        // 使用局部 conn 完成注册——仅在注册完全成功后才更新 self.conn。
+        // 这样若注册失败，self.conn 保持旧值（或 None），reconnect_peer 不会误判连接正常。
+        // 注册失败时显式关闭 conn，防止 QUIC 连接泄漏。
+        let register_msg = match self.client.create_register_message() {
+            Ok(msg) => msg,
+            Err(e) => {
+                conn.close(0u32.into(), b"register message creation failed");
+                return Err(e);
+            }
+        };
+        let response = match self.request_response(&conn, &register_msg).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                conn.close(0u32.into(), b"registration request failed");
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.handle_register_response(&response) {
+            conn.close(0u32.into(), b"registration response rejected");
+            return Err(e);
+        }
 
-        // 发送 Register 消息
-        let register_msg = self.client.create_register_message()?;
-        let response = self.request_response(&register_msg).await?;
+        // 临界区：串行化 conn 替换 + 心跳更新，防止并发 connect_and_register
+        // 导致活跃连接丢失心跳任务的竞态条件。
+        let _connect_guard = self.connect_lock.lock();
 
-        // 处理注册响应
-        self.client.handle_register_response(&response)?;
+        // 注册成功后，替换 self.conn 并关闭旧连接。
+        if let Some(old) = self.conn.write().replace(conn.clone()) {
+            debug!("重连：显式关闭旧 relay 连接");
+            old.close(0u32.into(), b"superseded by reconnect");
+        }
 
         // 启动后台接收 task。
-        // 每次连接都启动新的接收循环（旧连接的循环会因 conn.close 自然退出），
-        // 不使用 recv_started 守卫——重连后旧标志仍为 true 会导致新连接无接收循环。
         self.start_recv_loop(conn.clone());
 
         // 启动心跳 task（每 30s 发送 Ping，连续 2 次超时则关闭连接触发重连）。
@@ -208,12 +235,12 @@ impl RelayClientTransport {
     /// 通过 bi-stream 发送请求并等待响应。
     ///
     /// 使用独立 bi-stream 避免队头阻塞。
-    async fn request_response(&self, msg: &RelayMessage) -> CoreResult<RelayMessage> {
-        let conn = self
-            .conn
-            .read()
-            .clone()
-            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
+    /// 接受外部传入的 `conn`，使调用方可以在更新 `self.conn` 之前完成注册。
+    async fn request_response(
+        &self,
+        conn: &quinn::Connection,
+        msg: &RelayMessage,
+    ) -> CoreResult<RelayMessage> {
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -379,7 +406,13 @@ impl RelayClientTransport {
                                 }
                             }
                         }
-                        None => data,
+                        None => {
+                            warn!(
+                                peer = %from,
+                                "未注册 E2E 加密会话，丢弃明文消息",
+                            );
+                            continue;
+                        }
                     };
                     let msg = RelayMessage::Incoming {
                         from_peer_id: pid,
@@ -419,11 +452,13 @@ impl RelayClientTransport {
                                 }
                             }
                             if buf.is_empty() {
+                                // 发送占位消息保持序列号连续性，
+                                // 否则 watermark 永远无法推进导致解密循环死锁
+                                let _ = decrypt_tx.send((seq, String::new(), Vec::new())).await;
                                 return;
                             }
                             match RelayMessage::from_bytes(&buf) {
                                 Ok(msg) => {
-                                    // Incoming 需要解密：携带 seq 交给重排序队列
                                     if let RelayMessage::Incoming { from_peer_id, data } = msg {
                                         if let Err(e) =
                                             decrypt_tx.send((seq, from_peer_id, data)).await
@@ -441,10 +476,15 @@ impl RelayClientTransport {
                                                 h(event);
                                             }
                                         }
+                                        // 发送占位消息保持序列号连续性
+                                        let _ =
+                                            decrypt_tx.send((seq, String::new(), Vec::new())).await;
                                     }
                                 }
                                 Err(e) => {
                                     warn!(error = %e, "解析推送消息失败");
+                                    // 发送占位消息保持序列号连续性
+                                    let _ = decrypt_tx.send((seq, String::new(), Vec::new())).await;
                                 }
                             }
                         });
@@ -544,7 +584,12 @@ impl RelayClientTransport {
     pub async fn forward(&self, target: &PeerId, data: Vec<u8>) -> CoreResult<()> {
         let encrypted = self.encrypt_if_session(target, data)?;
         let forward_msg = self.client.create_forward_message(target, encrypted)?;
-        let response = self.request_response(&forward_msg).await?;
+        let conn = self
+            .conn
+            .read()
+            .clone()
+            .ok_or_else(|| CoreError::Transport("未连接 relay 服务端".into()))?;
+        let response = self.request_response(&conn, &forward_msg).await?;
         match response {
             RelayMessage::ForwardOk => Ok(()),
             RelayMessage::ForwardFailed { reason } => {
@@ -1110,15 +1155,19 @@ mod tests {
         // 等待服务端就绪
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // 创建 client1
+        // 建立 E2E 加密会话
+        let (session1, session2) = establish_e2e_sessions();
+
+        // 创建 client1，注册到 peer2 的 session
         let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
             .await
             .unwrap();
         client1.set_default_client_config(client_config.clone());
+        client1.register_session(PeerId::new("2"), session1);
         client1.connect_and_register().await.unwrap();
         assert!(client1.is_registered());
 
-        // 创建 client2，设置推送回调
+        // 创建 client2，注册到 peer1 的 session
         let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
             .await
             .unwrap();
@@ -1127,6 +1176,7 @@ mod tests {
         client2.set_push_handler(move |event| {
             received_clone.lock().push(event);
         });
+        client2.register_session(PeerId::new("1"), session2);
         client2.set_default_client_config(client_config);
         client2.connect_and_register().await.unwrap();
         assert!(client2.is_registered());
@@ -1354,7 +1404,11 @@ mod tests {
         client.connect_and_register().await.unwrap();
 
         // 直接通过 bi-stream 发送 Ping，验证收到 Pong（心跳 send_ping 的核心路径）
-        let resp = client.request_response(&RelayMessage::Ping).await.unwrap();
+        let conn = client.conn.read().clone().unwrap();
+        let resp = client
+            .request_response(&conn, &RelayMessage::Ping)
+            .await
+            .unwrap();
         assert!(matches!(resp, RelayMessage::Pong), "期望 Pong 响应");
 
         client.disconnect().await;
@@ -1447,72 +1501,6 @@ mod tests {
                 assert_eq!(*from_peer_id, PeerId::new("1"));
                 // 收到的应是解密后的原始明文
                 assert_eq!(recv_data, &data, "E2E 解密后数据应匹配原始明文");
-            }
-            _ => panic!("期望 Incoming 事件"),
-        }
-
-        client1.disconnect().await;
-        client2.disconnect().await;
-    }
-
-    #[tokio::test]
-    async fn relay_e2e_unencrypted_backward_compatible() {
-        // 验证：未注册 session 时，仍以明文传输（向后兼容）。
-        let (cert, key) = generate_self_signed_cert().unwrap();
-        let client_config = make_client_config(cert.clone()).unwrap();
-        let secret = b"relay_compat_secret".to_vec();
-        let runner = Arc::new(
-            RelayServerRunner::with_cert(secret.clone(), "127.0.0.1:0".parse().unwrap(), cert, key)
-                .await
-                .unwrap(),
-        );
-        let server_addr = runner.local_addr().unwrap();
-        let runner_clone = runner.clone();
-        tokio::spawn(async move {
-            runner_clone.run().await.unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // 不注册 session — 明文传输
-        let client1 = RelayClientTransport::new(PeerId::new("1"), secret.clone(), server_addr)
-            .await
-            .unwrap();
-        client1.set_default_client_config(client_config.clone());
-        client1.connect_and_register().await.unwrap();
-
-        let client2 = RelayClientTransport::new(PeerId::new("2"), secret.clone(), server_addr)
-            .await
-            .unwrap();
-        let received = Arc::new(Mutex::new(Vec::<RelayPushEvent>::new()));
-        let received_clone = received.clone();
-        client2.set_push_handler(move |event| {
-            received_clone.lock().push(event);
-        });
-        client2.set_default_client_config(client_config);
-        client2.connect_and_register().await.unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let data = b"plaintext via relay".to_vec();
-        client1
-            .forward(&PeerId::new("2"), data.clone())
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let events = {
-            let guard = received.lock();
-            guard.clone()
-        };
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            RelayPushEvent::Incoming {
-                from_peer_id,
-                data: recv_data,
-            } => {
-                assert_eq!(*from_peer_id, PeerId::new("1"));
-                assert_eq!(recv_data, &data);
             }
             _ => panic!("期望 Incoming 事件"),
         }
