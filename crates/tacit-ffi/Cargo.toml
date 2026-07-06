@@ -11,6 +11,7 @@ description = "UniFFI API、命令总线、回调事件桥接"
 [dependencies]
 tacit-core.workspace = true
 tacit-crdt.workspace = true
+tacit-crypto.workspace = true
 tacit-store.workspace = true
 tacit-sync.workspace = true
 tacit-transport.workspace = true
@@ -24,6 +25,7 @@ crossbeam-channel.workspace = true
 uniffi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,11 +14,12 @@ pub mod pairing;
 pub mod session;
 pub mod signature;
 
-pub use identity::{DeviceIdentity, PeerPubkey};
-pub use noise::{HandshakeResult, NoiseHandshake, NoiseRole};
+pub use identity::{verify_static_binding, DeviceIdentity, PeerPubkey, StaticKeypair};
+pub use noise::{HandshakeResult, NoiseHandshake, NoiseRole, NonceCache};
 pub use pairing::{
     compute_binding_digest, confirm_sas_code, derive_sas_code, format_sas_code,
-    generate_binding_salt, verify_binding, PairingPayload, PairingRole, PairingSession,
+    generate_binding_salt, validate_payload_structure, PairingPayload, PairingRole, PairingSession,
 };
+
 pub use session::Session;
 pub use signature::{sign, verify};

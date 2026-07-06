@@ -186,7 +186,7 @@ impl Store {
 
         // 获取连接锁，通过 transaction_with_conn 执行事务（避免 transaction 重入检测）
         let conn = self.conn();
-        self.transaction_with_conn(&conn, |conn| {
+        let result = self.transaction_with_conn(&conn, |conn| {
             // 1. 查找旧 pending snapshot
             let old_pending = dao::get_latest_snapshot(conn, &doc_id)?
                 .map(|(id, _, _, _)| id)
@@ -260,7 +260,17 @@ impl Store {
             }
 
             Ok(())
-        })
+        });
+
+        // #40: 事务成功后执行 PASSIVE WAL checkpoint（而非 FULL），
+        // 让 SQLite 在后台异步将 WAL 帧写入主数据库文件。
+        // FULL checkpoint 在每次 snapshot 时同步刷盘，在移动端会导致 UI 卡顿和高耗电；
+        // PASSIVE 模式不会阻塞，依赖 SQLite 自动 checkpoint（默认 1000 页触发）
+        // 加上 snapshot 事务本身的 commit 已确保数据持久化（WAL + synchronous=NORMAL）。
+        if result.is_ok() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        }
+        result
     }
 }
 
@@ -430,6 +440,16 @@ CREATE INDEX IF NOT EXISTS idx_acks_doc ON acks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_transport_stats_peer ON transport_stats(peer_id, channel);
 CREATE INDEX IF NOT EXISTS idx_sync_log_recipient ON sync_log(recipient_peer_id, delivered_at);
 CREATE INDEX IF NOT EXISTS idx_sync_log_ack ON sync_log(acknowledged_at);
+
+-- #4: 设备身份持久化表（单行表，id 固定为 'default'）
+CREATE TABLE IF NOT EXISTS device_identity (
+    id              TEXT PRIMARY KEY DEFAULT 'default',
+    signing_key     BLOB NOT NULL,
+    static_private  BLOB NOT NULL,
+    static_public   BLOB NOT NULL,
+    binding_proof   BLOB NOT NULL,
+    created_at      INTEGER NOT NULL
+);
 "#;
 
 #[cfg(test)]
@@ -718,5 +738,260 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(new_pending.0, b"snap2");
+    }
+
+    // ===== #47: DAO 边界/错误路径测试 =====
+
+    #[test]
+    fn dao_sql_injection_in_doc_id() {
+        // SQL 注入 payload 作为 doc_id：验证参数化查询防止注入
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let malicious_ids = [
+            "'; DROP TABLE documents;--",
+            "doc1' OR '1'='1",
+            // 注释：SQLite 不支持 null byte（\u{0000}），会导致 NulError
+            // "doc1\u{0000}",
+        ];
+        for &id in &malicious_ids {
+            let rec = dao::DocRecord {
+                doc_id: tacit_core::DocId::new(id),
+                kind: "note".into(),
+                current_frontier: Frontier::new(),
+                current_snapshot_id: None,
+                updated_at: SystemTime::now(),
+            };
+            assert!(
+                dao::upsert_doc(&conn, &rec).is_ok(),
+                "upsert 应成功（参数化查询）"
+            );
+            let got = dao::get_doc(&conn, &tacit_core::DocId::new(id)).unwrap();
+            assert!(got.is_some(), "应能读回 doc_id={}", id);
+        }
+        // 验证 documents 表未被删除
+        let docs = dao::list_docs(&conn).unwrap();
+        assert_eq!(
+            docs.len(),
+            malicious_ids.len(),
+            "所有 doc 应存在，表未被注入破坏"
+        );
+    }
+
+    #[test]
+    fn dao_empty_and_long_strings() {
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        // 空字符串 doc_id
+        let rec = dao::DocRecord {
+            doc_id: tacit_core::DocId::new(""),
+            kind: "note".into(),
+            current_frontier: Frontier::new(),
+            current_snapshot_id: None,
+            updated_at: SystemTime::now(),
+        };
+        assert!(dao::upsert_doc(&conn, &rec).is_ok());
+        let got = dao::get_doc(&conn, &tacit_core::DocId::new("")).unwrap();
+        assert!(got.is_some(), "空字符串 doc_id 应可读写");
+
+        // 非常长的 doc_id（10KB）
+        let long_id = "x".repeat(10_000);
+        let rec = dao::DocRecord {
+            doc_id: tacit_core::DocId::new(&long_id),
+            kind: "note".into(),
+            current_frontier: Frontier::new(),
+            current_snapshot_id: None,
+            updated_at: SystemTime::now(),
+        };
+        assert!(dao::upsert_doc(&conn, &rec).is_ok());
+        let got = dao::get_doc(&conn, &tacit_core::DocId::new(&long_id)).unwrap();
+        assert!(got.is_some(), "10KB doc_id 应可读写");
+    }
+
+    #[test]
+    fn dao_snapshot_with_null_bytes() {
+        // 验证包含 null byte 的二进制数据能正确存取
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let doc_id = tacit_core::DocId::new("d1");
+        dao::upsert_doc(
+            &conn,
+            &dao::DocRecord {
+                doc_id: doc_id.clone(),
+                kind: "note".into(),
+                current_frontier: Frontier::new(),
+                current_snapshot_id: None,
+                updated_at: SystemTime::now(),
+            },
+        )
+        .unwrap();
+
+        let payload = vec![0x00, 0xFF, 0x00, 0x42, 0x00, 0x00, 0x01];
+        let snap_id = tacit_core::CheckpointId::new("snap1");
+        dao::insert_snapshot(
+            &conn,
+            &doc_id,
+            &snap_id,
+            &payload,
+            tacit_core::SnapshotKind::Full,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let got = dao::get_snapshot(&conn, &doc_id, &snap_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.0, payload, "含 null byte 的二进制数据应完整存取");
+    }
+
+    #[test]
+    fn dao_duplicate_key_upsert() {
+        // 验证 upsert 在重复 key 时更新而非报错
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let doc_id = tacit_core::DocId::new("d1");
+
+        for &kind in &["note", "log", "todo"] {
+            dao::upsert_doc(
+                &conn,
+                &dao::DocRecord {
+                    doc_id: doc_id.clone(),
+                    kind: kind.to_string(),
+                    current_frontier: Frontier::new(),
+                    current_snapshot_id: None,
+                    updated_at: SystemTime::now(),
+                },
+            )
+            .unwrap();
+        }
+
+        let got = dao::get_doc(&conn, &doc_id).unwrap().unwrap();
+        assert_eq!(got.kind, "todo", "upsert 应更新为最后一次写入");
+    }
+
+    #[test]
+    fn dao_device_identity_roundtrip() {
+        // #4: 设备身份持久化 roundtrip
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+
+        // 首次加载应为 None
+        assert!(dao::load_device_identity(&conn).unwrap().is_none());
+
+        // 保存
+        let rec = dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(vec![0x01; 32]),
+            static_private: zeroize::Zeroizing::new(vec![0x02; 32]),
+            static_public: vec![0x03; 32],
+            binding_proof: vec![0x04; 64],
+            created_at: SystemTime::now(),
+        };
+        dao::save_device_identity(&conn, &rec).unwrap();
+
+        // 加载并验证
+        let loaded = dao::load_device_identity(&conn).unwrap().unwrap();
+        assert_eq!(&*loaded.signing_key, &*rec.signing_key);
+        assert_eq!(&*loaded.static_private, &*rec.static_private);
+        assert_eq!(loaded.static_public, rec.static_public);
+        assert_eq!(loaded.binding_proof, rec.binding_proof);
+
+        // 覆盖写入应失败（INSERT 防止静默覆盖）
+        let rec2 = dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(vec![0xAA; 32]),
+            static_private: zeroize::Zeroizing::new(vec![0xBB; 32]),
+            static_public: vec![0xCC; 32],
+            binding_proof: vec![0xDD; 64],
+            created_at: SystemTime::now(),
+        };
+        assert!(
+            dao::save_device_identity(&conn, &rec2).is_err(),
+            "INSERT 应在已存在身份时失败，防止静默覆盖"
+        );
+
+        // 原身份应保持不变
+        let loaded2 = dao::load_device_identity(&conn).unwrap().unwrap();
+        assert_eq!(loaded2.signing_key, rec.signing_key, "原身份不应被覆盖");
+    }
+
+    #[test]
+    fn dao_transaction_rollback_preserves_data() {
+        // 验证事务失败时数据不被部分写入
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let doc_id = tacit_core::DocId::new("d1");
+
+        // 先写入一条数据
+        dao::upsert_doc(
+            &conn,
+            &dao::DocRecord {
+                doc_id: doc_id.clone(),
+                kind: "note".into(),
+                current_frontier: Frontier::new(),
+                current_snapshot_id: None,
+                updated_at: SystemTime::now(),
+            },
+        )
+        .unwrap();
+
+        // 事务中写入第二条数据后失败
+        let result: CoreResult<()> = store.transaction_with_conn(&conn, |conn| {
+            dao::upsert_doc(
+                conn,
+                &dao::DocRecord {
+                    doc_id: tacit_core::DocId::new("d2"),
+                    kind: "note".into(),
+                    current_frontier: Frontier::new(),
+                    current_snapshot_id: None,
+                    updated_at: SystemTime::now(),
+                },
+            )?;
+            // 模拟失败
+            Err(CoreError::Store("故意失败".into()))
+        });
+        assert!(result.is_err());
+
+        // d2 不应存在（事务回滚）
+        let d2 = dao::get_doc(&conn, &tacit_core::DocId::new("d2")).unwrap();
+        assert!(d2.is_none(), "事务失败后 d2 不应存在");
+
+        // d1 仍应存在（事务前已提交）
+        let d1 = dao::get_doc(&conn, &doc_id).unwrap();
+        assert!(d1.is_some(), "d1 应仍存在（事务前已提交）");
+    }
+
+    #[test]
+    fn dao_large_snapshot_blob() {
+        // 验证大 blob（1MB）能正确存取
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn();
+        let doc_id = tacit_core::DocId::new("d1");
+        dao::upsert_doc(
+            &conn,
+            &dao::DocRecord {
+                doc_id: doc_id.clone(),
+                kind: "note".into(),
+                current_frontier: Frontier::new(),
+                current_snapshot_id: None,
+                updated_at: SystemTime::now(),
+            },
+        )
+        .unwrap();
+
+        let large_payload = vec![0xAB; 1024 * 1024]; // 1MB
+        let snap_id = tacit_core::CheckpointId::new("large_snap");
+        dao::insert_snapshot(
+            &conn,
+            &doc_id,
+            &snap_id,
+            &large_payload,
+            tacit_core::SnapshotKind::Full,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let got = dao::get_snapshot(&conn, &doc_id, &snap_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.0.len(), large_payload.len());
+        assert_eq!(got.0, large_payload, "1MB blob 应完整存取");
     }
 }
