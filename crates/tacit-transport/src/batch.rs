@@ -1,11 +1,18 @@
-//! 批次签名规则（v1.0 规范第 13.4 节）。
+//! 批次完整性标签规则（v1.0 规范第 13.4 节）。
 //!
-//! 同一 QUIC 流内、同一文档的连续 delta 构成一个签名批次。
+//! 同一 QUIC 流内、同一文档的连续 delta 构成一个完整性批次。
 //! flags 预留 2 bits 表示：单帧、批次开始、批次中间、批次结束。
 //!
-//! BatchSigner 管理签名批次的状态机：
-//! - 开始批次 → 收集帧 → 结束批次 → 计算签名
-//! - 签名覆盖批次内所有帧的 payload hash
+//! BatchSigner 管理完整性批次的状态机：
+//! - 开始批次 → 收集帧 → 结束批次 → 计算完整性标签
+//! - 标签覆盖批次内所有帧的 payload SHA256 哈希
+//!
+//! # 安全说明
+//!
+//! 此标签是 **SHA256 完整性哈希**，不是 Ed25519 签名。
+//! 它提供帧间一致性校验和意外损坏检测，不提供独立于
+//! Noise E2E 加密通道的身份认证或不可否认性。
+//! 在 Noise AEAD 通道内传输时，哈希足以保证完整性。
 
 use std::collections::HashMap;
 
@@ -79,7 +86,10 @@ impl BatchSigner {
         );
     }
 
-    /// 结束批次，返回签名（payload hash）。
+    /// 结束批次，返回完整性标签（payload SHA256 哈希）。
+    ///
+    /// 注意：此值是 SHA256 哈希而非密码学签名。
+    /// 完整性由 Noise AEAD 加密通道保证，此标签用于帧间一致性校验。
     pub fn end_batch(&self, peer_id: &PeerId, doc_id: &DocId) -> Option<Vec<u8>> {
         let mut batches = self.batches.lock();
         let key = (peer_id.clone(), doc_id.clone());
