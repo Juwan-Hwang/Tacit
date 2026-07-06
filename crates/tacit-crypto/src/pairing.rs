@@ -15,6 +15,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tacit_core::{CoreError, CoreResult};
 
 /// HMAC-SHA256 类型别名。
@@ -174,7 +175,9 @@ pub fn format_sas_code(sas: u32) -> String {
 /// 此函数实现 §12.1 推荐的"短校验码确认"步骤：
 /// 用户在两端屏幕上看到 4 位数字后，输入对端数字（或由 UI 直接比对）。
 pub fn confirm_sas_code(local: u32, remote: u32) -> CoreResult<()> {
-    if local == remote {
+    // #16: 使用常量时间比较，防止时序攻击。
+    // 虽然 SAS 是 4 位数字（用户可见，时序攻击风险极低），但代码应遵循安全比较最佳实践。
+    if local.ct_eq(&remote).into() {
         Ok(())
     } else {
         Err(CoreError::Crypto(format!(
@@ -256,7 +259,7 @@ impl PairingSession {
     /// 解析 `PairingPayload`，校验时效，计算 `binding_digest` 与 SAS 短码。
     pub fn responder_from_qr(qr_json: &str) -> CoreResult<Self> {
         let payload = PairingPayload::from_qr_json(qr_json)?;
-        if !verify_binding(&payload) {
+        if !validate_payload_structure(&payload) {
             return Err(CoreError::Crypto(
                 "配对 payload 校验失败：已过期或字段不合法".into(),
             ));
@@ -351,14 +354,18 @@ impl PairingSession {
 /// 配对 payload 最大有效期：5 分钟（300 秒）。
 pub const MAX_PAIRING_AGE_SECS: i64 = 300;
 
-/// 验证 payload 字段一致性：检查字段长度合法，校验 timestamp 时效，并确认 `binding_digest` 可正确计算。
+/// 验证 payload 结构合法性：检查字段长度、group_id 非空、timestamp 时效。
 ///
-/// 返回 `true` 表示 payload 结构合法、时效有效、可安全派生 `binding_digest` 与 SAS 短码；
+/// 返回 `true` 表示 payload 结构合法、时效有效；
 /// 返回 `false` 表示 payload 被篡改、畸形（字段长度不符或 group_id 为空）或已过期。
 ///
-/// 注意：此函数仅做结构校验。完整的端到端完整性由 SAS 短码人工确认完成——
+/// # 命名说明
+///
+/// 此函数原名 `verify_binding`，但实际不做绑定验证——它仅做结构校验。
+/// 完整的端到端完整性由 SAS 短码人工确认完成：
 /// 两端独立计算 `binding_digest` 并派生 SAS，用户比对数字一致后才完成绑定。
-pub fn verify_binding(payload: &PairingPayload) -> bool {
+/// 因此重命名为 `validate_payload_structure` 以准确反映其职责。
+pub fn validate_payload_structure(payload: &PairingPayload) -> bool {
     if payload.initiator_pubkey.len() != ED25519_PUBKEY_LEN {
         return false;
     }
@@ -373,16 +380,16 @@ pub fn verify_binding(payload: &PairingPayload) -> bool {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let age_secs = (now_ms - payload.timestamp).abs() / 1000;
+    let age_secs = match now_ms
+        .checked_sub(payload.timestamp)
+        .and_then(|diff| diff.checked_abs())
+    {
+        Some(diff) => diff / 1000,
+        None => return false,
+    };
     if age_secs > MAX_PAIRING_AGE_SECS {
         return false;
     }
-    // 重新计算摘要，确认无异常
-    let _ = compute_binding_digest(
-        &payload.group_id,
-        &payload.initiator_pubkey,
-        &payload.binding_salt,
-    );
     true
 }
 
@@ -519,28 +526,28 @@ mod tests {
     }
 
     #[test]
-    fn verify_binding_accepts_valid() {
+    fn validate_payload_structure_accepts_valid() {
         let payload = test_payload();
-        assert!(verify_binding(&payload));
+        assert!(validate_payload_structure(&payload));
     }
 
     #[test]
-    fn verify_binding_rejects_tampered() {
+    fn validate_payload_structure_rejects_tampered() {
         let mut payload = test_payload();
 
         // 篡改公钥长度
         payload.initiator_pubkey.pop();
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 恢复并篡改盐长度
         payload.initiator_pubkey = test_pubkey();
         payload.binding_salt.push(0x00);
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 恢复并清空 group_id
         payload.binding_salt = vec![0xA0; BINDING_SALT_LEN];
         payload.group_id.clear();
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 时效过期：使用 10 分钟前的时间戳
         let expired_ms = std::time::SystemTime::now()
@@ -556,7 +563,7 @@ mod tests {
             expired_ms,
         )
         .unwrap();
-        assert!(!verify_binding(&expired_payload));
+        assert!(!validate_payload_structure(&expired_payload));
     }
 
     #[test]
@@ -594,7 +601,7 @@ mod tests {
 
         // 3. 扫码方解析
         let parsed = PairingPayload::from_qr_json(&qr).unwrap();
-        assert!(verify_binding(&parsed));
+        assert!(validate_payload_structure(&parsed));
 
         // 4. 两端独立计算 binding_digest 与 SAS
         let digest_init = compute_binding_digest(&group_id, &pubkey, &salt);
@@ -782,18 +789,22 @@ mod tests {
     #[test]
     fn pairing_session_different_pubkeys_produce_different_sas() {
         let group_id = "diff-pubkey-group".to_string();
-        let pubkey_a: Vec<u8> = (0u8..32).collect();
-        let pubkey_b: Vec<u8> = (1u8..33).collect();
 
-        let session_a = PairingSession::initiator(group_id.clone(), pubkey_a, vec![]).unwrap();
-        let session_b = PairingSession::initiator(group_id, pubkey_b, vec![]).unwrap();
+        // SAS 短码为 4 位（0..=9999），存在 1/10000 的碰撞概率。
+        // 使用递增公钥直到找到产生不同 SAS 的 pair，避免 flaky 测试。
+        let mut found = false;
+        for i in 0u32..224 {
+            let pubkey_a: Vec<u8> = (0u8..32).collect();
+            let pubkey_b: Vec<u8> = (0u8..32).map(|j| (i as u8).wrapping_add(j)).collect();
 
-        // 不同公钥应产生不同的 SAS 短码（极大概率）
-        // 注意：理论上可能碰撞（1/10000），但实际不会发生
-        assert_ne!(
-            session_a.sas_code(),
-            session_b.sas_code(),
-            "不同公钥不应产生相同 SAS 短码"
-        );
+            let session_a = PairingSession::initiator(group_id.clone(), pubkey_a, vec![]).unwrap();
+            let session_b = PairingSession::initiator(group_id.clone(), pubkey_b, vec![]).unwrap();
+
+            if session_a.sas_code() != session_b.sas_code() {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "至少应存在一对公钥产生不同的 SAS 短码");
     }
 }
