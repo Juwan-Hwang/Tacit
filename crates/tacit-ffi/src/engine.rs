@@ -7,12 +7,13 @@
 //! - UI 线程可通过 `CommandBus` 发送命令，由 `RuntimeSupervisor` 异步消费。
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use parking_lot::Mutex;
 use tacit_core::{
     BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId, SyncReason,
 };
+use tacit_crypto::{DeviceIdentity, StaticKeypair};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tracing::debug;
@@ -22,8 +23,8 @@ use crate::doc_executor::DocExecutorRegistry;
 use crate::event_bus::EventBus;
 use crate::listener::{EventDispatcher, ForeignEventListener, ForeignListenerAdapter};
 use crate::view::{
-    DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction,
-    SyncStatus,
+    DocumentView, DocumentViewWithContent, FfiBlockContent, FfiRequestDeltaAction,
+    FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus,
 };
 
 /// Tacit 引擎：FFI 主入口。
@@ -121,13 +122,88 @@ impl TacitEngine {
         self.doc_store.create_doc(DocId::new(doc_id), &kind)
     }
 
+    /// #4: 保存设备身份到数据库（持久化）。
+    ///
+    /// 将 Ed25519 签名密钥、X25519 静态密钥对和绑定证明写入 `device_identity` 表。
+    /// 应用启动时调用 `load_device_identity` 恢复身份，避免每次重启生成新身份。
+    ///
+    /// # Security Notice
+    /// 私钥以明文存储在 SQLite 中。生产环境应使用平台安全存储（iOS Keychain /
+    /// Android Keystore）或 SQLCipher 加密数据库。当前实现适用于开发和测试阶段；
+    /// 后续应通过 trait 抽象存储后端，由各平台提供安全实现。
+    pub fn save_device_identity(&self, identity: &DeviceIdentity) -> CoreResult<()> {
+        let conn = self.doc_store.store().conn();
+        let rec = tacit_store::dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(identity.signing_key_bytes()),
+            static_private: zeroize::Zeroizing::new(identity.static_keypair().private),
+            static_public: identity.static_keypair().public.to_vec(),
+            binding_proof: identity.binding_proof().to_vec(),
+            created_at: SystemTime::now(),
+        };
+        tacit_store::dao::save_device_identity(&conn, &rec)
+    }
+
+    /// #4: 从数据库加载设备身份。
+    ///
+    /// 返回 `Ok(Some(identity))` 表示数据库中已有身份；
+    /// 返回 `Ok(None)` 表示首次启动，需要调用 `DeviceIdentity::generate()` 生成新身份。
+    pub fn load_device_identity(&self) -> CoreResult<Option<DeviceIdentity>> {
+        // 先在锁内读取记录，释放锁后再执行签名验证（避免持有 DB 锁执行密码学操作）
+        let rec = {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::load_device_identity(&conn)?
+        };
+        match rec {
+            Some(rec) => Ok(Some(parse_device_identity_rec(&rec)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 确保设备身份存在：加载已有身份或生成新身份并保存。
+    ///
+    /// 应用启动时调用此方法即可，无需手动判断是否首次启动。
+    /// 返回完整的 `DeviceIdentity`（含私钥），调用方负责不泄露私钥。
+    ///
+    /// 采用三步式设计避免在持有 DB 锁时执行昂贵的密码学操作：
+    /// 1. 锁内检查已有身份 → 2. 锁外生成密钥 → 3. 锁内二次检查 + INSERT
+    pub fn ensure_device_identity(&self) -> CoreResult<DeviceIdentity> {
+        // 1. 尝试加载已有身份（load_device_identity 内部获取锁后释放）
+        if let Some(di) = self.load_device_identity()? {
+            return Ok(di);
+        }
+
+        // 2. 锁外生成新身份（避免持有 DB 锁执行昂贵的密码学操作）
+        let di = DeviceIdentity::generate()?;
+        let rec = tacit_store::dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(di.signing_key_bytes()),
+            static_private: zeroize::Zeroizing::new(di.static_keypair().private),
+            static_public: di.static_keypair().public.to_vec(),
+            binding_proof: di.binding_proof().to_vec(),
+            created_at: SystemTime::now(),
+        };
+
+        // 3. 锁内原子操作：二次检查 + INSERT 必须在同一锁内完成，防止 TOCTOU 竞态。
+        //    但如果发现已有身份，先释放锁再执行签名验证（parse_device_identity_rec），
+        //    避免持有 DB 锁执行昂贵的密码学操作。
+        let conn = self.doc_store.store().conn();
+        if let Some(existing) = tacit_store::dao::load_device_identity(&conn)? {
+            drop(conn);
+            // 并发竞态：另一线程已先保存，使用已有身份
+            return parse_device_identity_rec(&existing);
+        }
+        tacit_store::dao::save_device_identity(&conn, &rec)?;
+        Ok(di)
+    }
+
     /// 打开文档，返回视图。
     pub fn open_document(&self, doc_id: String) -> CoreResult<DocumentView> {
         let doc_id = DocId::new(doc_id);
-        // 从 store 获取文档记录
-        let conn = self.doc_store.store().conn();
-        let doc_rec = tacit_store::dao::get_doc(&conn, &doc_id)?
-            .ok_or_else(|| CoreError::Store(format!("文档不存在: {doc_id}")))?;
+        // 从 store 获取文档记录（锁在 block 内释放，避免后续 list_blocks/meta_frontier 再次获取锁时死锁）
+        let doc_rec = {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::get_doc(&conn, &doc_id)?
+                .ok_or_else(|| CoreError::Store(format!("文档不存在: {doc_id}")))?
+        };
         let blocks = self.doc_store.list_blocks(&doc_id)?;
         let frontier = self.doc_store.meta_frontier(&doc_id)?;
         Ok(DocumentView {
@@ -140,6 +216,61 @@ impl TacitEngine {
             frontier_json: serde_json::to_string(&frontier)
                 .map_err(|e| CoreError::Serialize(e.to_string()))?,
         })
+    }
+
+    /// 打开文档，返回视图（含所有 block 的渲染内容）。
+    ///
+    /// 与 `open_document` 不同，此方法一次性返回所有 block 的渲染数据，
+    /// 移动端无需再逐个调用 `get_block_content`，减少 FFI 调用开销。
+    pub fn open_document_with_content(
+        &self,
+        doc_id: String,
+    ) -> CoreResult<DocumentViewWithContent> {
+        let doc_id_obj = DocId::new(doc_id);
+        // 锁在 block 内释放，避免后续 meta_frontier/get_render_model 再次获取锁时死锁
+        let doc_rec = {
+            let conn = self.doc_store.store().conn();
+            tacit_store::dao::get_doc(&conn, &doc_id_obj)?
+                .ok_or_else(|| CoreError::Store(format!("文档不存在: {doc_id_obj}")))?
+        };
+        let frontier = self.doc_store.meta_frontier(&doc_id_obj)?;
+        // 复用 DocStore::get_render_model 一次性获取所有 block 的渲染数据
+        let render_model = self.doc_store.get_render_model(&doc_id_obj, None)?;
+
+        let blocks: Vec<FfiBlockContent> = render_model
+            .blocks
+            .into_iter()
+            .map(|b| FfiBlockContent {
+                block_id: b.block_id.as_str().to_string(),
+                kind: block_kind_to_str(b.kind).to_string(),
+                render_bytes: b.render_bytes.to_vec(),
+            })
+            .collect();
+
+        let block_ids: Vec<String> = blocks.iter().map(|b| b.block_id.clone()).collect();
+
+        Ok(DocumentViewWithContent {
+            doc_id: doc_id_obj.as_str().to_string(),
+            kind: doc_rec.kind,
+            block_ids,
+            frontier_json: serde_json::to_string(&frontier)
+                .map_err(|e| CoreError::Serialize(e.to_string()))?,
+            blocks,
+        })
+    }
+
+    /// 获取 block 的渲染内容（字节数组）。
+    ///
+    /// 返回 block 的 `render_bytes`，格式取决于 block 类型：
+    /// - Text: UTF-8 文本
+    /// - Todo/Log: JSON 数组
+    ///
+    /// 用于移动端 UI 渲染文档内容。
+    pub fn get_block_content(&self, doc_id: String, block_id: String) -> CoreResult<Vec<u8>> {
+        let doc_id_obj = DocId::new(doc_id);
+        let block_id_obj = BlockId::new(block_id);
+        let block = self.doc_store.get_block(&doc_id_obj, &block_id_obj)?;
+        block.export_render_bytes()
     }
 
     /// 创建 block。
@@ -160,23 +291,28 @@ impl TacitEngine {
     ///
     /// `edit_bytes`：Loro delta 编码。
     ///
-    /// 此方法同步执行 CRDT 合并与持久化。对于大导入（>1MB）或非关键路径，
-    /// 建议通过 `send_command(Command::ApplyUserEdit{...})` 异步执行，
-    /// 命令会通过 per-doc actor 串行处理，不阻塞 UI 线程。
+    /// # 大导入限制
+    ///
+    /// 此方法为**同步 API**，仅适用于小编辑（< 1MB）。
+    /// 超过 1MB 的编辑会被拒绝并返回 `Error`，调用方应改用异步路径：
+    /// ```ignore
+    /// engine.send_command(Command::ApplyUserEdit { doc_id, block_id, edit_bytes })?;
+    /// ```
+    /// 异步路径通过 per-doc actor 串行处理，不阻塞 UI 线程。
     pub fn apply_user_edit(
         &self,
         doc_id: String,
         block_id: String,
         edit_bytes: Vec<u8>,
     ) -> CoreResult<()> {
-        // 大导入检测：超过 1MB 记录 warn 日志
-        if edit_bytes.len() > 1024 * 1024 {
-            tracing::warn!(
-                doc_id = %doc_id,
-                block_id = %block_id,
-                size = edit_bytes.len(),
-                "大导入同步执行，建议通过 send_command 异步执行"
-            );
+        // #19/#9: 大导入检测——同步 API 拒绝 >1MB 的编辑，引导使用异步路径
+        const SYNC_EDIT_MAX_BYTES: usize = 1024 * 1024;
+        if edit_bytes.len() > SYNC_EDIT_MAX_BYTES {
+            return Err(CoreError::Store(format!(
+                "同步 API 拒绝大导入（{} 字节 > {} 字节），请使用 send_command(Command::ApplyUserEdit) 异步路径",
+                edit_bytes.len(),
+                SYNC_EDIT_MAX_BYTES
+            )));
         }
         let doc_id_obj = DocId::new(doc_id);
         let block_id_obj = BlockId::new(block_id);
@@ -432,6 +568,17 @@ fn priority_to_u8(p: tacit_core::Priority) -> u8 {
     }
 }
 
+/// BlockKind 转为字符串：text/todo/settings/log。
+fn block_kind_to_str(kind: tacit_core::BlockKind) -> &'static str {
+    use tacit_core::BlockKind;
+    match kind {
+        BlockKind::Text => "text",
+        BlockKind::Todo => "todo",
+        BlockKind::Settings => "settings",
+        BlockKind::Log => "log",
+    }
+}
+
 /// PathPreference 转换为字符串。
 fn path_to_str(p: tacit_transport::PathPreference) -> &'static str {
     use tacit_transport::PathPreference;
@@ -441,6 +588,32 @@ fn path_to_str(p: tacit_transport::PathPreference) -> &'static str {
         PathPreference::LanQuic => "lan_quic",
         PathPreference::WanQuic => "wan_quic",
         PathPreference::Relay => "relay",
+    }
+}
+
+/// 从 `DeviceIdentityRecord` 解析出 `DeviceIdentity`（验证 binding_proof 签名）。
+///
+/// `load_device_identity()` 和 `ffi_generate_and_save_device_identity()` 的公共逻辑。
+fn parse_device_identity_rec(
+    rec: &tacit_store::dao::DeviceIdentityRecord,
+) -> CoreResult<DeviceIdentity> {
+    let static_kp = StaticKeypair {
+        private: *rec.static_private,
+        public: rec
+            .static_public
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoreError::Crypto("数据库中存储的静态公钥长度不正确".into()))?,
+    };
+    DeviceIdentity::from_keys(&*rec.signing_key, static_kp, &rec.binding_proof)
+}
+
+/// 从 `DeviceIdentity` 提取公开信息（私钥不外泄）。
+fn device_identity_to_public_info(di: &DeviceIdentity) -> crate::view::FfiDevicePublicInfo {
+    crate::view::FfiDevicePublicInfo {
+        verifying_key: di.verifying_key().to_bytes().to_vec(),
+        static_public: di.static_keypair().public.to_vec(),
+        peer_id: di.peer_id().0.clone(),
     }
 }
 
@@ -483,6 +656,60 @@ impl TacitEngine {
         doc_id: String,
     ) -> Result<DocumentView, crate::error::TacitFfiError> {
         Ok(self.open_document(doc_id)?)
+    }
+
+    /// 打开文档，返回视图（含所有 block 的渲染内容）。
+    ///
+    /// 与 `ffi_open_document` 不同，此方法一次性返回所有 block 的渲染数据，
+    /// 移动端无需再逐个调用 `ffi_get_block_content`，减少 FFI 调用开销。
+    pub fn ffi_open_document_with_content(
+        &self,
+        doc_id: String,
+    ) -> Result<DocumentViewWithContent, crate::error::TacitFfiError> {
+        Ok(self.open_document_with_content(doc_id)?)
+    }
+
+    /// 获取 block 的渲染内容。
+    ///
+    /// 返回 `render_bytes`（Text 为 UTF-8 文本，Todo/Log 为 JSON 数组）。
+    pub fn ffi_get_block_content(
+        &self,
+        doc_id: String,
+        block_id: String,
+    ) -> Result<Vec<u8>, crate::error::TacitFfiError> {
+        Ok(self.get_block_content(doc_id, block_id)?)
+    }
+
+    /// 生成并保存设备身份到数据库。
+    ///
+    /// 私钥永远不会离开 Rust 内存空间，FFI 调用方只能获取公开信息。
+    ///
+    /// 如果数据库中已存在设备身份，则直接返回现有身份的公开信息，
+    /// 不会静默覆盖——防止已有 PeerId 的文档和同步状态被孤立。
+    ///
+    /// 委托给 `ensure_device_identity()`，采用三步式设计避免在持有 DB 锁时
+    /// 执行昂贵的密码学操作：
+    /// 1. 锁内检查已有身份 → 2. 锁外生成密钥 → 3. 锁内二次检查 + INSERT
+    pub fn ffi_generate_and_save_device_identity(
+        &self,
+    ) -> Result<crate::view::FfiDevicePublicInfo, crate::error::TacitFfiError> {
+        let di = self.ensure_device_identity()?;
+        Ok(device_identity_to_public_info(&di))
+    }
+
+    /// 获取已保存设备身份的公开信息。
+    ///
+    /// 只返回公钥和 PeerId，不暴露私钥。
+    pub fn ffi_get_device_public_info(
+        &self,
+    ) -> Result<Option<crate::view::FfiDevicePublicInfo>, crate::error::TacitFfiError> {
+        Ok(self
+            .load_device_identity()?
+            .map(|di| crate::view::FfiDevicePublicInfo {
+                verifying_key: di.verifying_key().to_bytes().to_vec(),
+                static_public: di.static_keypair().public.to_vec(),
+                peer_id: di.peer_id().0.clone(),
+            }))
     }
 
     /// 创建 block。

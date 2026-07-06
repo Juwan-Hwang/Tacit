@@ -177,18 +177,19 @@ mod tests {
 
     #[test]
     fn receive_same_physical_increments_logical() {
-        // 使用接近当前的物理时间，避免 wall_clock() 干扰
-        let now_ms = Hlc::wall_millis();
+        // 使用 wall_millis() + 偏移量，确保物理时间 >= 当前时间，
+        // 避免 receive() 中 wall_millis() 取最大值进入 else 分支。
+        let fixed_ms = Hlc::wall_millis() + 1_000;
         let mut local = Hlc {
-            physical_ms: now_ms,
+            physical_ms: fixed_ms,
             logical: 3,
         };
         let remote = Hlc {
-            physical_ms: now_ms,
+            physical_ms: fixed_ms,
             logical: 5,
         };
         let merged = local.receive(&remote);
-        // 两者物理时间相同且接近当前，logical 应递增
+        // 两者物理时间相同且 >= wall clock，logical 应递增
         assert!(merged.logical > 5);
     }
 

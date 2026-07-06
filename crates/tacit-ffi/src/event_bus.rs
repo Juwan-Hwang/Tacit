@@ -78,6 +78,9 @@ impl EventBus {
 
     /// 发布事件到所有匹配的订阅者。
     /// 返回成功送达的订阅者数量。
+    ///
+    /// 慢订阅者策略：`try_send` 非阻塞，队列满时丢弃事件并记录 warn 日志。
+    /// 这是有意设计——慢订阅者不应阻塞发布者（通常是同步引擎主线程）。
     pub fn publish(&self, event: &CoreEvent) -> usize {
         let subscribers = self.subscribers.read();
         let mut count = 0;
@@ -90,6 +93,8 @@ impl EventBus {
             // 非阻塞发送：订阅者慢时丢弃事件（避免阻塞发布者）
             if sub.tx.try_send(event.clone()).is_ok() {
                 count += 1;
+            } else {
+                tracing::warn!("EventBus 订阅者 {} 队列已满，丢弃事件", sub.id);
             }
         }
         count

@@ -15,6 +15,37 @@ pub struct DocumentView {
     pub frontier_json: String,
 }
 
+/// 单个 block 的渲染内容（FFI 友好）。
+///
+/// 用于 `DocumentViewWithContent`，移动端无需再逐个调用 `ffi_get_block_content`。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiBlockContent {
+    /// Block ID。
+    pub block_id: String,
+    /// Block 类型：`"text"`/`"todo"`/`"settings"`/`"log"`。
+    pub kind: String,
+    /// 渲染字节（Text 为 UTF-8 文本，Todo/Log 为 JSON 数组）。
+    pub render_bytes: Vec<u8>,
+}
+
+/// 文档视图（含 block 渲染内容）。
+///
+/// 与 `DocumentView` 不同，此结构包含所有 block 的渲染数据，
+/// 移动端无需再逐个调用 `ffi_get_block_content`，减少 FFI 调用开销。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DocumentViewWithContent {
+    /// 文档 ID。
+    pub doc_id: String,
+    /// 文档类型。
+    pub kind: String,
+    /// 所有 block ID 列表。
+    pub block_ids: Vec<String>,
+    /// 当前 frontier（JSON 字符串）。
+    pub frontier_json: String,
+    /// 所有 block 的渲染内容。
+    pub blocks: Vec<FfiBlockContent>,
+}
+
 /// 同步状态。
 #[derive(Debug, Clone, Default, uniffi::Record)]
 pub struct SyncStatus {
@@ -59,6 +90,19 @@ pub struct FfiRequestDeltaAction {
     pub since_json: String,
     /// 优先级：0=High, 1=Medium, 2=Low。
     pub priority: u8,
+}
+
+/// 设备身份的公开信息（FFI 友好）。
+///
+/// 只包含公钥和 PeerId，不暴露任何私钥。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDevicePublicInfo {
+    /// Ed25519 验证公钥（32 字节）。
+    pub verifying_key: Vec<u8>,
+    /// X25519 静态公钥（32 字节）。
+    pub static_public: Vec<u8>,
+    /// 设备 PeerId（Ed25519 公钥的 hex）。
+    pub peer_id: String,
 }
 
 /// FFI 友好的同步动作枚举。
