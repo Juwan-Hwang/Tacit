@@ -928,6 +928,109 @@ pub fn update_transport_ema(
     Ok(())
 }
 
+// ===== 设备身份持久化（#4）=====
+
+/// 设备身份记录（对应 `device_identity` 表）。
+///
+/// 包含高敏感私钥，使用 `Zeroizing` 包装以在 drop 时自动擦除内存。
+/// 私钥为固定 32 字节，使用 `Zeroizing<[u8; 32]>` 而非 `Zeroizing<Vec<u8>>`
+/// 以避免堆分配器在 realloc 时残留副本，确保栈分配 + 可靠擦除。
+pub struct DeviceIdentityRecord {
+    pub signing_key: zeroize::Zeroizing<[u8; 32]>,
+    pub static_private: zeroize::Zeroizing<[u8; 32]>,
+    pub static_public: Vec<u8>,
+    pub binding_proof: Vec<u8>,
+    pub created_at: SystemTime,
+}
+
+/// 保存设备身份（INSERT，单行表）。
+///
+/// 使用 `INSERT` 而非 `INSERT OR REPLACE`——如果 `id='default'` 行已存在，
+/// SQLite PRIMARY KEY 约束会返回错误，从数据库层面防止静默覆盖。
+/// 调用方应先调用 `load_device_identity` 检查是否已有身份。
+pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> CoreResult<()> {
+    let now = rec
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+         VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+        params![
+            &rec.signing_key[..],
+            &rec.static_private[..],
+            rec.static_public,
+            rec.binding_proof,
+            now
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 加载设备身份。
+pub fn load_device_identity(conn: &Connection) -> CoreResult<Option<DeviceIdentityRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT signing_key, static_private, static_public, binding_proof, created_at
+             FROM device_identity WHERE id = 'default'",
+            [],
+            |row| {
+                // #17: 使用 Zeroizing 包装敏感私钥，部分列读取失败时也能自动擦除。
+                // 读取为 Vec<u8> 后立即转换为 [u8; 32]，避免堆分配残留。
+                let signing_key_vec: zeroize::Zeroizing<Vec<u8>> =
+                    zeroize::Zeroizing::new(row.get(0)?);
+                let static_private_vec: zeroize::Zeroizing<Vec<u8>> =
+                    zeroize::Zeroizing::new(row.get(1)?);
+                let static_public: Vec<u8> = row.get(2)?;
+                let binding_proof: Vec<u8> = row.get(3)?;
+                let created_at_ms: i64 = row.get(4)?;
+                Ok((
+                    signing_key_vec,
+                    static_private_vec,
+                    static_public,
+                    binding_proof,
+                    created_at_ms,
+                ))
+            },
+        )
+        .optional()
+        .map_err(store_err)?;
+
+    match row {
+        Some((
+            signing_key_vec,
+            static_private_vec,
+            static_public,
+            binding_proof,
+            created_at_ms,
+        )) => {
+            // Vec<u8> → [u8; 32]：长度不匹配时返回错误，Zeroizing 自动擦除临时 Vec
+            let signing_key: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(
+                signing_key_vec
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::Store("signing_key 长度不为 32 字节".into()))?,
+            );
+            let static_private: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(
+                static_private_vec
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::Store("static_private 长度不为 32 字节".into()))?,
+            );
+            Ok(Some(DeviceIdentityRecord {
+                signing_key,
+                static_private,
+                static_public,
+                binding_proof,
+                created_at: from_millis(created_at_ms),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 // ===== 辅助 =====
 
 fn store_err(e: rusqlite::Error) -> CoreError {
