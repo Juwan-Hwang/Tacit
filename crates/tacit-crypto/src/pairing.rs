@@ -15,6 +15,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tacit_core::{CoreError, CoreResult};
 
 /// HMAC-SHA256 类型别名。
@@ -174,7 +175,9 @@ pub fn format_sas_code(sas: u32) -> String {
 /// 此函数实现 §12.1 推荐的"短校验码确认"步骤：
 /// 用户在两端屏幕上看到 4 位数字后，输入对端数字（或由 UI 直接比对）。
 pub fn confirm_sas_code(local: u32, remote: u32) -> CoreResult<()> {
-    if local == remote {
+    // #16: 使用常量时间比较，防止时序攻击。
+    // 虽然 SAS 是 4 位数字（用户可见，时序攻击风险极低），但代码应遵循安全比较最佳实践。
+    if local.ct_eq(&remote).into() {
         Ok(())
     } else {
         Err(CoreError::Crypto(format!(
@@ -256,7 +259,7 @@ impl PairingSession {
     /// 解析 `PairingPayload`，校验时效，计算 `binding_digest` 与 SAS 短码。
     pub fn responder_from_qr(qr_json: &str) -> CoreResult<Self> {
         let payload = PairingPayload::from_qr_json(qr_json)?;
-        if !verify_binding(&payload) {
+        if !validate_payload_structure(&payload) {
             return Err(CoreError::Crypto(
                 "配对 payload 校验失败：已过期或字段不合法".into(),
             ));
@@ -351,14 +354,18 @@ impl PairingSession {
 /// 配对 payload 最大有效期：5 分钟（300 秒）。
 pub const MAX_PAIRING_AGE_SECS: i64 = 300;
 
-/// 验证 payload 字段一致性：检查字段长度合法，校验 timestamp 时效，并确认 `binding_digest` 可正确计算。
+/// 验证 payload 结构合法性：检查字段长度、group_id 非空、timestamp 时效。
 ///
-/// 返回 `true` 表示 payload 结构合法、时效有效、可安全派生 `binding_digest` 与 SAS 短码；
+/// 返回 `true` 表示 payload 结构合法、时效有效；
 /// 返回 `false` 表示 payload 被篡改、畸形（字段长度不符或 group_id 为空）或已过期。
 ///
-/// 注意：此函数仅做结构校验。完整的端到端完整性由 SAS 短码人工确认完成——
+/// # 命名说明
+///
+/// 此函数原名 `verify_binding`，但实际不做绑定验证——它仅做结构校验。
+/// 完整的端到端完整性由 SAS 短码人工确认完成：
 /// 两端独立计算 `binding_digest` 并派生 SAS，用户比对数字一致后才完成绑定。
-pub fn verify_binding(payload: &PairingPayload) -> bool {
+/// 因此重命名为 `validate_payload_structure` 以准确反映其职责。
+pub fn validate_payload_structure(payload: &PairingPayload) -> bool {
     if payload.initiator_pubkey.len() != ED25519_PUBKEY_LEN {
         return false;
     }
@@ -377,14 +384,9 @@ pub fn verify_binding(payload: &PairingPayload) -> bool {
     if age_secs > MAX_PAIRING_AGE_SECS {
         return false;
     }
-    // 重新计算摘要，确认无异常
-    let _ = compute_binding_digest(
-        &payload.group_id,
-        &payload.initiator_pubkey,
-        &payload.binding_salt,
-    );
     true
 }
+
 
 /// 用 `OsRng` 生成 16 字节绑定盐。
 ///
@@ -519,28 +521,28 @@ mod tests {
     }
 
     #[test]
-    fn verify_binding_accepts_valid() {
+    fn validate_payload_structure_accepts_valid() {
         let payload = test_payload();
-        assert!(verify_binding(&payload));
+        assert!(validate_payload_structure(&payload));
     }
 
     #[test]
-    fn verify_binding_rejects_tampered() {
+    fn validate_payload_structure_rejects_tampered() {
         let mut payload = test_payload();
 
         // 篡改公钥长度
         payload.initiator_pubkey.pop();
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 恢复并篡改盐长度
         payload.initiator_pubkey = test_pubkey();
         payload.binding_salt.push(0x00);
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 恢复并清空 group_id
         payload.binding_salt = vec![0xA0; BINDING_SALT_LEN];
         payload.group_id.clear();
-        assert!(!verify_binding(&payload));
+        assert!(!validate_payload_structure(&payload));
 
         // 时效过期：使用 10 分钟前的时间戳
         let expired_ms = std::time::SystemTime::now()
@@ -556,7 +558,7 @@ mod tests {
             expired_ms,
         )
         .unwrap();
-        assert!(!verify_binding(&expired_payload));
+        assert!(!validate_payload_structure(&expired_payload));
     }
 
     #[test]
@@ -594,7 +596,7 @@ mod tests {
 
         // 3. 扫码方解析
         let parsed = PairingPayload::from_qr_json(&qr).unwrap();
-        assert!(verify_binding(&parsed));
+        assert!(validate_payload_structure(&parsed));
 
         // 4. 两端独立计算 binding_digest 与 SAS
         let digest_init = compute_binding_digest(&group_id, &pubkey, &salt);
