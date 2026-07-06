@@ -140,8 +140,11 @@ impl ControlType {
 /// Control Frame（规范 13.2）。
 ///
 /// ```text
-/// magic(2) | version(1) | ctrl_type(1) | session_id(8) | payload_len(2) | payload(n) | mac(16)
+/// magic(2) | version(1) | ctrl_type(1) | session_id(8) | payload_len(2) | payload(n)
 /// ```
+///
+/// #3: mac 字段已移除。传输层完整性由 QUIC TLS 1.3 保证，
+/// 应用层 E2E 加密由 Noise Session AEAD 保证，per-frame mac 冗余。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlFrame {
     pub version: u8,
@@ -149,39 +152,35 @@ pub struct ControlFrame {
     pub session_id: u64,
     /// TLV 编码的 payload。
     pub payload: Vec<u8>,
-    /// 消息认证码（16 字节，由 Noise Session AEAD 生成）。
-    pub mac: [u8; 16],
 }
 
 impl ControlFrame {
-    /// 创建 ControlFrame（mac 填零，由加密层填充）。
+    /// 创建 ControlFrame。
     pub fn new(ctrl_type: ControlType, session_id: u64, payload: Vec<u8>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             ctrl_type,
             session_id,
             payload,
-            mac: [0u8; 16],
         }
     }
 
-    /// 编码为字节流（不含 mac，mac 由加密层在发送时填充）。
+    /// 编码为字节流。
     pub fn encode(&self) -> Vec<u8> {
         let payload_len = self.payload.len() as u16;
-        let mut buf = Vec::with_capacity(14 + self.payload.len() + 16);
+        let mut buf = Vec::with_capacity(14 + self.payload.len());
         buf.extend_from_slice(&MAGIC);
         buf.push(self.version);
         buf.push(self.ctrl_type as u8);
         buf.extend_from_slice(&self.session_id.to_be_bytes());
         buf.extend_from_slice(&payload_len.to_be_bytes());
         buf.extend_from_slice(&self.payload);
-        buf.extend_from_slice(&self.mac);
         buf
     }
 
     /// 从字节流解码。
     pub fn decode(data: &[u8]) -> Result<Self, FrameError> {
-        if data.len() < 30 {
+        if data.len() < 14 {
             return Err(FrameError::TooShort);
         }
         if data[0..2] != MAGIC {
@@ -192,19 +191,15 @@ impl ControlFrame {
             ControlType::from_u8(data[3]).ok_or(FrameError::UnknownControlType(data[3]))?;
         let session_id = u64::from_be_bytes(data[4..12].try_into().unwrap());
         let payload_len = u16::from_be_bytes([data[12], data[13]]) as usize;
-        if data.len() < 14 + payload_len + 16 {
+        if data.len() < 14 + payload_len {
             return Err(FrameError::TooShort);
         }
         let payload = data[14..14 + payload_len].to_vec();
-        let mac: [u8; 16] = data[14 + payload_len..14 + payload_len + 16]
-            .try_into()
-            .unwrap();
         Ok(Self {
             version,
             ctrl_type,
             session_id,
             payload,
-            mac,
         })
     }
 }
@@ -245,8 +240,11 @@ impl BatchFlag {
 ///
 /// ```text
 /// magic(2) | version(1) | flags(1) | doc_id(8) | actor_id(8) | seq(4) | kind(1)
-/// | payload_len(4) | payload(n) | ref(8) | sig(batch) | mac(16)
+/// | payload_len(4) | payload(n) | ref(8) | sig(batch)
 /// ```
+///
+/// #3: mac 字段已移除。传输层完整性由 QUIC TLS 1.3 保证，
+/// 应用层 E2E 加密由 Noise Session AEAD 保证，per-frame mac 冗余。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataFrameWire {
     pub version: u8,
@@ -264,14 +262,12 @@ pub struct DataFrameWire {
     pub payload: Bytes,
     /// 引用（如关联的 checkpoint_id 或前置帧 hash）。
     pub ref_id: [u8; 8],
-    /// 批次签名（可变长度，由 sig_len 字段指示）。
+    /// 批次完整性标签（可变长度，由 sig_len 字段指示）。
     pub sig: Vec<u8>,
-    /// 消息认证码。
-    pub mac: [u8; 16],
 }
 
 impl DataFrameWire {
-    /// 创建 DataFrameWire（mac/sig 填零，由加密层填充）。
+    /// 创建 DataFrameWire（sig 初始为空，由批次完整性标签填充）。
     pub fn new(
         doc_id: &DocId,
         actor_id: &PeerId,
@@ -291,7 +287,6 @@ impl DataFrameWire {
             payload,
             ref_id,
             sig: Vec::new(),
-            mac: [0u8; 16],
         }
     }
 
@@ -321,7 +316,7 @@ impl DataFrameWire {
         let payload_len = self.payload.len() as u32;
         let sig_len = self.sig.len() as u16;
         let mut buf = Vec::with_capacity(
-            2 + 1 + 1 + 8 + 8 + 4 + 1 + 4 + self.payload.len() + 8 + 2 + self.sig.len() + 16,
+            2 + 1 + 1 + 8 + 8 + 4 + 1 + 4 + self.payload.len() + 8 + 2 + self.sig.len(),
         );
         buf.extend_from_slice(&MAGIC);
         buf.push(self.version);
@@ -335,13 +330,12 @@ impl DataFrameWire {
         buf.extend_from_slice(&self.ref_id);
         buf.extend_from_slice(&sig_len.to_be_bytes());
         buf.extend_from_slice(&self.sig);
-        buf.extend_from_slice(&self.mac);
         buf
     }
 
     /// 从字节流解码。
     pub fn decode(data: &[u8]) -> Result<Self, FrameError> {
-        if data.len() < 40 {
+        if data.len() < 29 {
             return Err(FrameError::TooShort);
         }
         if data[0..2] != MAGIC {
@@ -354,7 +348,11 @@ impl DataFrameWire {
         let seq = u32::from_be_bytes(data[20..24].try_into().unwrap());
         let kind = u8_to_data_frame_kind(data[24])?;
         let payload_len = u32::from_be_bytes(data[25..29].try_into().unwrap()) as usize;
-        if data.len() < 29 + payload_len + 8 + 2 + 16 {
+        let required_len = 29usize
+            .checked_add(payload_len)
+            .and_then(|len| len.checked_add(8))
+            .and_then(|len| len.checked_add(2));
+        if required_len.is_none_or(|total| data.len() < total) {
             return Err(FrameError::TooShort);
         }
         let payload = Bytes::copy_from_slice(&data[29..29 + payload_len]);
@@ -364,13 +362,13 @@ impl DataFrameWire {
         let sig_len =
             u16::from_be_bytes([data[29 + payload_len + 8], data[29 + payload_len + 9]]) as usize;
         let sig_start = 29 + payload_len + 10;
-        if data.len() < sig_start + sig_len + 16 {
+        if sig_start
+            .checked_add(sig_len)
+            .is_none_or(|total| data.len() < total)
+        {
             return Err(FrameError::TooShort);
         }
         let sig = data[sig_start..sig_start + sig_len].to_vec();
-        let mac: [u8; 16] = data[sig_start + sig_len..sig_start + sig_len + 16]
-            .try_into()
-            .unwrap();
         Ok(Self {
             version,
             flags,
@@ -381,7 +379,6 @@ impl DataFrameWire {
             payload,
             ref_id,
             sig,
-            mac,
         })
     }
 }
