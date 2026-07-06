@@ -61,6 +61,17 @@ pub struct FfiRequestDeltaAction {
     pub priority: u8,
 }
 
+/// 设备身份记录（FFI 友好）。
+///
+/// 用于跨 FFI 边界传递设备身份的序列化密钥字节。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDeviceIdentity {
+    pub signing_key: Vec<u8>,
+    pub static_private: Vec<u8>,
+    pub static_public: Vec<u8>,
+    pub binding_proof: Vec<u8>,
+}
+
 /// FFI 友好的同步动作枚举。
 ///
 /// 集成层通过 `ffi_drain_actions` 获取动作列表后，
