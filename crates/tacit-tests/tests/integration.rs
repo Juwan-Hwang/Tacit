@@ -614,15 +614,29 @@ fn ble_presence_discovery() {
 
 #[test]
 fn noise_handshake_and_encrypted_sync() {
-    use tacit_crypto::{sign, verify, DeviceIdentity, NoiseHandshake};
+    use std::sync::Arc;
+    use tacit_crypto::{sign, verify, DeviceIdentity, NoiseHandshake, NonceCache};
 
     // 两个设备身份
     let id1 = DeviceIdentity::generate().unwrap();
     let id2 = DeviceIdentity::generate().unwrap();
 
     // Noise 握手
-    let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-    let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+    let cache = Arc::new(NonceCache::new());
+    let mut init = NoiseHandshake::initiator(
+        id1.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache.clone(),
+        None,
+    )
+    .unwrap();
+    let mut resp = NoiseHandshake::responder(
+        id2.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache,
+        None,
+    )
+    .unwrap();
 
     let msg1 = init.step(None).unwrap();
     let msg2 = resp.step(Some(&msg1)).unwrap();
@@ -659,13 +673,27 @@ fn noise_handshake_and_encrypted_sync() {
 
 #[test]
 fn noise_rekey_preserves_sync_communication() {
-    use tacit_crypto::{DeviceIdentity, NoiseHandshake};
+    use std::sync::Arc;
+    use tacit_crypto::{DeviceIdentity, NoiseHandshake, NonceCache};
 
     let id1 = DeviceIdentity::generate().unwrap();
     let id2 = DeviceIdentity::generate().unwrap();
 
-    let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-    let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+    let cache = Arc::new(NonceCache::new());
+    let mut init = NoiseHandshake::initiator(
+        id1.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache.clone(),
+        None,
+    )
+    .unwrap();
+    let mut resp = NoiseHandshake::responder(
+        id2.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache,
+        None,
+    )
+    .unwrap();
 
     let msg1 = init.step(None).unwrap();
     let msg2 = resp.step(Some(&msg1)).unwrap();

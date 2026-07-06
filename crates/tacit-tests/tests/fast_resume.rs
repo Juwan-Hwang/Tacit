@@ -73,15 +73,13 @@ fn hot_path_defers_data_actions() {
     // drain_actions 在 Hot-Path 模式下应仅返回控制类动作
     let actions = engine.drain_actions();
 
-    // 验证所有返回的动作都是控制类（EmitEvent）或空
+    // 验证所有返回的动作都是控制类（EmitEvent）
     for action in &actions {
-        match action {
-            SyncAction::EmitEvent(_) => { /* 控制类动作，允许 */ }
-            _ => {
-                // 数据类动作在 Hot-Path 模式下不应返回
-                // 但如果 fast-resume 只产生了 EmitEvent，这里可能没有数据动作
-            }
-        }
+        assert!(
+            matches!(action, SyncAction::EmitEvent(_)),
+            "Hot-Path 模式不应返回数据类动作，实际: {:?}",
+            action
+        );
     }
 
     // 退出 Hot-Path 模式后，延后的动作应可获取
@@ -157,10 +155,13 @@ fn repeated_fast_resume_no_duplicates() {
     let actions2 = engine.drain_actions();
     let count2 = actions2.len();
 
-    // 第二次可能产生相同动作（fast-resume 每次都请求同步），
-    // 但不应产生重复的 EmitEvent
-    // 这里只验证不 panic 且动作数合理
-    let _ = (count1, count2);
+    // 第二次不应产生更多动作（无新变更，状态未变）
+    assert!(
+        count2 <= count1,
+        "第二次 fast-resume 不应产生更多动作：第一次 {}，第二次 {}",
+        count1,
+        count2
+    );
 }
 
 /// 测试：pending queue 在 fast-resume 后正确反映待拉取数。

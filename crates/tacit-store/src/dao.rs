@@ -928,6 +928,94 @@ pub fn update_transport_ema(
     Ok(())
 }
 
+// ===== 设备身份持久化（#4）=====
+
+/// 设备身份记录（对应 `device_identity` 表）。
+///
+/// 包含高敏感私钥，drop 时自动 zeroize 防止内存残留。
+pub struct DeviceIdentityRecord {
+    pub signing_key: Vec<u8>,
+    pub static_private: Vec<u8>,
+    pub static_public: Vec<u8>,
+    pub binding_proof: Vec<u8>,
+    pub created_at: SystemTime,
+}
+
+impl Drop for DeviceIdentityRecord {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.signing_key.zeroize();
+        self.static_private.zeroize();
+    }
+}
+
+/// 保存设备身份（upsert，单行表）。
+pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> CoreResult<()> {
+    let now = rec
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR REPLACE INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+         VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+        params![
+            rec.signing_key,
+            rec.static_private,
+            rec.static_public,
+            rec.binding_proof,
+            now
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 加载设备身份。
+pub fn load_device_identity(conn: &Connection) -> CoreResult<Option<DeviceIdentityRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT signing_key, static_private, static_public, binding_proof, created_at
+             FROM device_identity WHERE id = 'default'",
+            [],
+            |row| {
+                // #17: 使用 Zeroizing 包装敏感私钥，部分列读取失败时也能自动擦除。
+                let signing_key: zeroize::Zeroizing<Vec<u8>> = zeroize::Zeroizing::new(row.get(0)?);
+                let static_private: zeroize::Zeroizing<Vec<u8>> =
+                    zeroize::Zeroizing::new(row.get(1)?);
+                let static_public: Vec<u8> = row.get(2)?;
+                let binding_proof: Vec<u8> = row.get(3)?;
+                let created_at_ms: i64 = row.get(4)?;
+                Ok((
+                    signing_key,
+                    static_private,
+                    static_public,
+                    binding_proof,
+                    created_at_ms,
+                ))
+            },
+        )
+        .optional()
+        .map_err(store_err)?;
+
+    match row {
+        Some((
+            mut signing_key,
+            mut static_private,
+            static_public,
+            binding_proof,
+            created_at_ms,
+        )) => Ok(Some(DeviceIdentityRecord {
+            signing_key: std::mem::take(&mut *signing_key),
+            static_private: std::mem::take(&mut *static_private),
+            static_public,
+            binding_proof,
+            created_at: from_millis(created_at_ms),
+        })),
+        None => Ok(None),
+    }
+}
+
 // ===== 辅助 =====
 
 fn store_err(e: rusqlite::Error) -> CoreError {

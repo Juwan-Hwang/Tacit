@@ -353,23 +353,45 @@ fn network_switch_triggers_fast_resume() {
     // 触发 fast-resume
     engine.fast_resume(None).unwrap();
 
-    // fast-resume 可能不产生动作（无在线 peer），验证不 panic 即可
-    let _actions = engine.drain_actions();
+    // fast-resume 后应产生同步动作（有内容需同步）
+    let actions = engine.drain_actions();
+    assert!(!actions.is_empty(), "fast-resume 有内容时应产生同步动作");
 }
 
 /// 测试：stale peer 清理。
 #[test]
 fn stale_peers_are_cleaned_up() {
-    use tacit_core::SyncReason;
+    use tacit_core::PeerSummary;
     let (_ds, engine) = make_node(1);
 
-    // 模拟 peer 上线
-    engine.request_sync(pid(2), SyncReason::PeerOnline).unwrap();
+    // 注册 peer 并标记在线（on_peer_summary 会写入 peer_states）
+    engine
+        .on_peer_summary(
+            pid(2),
+            PeerSummary {
+                peer_id: pid(2),
+                online: true,
+                frontier: Frontier::new(),
+                capabilities: Default::default(),
+            },
+        )
+        .unwrap();
+
+    // 确认 peer 已注册
+    assert!(!engine.online_peers().is_empty(), "peer 应已在线");
+
+    // 确保系统时钟向前推进，防止在低时钟分辨率平台（如 Windows）上出现测试抖动
+    std::thread::sleep(std::time::Duration::from_millis(20));
 
     // 清理 0 秒未活跃的 peer（应被清理）
     let removed = engine.cleanup_stale_peers(Duration::from_secs(0));
-    // peer_states 可能为空（取决于 request_sync 实现），验证方法不 panic
-    let _ = removed;
+    assert_eq!(
+        removed.len(),
+        1,
+        "0s TTL 应清理 1 个 stale peer，实际清理: {:?}",
+        removed
+    );
+    assert_eq!(removed[0], pid(2));
 }
 
 /// 测试：多节点串行同步链（A→B→C→A）最终收敛。

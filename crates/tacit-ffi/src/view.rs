@@ -61,6 +61,19 @@ pub struct FfiRequestDeltaAction {
     pub priority: u8,
 }
 
+/// 设备身份的公开信息（FFI 友好）。
+///
+/// 只包含公钥和 PeerId，不暴露任何私钥。
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDevicePublicInfo {
+    /// Ed25519 验证公钥（32 字节）。
+    pub verifying_key: Vec<u8>,
+    /// X25519 静态公钥（32 字节）。
+    pub static_public: Vec<u8>,
+    /// 设备 PeerId（Ed25519 公钥的 hex）。
+    pub peer_id: String,
+}
+
 /// FFI 友好的同步动作枚举。
 ///
 /// 集成层通过 `ffi_drain_actions` 获取动作列表后，
