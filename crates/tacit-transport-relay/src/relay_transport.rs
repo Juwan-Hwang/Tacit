@@ -1416,13 +1416,29 @@ mod tests {
 
     /// 建立 Noise 会话对（initiator → responder），用于 E2E 加密测试。
     fn establish_e2e_sessions() -> (Session, Session) {
-        use tacit_crypto::{DeviceIdentity, NoiseHandshake};
+        use std::sync::Arc;
+        use tacit_crypto::{DeviceIdentity, NoiseHandshake, NonceCache};
 
         let id1 = DeviceIdentity::generate().unwrap();
         let id2 = DeviceIdentity::generate().unwrap();
 
-        let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-        let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+        let cache = Arc::new(NonceCache::new());
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+        let local_id2 = (id2.public_key(), *id2.binding_proof());
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            b"tacit-test-v1",
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            b"tacit-test-v1",
+            cache,
+            local_id2,
+        )
+        .unwrap();
 
         let msg1 = init.step(None).unwrap();
         let msg2 = resp.step(Some(&msg1)).unwrap();

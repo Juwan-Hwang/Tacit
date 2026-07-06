@@ -2968,11 +2968,13 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "parking_lot",
  "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",
  "snow",
+ "subtle",
  "tacit-core",
  "thiserror 1.0.69",
  "tracing",
@@ -2990,6 +2992,7 @@ dependencies = [
  "serde_json",
  "tacit-core",
  "tacit-crdt",
+ "tacit-crypto",
  "tacit-store",
  "tacit-sync",
  "tacit-transport",
@@ -2999,6 +3002,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
@@ -3017,6 +3021,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "uuid",
+ "zeroize",
  "zstd",
 ]
 
