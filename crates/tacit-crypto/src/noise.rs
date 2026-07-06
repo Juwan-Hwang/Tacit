@@ -13,12 +13,17 @@
 //! 虽然 Noise_XX 的 ephemeral key 已防御了密钥重放（每次握手生成新密钥对），
 //! 但这层防御可阻止攻击者重放整个握手流程来消耗 responder 资源（DoS 减缓）。
 //!
+//! # Prologue
+//! 握手双方必须传入相同的 prologue 字节。不同 prologue 会导致握手失败，
+//! 从而实现跨组/跨版本隔离。调用方应构造 `protocol_version || group_id`。
+//!
 //! Strict mode: empty payload is rejected, no backward-compat bypass.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use rand::RngCore;
 use snow::HandshakeState;
 use tacit_core::{CoreError, CoreResult};
@@ -30,6 +35,17 @@ const REPLAY_PAYLOAD_LEN: usize = 24;
 
 /// 允许的时间窗口偏差（秒）。
 const REPLAY_WINDOW_SECS: u64 = 60;
+
+/// Nonce 缓存硬上限。超过此值时触发强制 prune；
+/// prune 后仍超限则拒绝新条目（返回 false = 视为重复），防止内存耗尽 DoS。
+const MAX_NONCE_CACHE_ENTRIES: usize = 100_000;
+
+/// 时钟回拨警告阈值（秒）。新消息时间戳比已见最大值回拨超过此阈值时记录 warn。
+/// 不改变拒绝/接受逻辑，仅增加可观测性。
+const CLOCK_ROLLBACK_WARN_SECS: u64 = 120;
+
+/// prune 执行间隔（秒）。在此间隔内跳过 prune，避免高并发下 CPU DoS。
+const PRUNE_INTERVAL_SECS: u64 = 10;
 
 /// Noise 角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,67 +62,148 @@ pub struct HandshakeResult {
     pub session: Session,
 }
 
-/// Nonce 缓存内部结构：HashSet + 上次 prune 的单调时间点。
-struct NonceCache {
+// ---------------------------------------------------------------------------
+// NonceCache — 实例级重放保护缓存（#10 + #15）
+// ---------------------------------------------------------------------------
+
+/// Nonce 缓存内部状态。
+struct NonceCacheInner {
     set: HashSet<([u8; 8], [u8; 16])>,
     last_prune: Option<std::time::Instant>,
+    /// 已见到的最大时间戳（用于 #13 时钟回拨检测）。
+    max_seen_timestamp: u64,
 }
 
-/// 已见 nonce 缓存的类型。
-type SeenNonces = Option<NonceCache>;
-
-/// 全局已见 nonce 缓存，用于检测精确重放。
+/// 实例级重放保护缓存。
 ///
-/// 使用 `Mutex<NonceCache>` 存储 `(timestamp, nonce)` 对。
-/// prune 频率受限（每 `PRUNE_INTERVAL_SECS` 秒最多一次），避免 flood
-/// 攻击下频繁 O(N) 遍历导致 CPU DoS，同时保持重放保护有效性。
-static SEEN_NONCES: Mutex<SeenNonces> = Mutex::new(None);
-
-/// prune 执行间隔（秒）。在此间隔内跳过 prune，避免高并发下 CPU DoS。
-const PRUNE_INTERVAL_SECS: u64 = 10;
-
-/// 记录已见的 (timestamp, nonce) 对，返回是否为重复。
+/// 替代原先的 `static SEEN_NONCES`，避免多 `SyncEngine` 实例共享状态导致误判重放。
+/// 调用方应创建一个 `Arc<NonceCache>` 并在多个握手之间共享（同一实例的 peer
+/// 之间需要共享 nonce 缓存才能检测跨握手重放）。
 ///
-/// `true` = 首次见到（非重复），`false` = 重复（已见过）。
-///
-/// prune 频率限制为每 `PRUNE_INTERVAL_SECS` 秒最多一次：正常负载下
-/// 过期条目在下次 prune 时被清除，flood 攻击下不会因频繁 O(N) 遍历
-/// 导致 CPU DoS。时间戳验证仍拒绝过期消息，安全性不受影响。
-fn record_seen_nonce(timestamp: [u8; 8], nonce: [u8; 16]) -> bool {
-    let mut guard = SEEN_NONCES.lock().unwrap();
-    let cache = guard.get_or_insert_with(|| NonceCache {
-        set: HashSet::new(),
-        last_prune: None,
-    });
+/// 内部使用 `parking_lot::Mutex`（无中毒，无 `.unwrap()`）。
+pub struct NonceCache {
+    inner: Mutex<NonceCacheInner>,
+}
 
-    // 使用单调时钟（Instant）进行 prune 频率限制，
-    // 避免 SystemTime 受 NTP 同步或手动修改时钟影响。
-    let now_instant = std::time::Instant::now();
-    let should_prune = match cache.last_prune {
-        Some(last) => {
-            now_instant.saturating_duration_since(last)
-                >= std::time::Duration::from_secs(PRUNE_INTERVAL_SECS)
+impl Default for NonceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NonceCache {
+    /// 创建空的 nonce 缓存。
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(NonceCacheInner {
+                set: HashSet::new(),
+                last_prune: None,
+                max_seen_timestamp: 0,
+            }),
         }
-        None => true,
-    };
+    }
 
-    if should_prune {
+    /// 验证重放保护 payload：检查时间戳窗口 + nonce 唯一性。
+    fn verify_replay(&self, payload: &[u8]) -> CoreResult<()> {
+        if payload.len() < REPLAY_PAYLOAD_LEN {
+            return Err(CoreError::Crypto(format!(
+                "重放保护 payload 过短：需要 {REPLAY_PAYLOAD_LEN} 字节，实际 {}",
+                payload.len()
+            )));
+        }
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&payload[..8]);
+        let timestamp = u64::from_be_bytes(ts_bytes);
+
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&payload[8..24]);
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        // 限制 prune 频率：每 PRUNE_INTERVAL_SECS 秒最多一次。
-        // 时间戳验证（verify_replay_payload）仍拒绝过期消息，
-        // 所以即使缓存中暂时残留过期条目也不影响安全性。
-        cache.set.retain(|(ts_bytes, _)| {
-            let ts = u64::from_be_bytes(*ts_bytes);
-            now.saturating_sub(ts) <= REPLAY_WINDOW_SECS
-        });
-        cache.last_prune = Some(now_instant);
-    }
 
-    cache.set.insert((timestamp, nonce))
+        // 时间窗口检查
+        if timestamp > now {
+            if timestamp - now > REPLAY_WINDOW_SECS {
+                return Err(CoreError::Crypto(format!(
+                    "握手时间戳超前过多 ({}s > {REPLAY_WINDOW_SECS}s)，拒绝",
+                    timestamp - now
+                )));
+            }
+        } else if now - timestamp > REPLAY_WINDOW_SECS {
+            return Err(CoreError::Crypto(format!(
+                "握手时间戳过期 ({}s > {REPLAY_WINDOW_SECS}s)，拒绝重放",
+                now - timestamp
+            )));
+        }
+
+        // #13 + #15: 时钟回拨检测、prune、nonce 唯一性检查——全部在单一锁区间内完成。
+        {
+            let mut guard = self.inner.lock();
+
+            // #13: 时钟回拨检测。
+            // 注意：max_seen_timestamp 是全局的（跨所有 peer），不同 peer 间的正常时钟偏移
+            // 可能触发此警告。这是可接受的——REPLAY_WINDOW_SECS 已严格限制可接受的时间范围，
+            // 此警告仅用于诊断，不影响接受/拒绝逻辑。
+            if timestamp < guard.max_seen_timestamp
+                && guard.max_seen_timestamp - timestamp > CLOCK_ROLLBACK_WARN_SECS
+            {
+                tracing::warn!(
+                    "检测到时钟回拨：新消息 ts={}，已见最大 ts={}，回拨 {}s",
+                    timestamp,
+                    guard.max_seen_timestamp,
+                    guard.max_seen_timestamp - timestamp
+                );
+            } else if timestamp > guard.max_seen_timestamp {
+                guard.max_seen_timestamp = timestamp;
+            }
+
+            // prune 过期条目（频率限制 + 缓存满时强制）
+            let now_instant = std::time::Instant::now();
+            let should_prune = match guard.last_prune {
+                Some(last) => {
+                    now_instant.saturating_duration_since(last)
+                        >= std::time::Duration::from_secs(PRUNE_INTERVAL_SECS)
+                }
+                None => true,
+            };
+            if should_prune || guard.set.len() >= MAX_NONCE_CACHE_ENTRIES {
+                guard.set.retain(|(ts_bytes, _)| {
+                    let ts = u64::from_be_bytes(*ts_bytes);
+                    now.saturating_sub(ts) <= REPLAY_WINDOW_SECS
+                });
+                guard.last_prune = Some(now_instant);
+            }
+
+            // 硬上限检查——拒绝新条目（保守的安全策略）
+            //
+            // 安全权衡说明：
+            // - 当前策略：缓存满时拒绝新连接，防止恶意耗尽内存/DoS。
+            // - 替代策略（更激进）：接受新条目并强制修剪最旧条目，可能导致合法连接被挤出。
+            // - 拒绝策略在 DoS 防护上更保守——攻击者无法通过大量旧握手驱逐合法连接的 nonce。
+            // - 代价：正常高并发场景下，MAX_NONCE_CACHE_ENTRIES(100000) 足够容纳 100 秒窗口内的所有连接。
+            if guard.set.len() >= MAX_NONCE_CACHE_ENTRIES {
+                tracing::warn!(
+                    "nonce 缓存已达硬上限 {}，拒绝新条目（可能的 flood DoS）",
+                    MAX_NONCE_CACHE_ENTRIES
+                );
+                return Err(CoreError::Crypto("nonce 缓存已达硬上限".into()));
+            }
+
+            // nonce 唯一性检查
+            if !guard.set.insert((ts_bytes, nonce)) {
+                return Err(CoreError::Crypto("握手 nonce 重复，拒绝精确重放".into()));
+            }
+        }
+
+        Ok(())
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Replay payload 生成
+// ---------------------------------------------------------------------------
 
 /// 生成重放保护 payload：当前时间戳（8B 大端）+ 随机 nonce（16B）。
 fn generate_replay_payload() -> Vec<u8> {
@@ -120,48 +217,9 @@ fn generate_replay_payload() -> Vec<u8> {
     payload
 }
 
-/// 验证重放保护 payload：检查时间戳窗口 + nonce 唯一性。
-fn verify_replay_payload(payload: &[u8]) -> CoreResult<()> {
-    if payload.len() < REPLAY_PAYLOAD_LEN {
-        return Err(CoreError::Crypto(format!(
-            "重放保护 payload 过短：需要 {REPLAY_PAYLOAD_LEN} 字节，实际 {}",
-            payload.len()
-        )));
-    }
-    let mut ts_bytes = [0u8; 8];
-    ts_bytes.copy_from_slice(&payload[..8]);
-    let timestamp = u64::from_be_bytes(ts_bytes);
-
-    let mut nonce = [0u8; 16];
-    nonce.copy_from_slice(&payload[8..24]);
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 时间窗口检查
-    if timestamp > now {
-        if timestamp - now > REPLAY_WINDOW_SECS {
-            return Err(CoreError::Crypto(format!(
-                "握手时间戳超前过多 ({}s > {REPLAY_WINDOW_SECS}s)，拒绝",
-                timestamp - now
-            )));
-        }
-    } else if now - timestamp > REPLAY_WINDOW_SECS {
-        return Err(CoreError::Crypto(format!(
-            "握手时间戳过期 ({}s > {REPLAY_WINDOW_SECS}s)，拒绝重放",
-            now - timestamp
-        )));
-    }
-
-    // nonce 唯一性检查（精确重放检测）
-    if !record_seen_nonce(ts_bytes, nonce) {
-        return Err(CoreError::Crypto("握手 nonce 重复，拒绝精确重放".into()));
-    }
-
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// NoiseHandshake
+// ---------------------------------------------------------------------------
 
 /// Noise 握手状态机。
 pub struct NoiseHandshake {
@@ -171,6 +229,13 @@ pub struct NoiseHandshake {
     step: u8,
     /// initiator 生成的重放保护 payload（step 0 时写入握手消息）。
     replay_payload: Vec<u8>,
+    /// 实例级 nonce 缓存（#15: 从全局 static 改为实例级）。
+    nonce_cache: Arc<NonceCache>,
+    /// 本地 Ed25519 公钥 + binding_proof（用于发送给对端验证身份绑定）。
+    /// 非可选：身份绑定是强制性的，None 会导致握手必然失败。
+    local_identity: ([u8; 32], [u8; 64]),
+    /// 对端 Ed25519 公钥 + binding_proof（从握手 payload 中提取）。
+    remote_identity: Option<([u8; 32], [u8; 64])>,
 }
 
 /// Noise_XX 参数。
@@ -178,7 +243,18 @@ const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
 impl NoiseHandshake {
     /// 创建 initiator。
-    pub fn initiator(local_static_private: &[u8]) -> CoreResult<Self> {
+    ///
+    /// # 参数
+    /// - `local_static_private`: 本地 X25519 静态私钥（32 字节）
+    /// - `prologue`: Noise prologue 字节，双方必须一致（#6: 跨组/跨版本隔离）
+    /// - `nonce_cache`: 实例级重放保护缓存（#15: 从全局 static 改为实例级）
+    /// - `local_identity`: 本地 Ed25519 公钥 + binding_proof（#1: 身份绑定）
+    pub fn initiator(
+        local_static_private: &[u8],
+        prologue: &[u8],
+        nonce_cache: Arc<NonceCache>,
+        local_identity: ([u8; 32], [u8; 64]),
+    ) -> CoreResult<Self> {
         let params = NOISE_PARAMS
             .parse()
             .map_err(|e| CoreError::Crypto(format!("解析 Noise 参数失败: {e}")))?;
@@ -186,6 +262,8 @@ impl NoiseHandshake {
         let state = builder
             .local_private_key(local_static_private)
             .map_err(|e| CoreError::Crypto(format!("设置本地私钥失败: {e}")))?
+            .prologue(prologue)
+            .map_err(|e| CoreError::Crypto(format!("设置 prologue 失败: {e}")))?
             .build_initiator()
             .map_err(|e| CoreError::Crypto(format!("构建 initiator 失败: {e}")))?;
         Ok(Self {
@@ -193,11 +271,25 @@ impl NoiseHandshake {
             role: NoiseRole::Initiator,
             step: 0,
             replay_payload: generate_replay_payload(),
+            nonce_cache,
+            local_identity,
+            remote_identity: None,
         })
     }
 
     /// 创建 responder。
-    pub fn responder(local_static_private: &[u8]) -> CoreResult<Self> {
+    ///
+    /// # 参数
+    /// - `local_static_private`: 本地 X25519 静态私钥（32 字节）
+    /// - `prologue`: Noise prologue 字节，双方必须一致（#6: 跨组/跨版本隔离）
+    /// - `nonce_cache`: 实例级重放保护缓存（#15: 从全局 static 改为实例级）
+    /// - `local_identity`: 本地 Ed25519 公钥 + binding_proof（#1: 身份绑定）
+    pub fn responder(
+        local_static_private: &[u8],
+        prologue: &[u8],
+        nonce_cache: Arc<NonceCache>,
+        local_identity: ([u8; 32], [u8; 64]),
+    ) -> CoreResult<Self> {
         let params = NOISE_PARAMS
             .parse()
             .map_err(|e| CoreError::Crypto(format!("解析 Noise 参数失败: {e}")))?;
@@ -205,6 +297,8 @@ impl NoiseHandshake {
         let state = builder
             .local_private_key(local_static_private)
             .map_err(|e| CoreError::Crypto(format!("设置本地私钥失败: {e}")))?
+            .prologue(prologue)
+            .map_err(|e| CoreError::Crypto(format!("设置 prologue 失败: {e}")))?
             .build_responder()
             .map_err(|e| CoreError::Crypto(format!("构建 responder 失败: {e}")))?;
         Ok(Self {
@@ -212,6 +306,9 @@ impl NoiseHandshake {
             role: NoiseRole::Responder,
             step: 0,
             replay_payload: Vec::new(),
+            nonce_cache,
+            local_identity,
+            remote_identity: None,
         })
     }
 
@@ -230,22 +327,25 @@ impl NoiseHandshake {
         match self.role {
             NoiseRole::Initiator => match self.step {
                 0 => {
-                    // -> e (含 replay protection payload)
-                    let payload = &self.replay_payload;
+                    // -> e (含 replay protection payload + 身份绑定)
+                    let payload = self.build_initiator_payload();
                     let len = self
                         .state
-                        .write_message(payload, &mut buf)
+                        .write_message(&payload, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("write_message 失败: {e}")))?;
                     self.step = 1;
                     Ok(buf[..len].to_vec())
                 }
                 1 => {
-                    // <- e, ee, s, es
+                    // <- e, ee, s, es (含 responder 身份绑定)
                     let received = received
                         .ok_or_else(|| CoreError::Crypto("initiator step 1 需要收到消息".into()))?;
-                    self.state
+                    let payload_len = self
+                        .state
                         .read_message(received, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("read_message 失败: {e}")))?;
+                    // 提取 responder 的身份绑定信息（缺失时立即失败，防止 DoS）
+                    self.extract_remote_identity(&buf[..payload_len])?;
                     // -> s, se
                     let len = self
                         .state
@@ -258,7 +358,7 @@ impl NoiseHandshake {
             },
             NoiseRole::Responder => match self.step {
                 0 => {
-                    // <- e (含 replay protection payload)
+                    // <- e (含 replay protection payload + initiator 身份绑定)
                     let received = received
                         .ok_or_else(|| CoreError::Crypto("responder step 0 需要收到消息".into()))?;
                     let payload_len = self
@@ -266,22 +366,22 @@ impl NoiseHandshake {
                         .read_message(received, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("read_message 失败: {e}")))?;
 
-                    // 验证重放保护 payload。
-                    // 空 payload 被拒绝——不存在向后兼容绕过。
-                    // 攻击者不能通过发空 payload 来绕过重放保护。
                     let payload = &buf[..payload_len];
-                    if payload.is_empty() {
+                    if payload.len() < REPLAY_PAYLOAD_LEN {
                         return Err(CoreError::Crypto(
-                            "握手 payload 为空，拒绝无重放保护的握手".into(),
+                            "握手 payload 过短，拒绝无重放保护的握手".into(),
                         ));
                     }
-                    verify_replay_payload(payload)?;
+                    // 提取 replay payload 和 initiator 身份绑定（缺失时立即失败，防止 DoS）
+                    let replay_len = self.extract_replay_and_remote_identity(payload)?;
+                    self.nonce_cache.verify_replay(&payload[..replay_len])?;
                     tracing::debug!("握手重放保护验证通过");
 
-                    // -> e, ee, s, es
+                    // -> e, ee, s, es (含 responder 身份绑定)
+                    let resp_payload = self.build_responder_payload();
                     let len = self
                         .state
-                        .write_message(&[], &mut buf)
+                        .write_message(&resp_payload, &mut buf)
                         .map_err(|e| CoreError::Crypto(format!("write_message 失败: {e}")))?;
                     self.step = 1;
                     Ok(buf[..len].to_vec())
@@ -306,7 +406,66 @@ impl NoiseHandshake {
         self.step >= 2
     }
 
+    /// 构建 initiator step 0 payload：replay_payload + 本地身份绑定（如果有）。
+    fn build_initiator_payload(&self) -> Vec<u8> {
+        let mut payload = self.replay_payload.clone();
+        let (pubkey, proof) = &self.local_identity;
+        payload.extend_from_slice(pubkey);
+        payload.extend_from_slice(proof);
+        payload
+    }
+
+    /// 构建 responder step 0 response payload：本地身份绑定（如果有）。
+    fn build_responder_payload(&self) -> Vec<u8> {
+        let (pubkey, proof) = &self.local_identity;
+        let mut payload = Vec::with_capacity(32 + 64);
+        payload.extend_from_slice(pubkey);
+        payload.extend_from_slice(proof);
+        payload
+    }
+
+    /// 从 responder 的 payload 中提取身份绑定信息（initiator step 1 调用）。
+    ///
+    /// 缺失身份绑定证明时立即返回错误，防止攻击者在不发送身份信息的情况下
+    /// 强制对端完成昂贵的密码学操作（DoS 减缓）。
+    fn extract_remote_identity(&mut self, payload: &[u8]) -> CoreResult<()> {
+        const IDENTITY_LEN: usize = 32 + 64;
+        if payload.len() < IDENTITY_LEN {
+            return Err(CoreError::Crypto(
+                "握手 payload 缺少对端身份绑定信息（pubkey + proof）".into(),
+            ));
+        }
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&payload[..32]);
+        let mut proof = [0u8; 64];
+        proof.copy_from_slice(&payload[32..IDENTITY_LEN]);
+        self.remote_identity = Some((pubkey, proof));
+        Ok(())
+    }
+
+    /// 从 initiator 的 payload 中提取 replay payload 和身份绑定（responder step 0 调用）。
+    ///
+    /// 缺失身份绑定证明时立即返回错误，防止攻击者在不发送身份信息的情况下
+    /// 强制对端完成昂贵的密码学操作（DoS 减缓）。
+    /// 成功时返回 replay payload 的长度。
+    fn extract_replay_and_remote_identity(&mut self, payload: &[u8]) -> CoreResult<usize> {
+        const REPLAY_LEN: usize = REPLAY_PAYLOAD_LEN;
+        const IDENTITY_LEN: usize = 32 + 64;
+        if payload.len() < REPLAY_LEN + IDENTITY_LEN {
+            return Err(CoreError::Crypto(
+                "握手 payload 缺少对端身份绑定信息（pubkey + proof）".into(),
+            ));
+        }
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&payload[REPLAY_LEN..REPLAY_LEN + 32]);
+        let mut proof = [0u8; 64];
+        proof.copy_from_slice(&payload[REPLAY_LEN + 32..REPLAY_LEN + IDENTITY_LEN]);
+        self.remote_identity = Some((pubkey, proof));
+        Ok(REPLAY_LEN)
+    }
+
     /// 转为传输模式，返回对端公钥和加密会话。
+    /// 如果握手过程中收到了对端的身份绑定信息，会在此验证。
     pub fn into_transport(self) -> CoreResult<HandshakeResult> {
         if !self.is_finished() {
             return Err(CoreError::Crypto("握手未完成".into()));
@@ -317,6 +476,16 @@ impl NoiseHandshake {
             .ok_or_else(|| CoreError::Crypto("无法获取对端静态公钥".into()))?;
         let mut remote_pubkey = [0u8; 32];
         remote_pubkey.copy_from_slice(remote_static);
+
+        // #1: 验证身份绑定——确保 X25519 静态公钥确实属于对端的 Ed25519 身份。
+        // CRITICAL: 强制要求身份验证，remote_identity 必须存在且通过验证。
+        let (ed25519_pubkey, binding_proof) = self
+            .remote_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::Crypto("握手缺少对端身份信息（remote_identity）".into()))?;
+        crate::identity::verify_static_binding(ed25519_pubkey, &remote_pubkey, binding_proof)?;
+        tracing::debug!("身份绑定验证通过");
+
         let transport = self
             .state
             .into_transport_mode()
@@ -333,13 +502,36 @@ mod tests {
     use super::*;
     use crate::identity::DeviceIdentity;
 
+    /// 测试用默认 prologue。
+    const TEST_PROLOGUE: &[u8] = b"tacit-test-v1";
+
+    fn make_nonce_cache() -> Arc<NonceCache> {
+        Arc::new(NonceCache::new())
+    }
+
     #[test]
     fn full_handshake() {
         let id1 = DeviceIdentity::generate().unwrap();
         let id2 = DeviceIdentity::generate().unwrap();
 
-        let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-        let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+        let cache = make_nonce_cache();
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+        let local_id2 = (id2.public_key(), *id2.binding_proof());
+
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache,
+            local_id2,
+        )
+        .unwrap();
 
         // step 1: initiator -> e (含 replay payload)
         let msg1 = init.step(None).unwrap();
@@ -374,8 +566,24 @@ mod tests {
         let id1 = DeviceIdentity::generate().unwrap();
         let id2 = DeviceIdentity::generate().unwrap();
 
-        let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-        let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+        let cache = make_nonce_cache();
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+        let local_id2 = (id2.public_key(), *id2.binding_proof());
+
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache,
+            local_id2,
+        )
+        .unwrap();
 
         let msg1 = init.step(None).unwrap();
         let msg2 = resp.step(Some(&msg1)).unwrap();
@@ -402,7 +610,40 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_prologue_fails_handshake() {
+        let id1 = DeviceIdentity::generate().unwrap();
+        let id2 = DeviceIdentity::generate().unwrap();
+
+        let cache = make_nonce_cache();
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+        let local_id2 = (id2.public_key(), *id2.binding_proof());
+
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            b"group-A",
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            b"group-B",
+            cache,
+            local_id2,
+        )
+        .unwrap();
+
+        let msg1 = init.step(None).unwrap();
+        // step 2: responder 读取 e（成功），发送加密的 e,ee,s,es（用错误 prologue 派生的密钥）
+        let msg2 = resp.step(Some(&msg1)).unwrap();
+        // step 3: initiator 尝试解密——prologue 不匹配导致解密失败
+        let result = init.step(Some(&msg2));
+        assert!(result.is_err(), "不同 prologue 应导致握手在解密阶段失败");
+    }
+
+    #[test]
     fn replay_protection_rejects_expired_timestamp() {
+        let cache = make_nonce_cache();
         // 构造过期的 payload（时间戳 = 现在 - 120s，超过 60s 窗口）
         let mut expired = vec![0u8; REPLAY_PAYLOAD_LEN];
         let old_ts = SystemTime::now()
@@ -413,12 +654,13 @@ mod tests {
         expired[..8].copy_from_slice(&(old_ts).to_be_bytes());
         rand::thread_rng().fill_bytes(&mut expired[8..]);
 
-        let result = verify_replay_payload(&expired);
+        let result = cache.verify_replay(&expired);
         assert!(result.is_err(), "过期握手应被拒绝");
     }
 
     #[test]
     fn replay_protection_rejects_future_timestamp() {
+        let cache = make_nonce_cache();
         // 构造超前的 payload（时间戳 = 现在 + 120s，超过 60s 窗口）
         let mut future = vec![0u8; REPLAY_PAYLOAD_LEN];
         let future_ts = SystemTime::now()
@@ -429,36 +671,73 @@ mod tests {
         future[..8].copy_from_slice(&(future_ts).to_be_bytes());
         rand::thread_rng().fill_bytes(&mut future[8..]);
 
-        let result = verify_replay_payload(&future);
+        let result = cache.verify_replay(&future);
         assert!(result.is_err(), "超前握手应被拒绝");
     }
 
     #[test]
     fn replay_protection_rejects_duplicate_nonce() {
+        let cache = make_nonce_cache();
         // 构造合法 payload
-        let payload = generate_replay_payload();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut payload = vec![0u8; REPLAY_PAYLOAD_LEN];
+        payload[..8].copy_from_slice(&now.to_be_bytes());
+        rand::thread_rng().fill_bytes(&mut payload[8..]);
 
         // 第一次验证应通过
-        let result1 = verify_replay_payload(&payload);
+        let result1 = cache.verify_replay(&payload);
         assert!(result1.is_ok(), "首次验证应通过");
 
         // 第二次验证（相同 nonce）应拒绝
-        let result2 = verify_replay_payload(&payload);
+        let result2 = cache.verify_replay(&payload);
         assert!(result2.is_err(), "重复 nonce 应被拒绝");
     }
 
     #[test]
     fn replay_protection_accepts_fresh_payload() {
-        let payload = generate_replay_payload();
-        let result = verify_replay_payload(&payload);
+        let cache = make_nonce_cache();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut payload = vec![0u8; REPLAY_PAYLOAD_LEN];
+        payload[..8].copy_from_slice(&now.to_be_bytes());
+        rand::thread_rng().fill_bytes(&mut payload[8..]);
+
+        let result = cache.verify_replay(&payload);
         assert!(result.is_ok(), "新鲜 payload 应通过验证");
     }
 
     #[test]
     fn replay_protection_rejects_empty_payload() {
-        // 空 payload 被拒绝——不存在向后兼容绕过。
-        // 攻击者不能通过发空 payload 来绕过重放保护。
-        let result = verify_replay_payload(&[]);
+        let cache = make_nonce_cache();
+        let result = cache.verify_replay(&[]);
         assert!(result.is_err(), "空 payload 应被拒绝");
+    }
+
+    #[test]
+    fn nonce_cache_independent_across_instances() {
+        // #15: 不同 NonceCache 实例应独立——同一 nonce 在不同实例中都应被接受。
+        let cache1 = make_nonce_cache();
+        let cache2 = make_nonce_cache();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut payload = vec![0u8; REPLAY_PAYLOAD_LEN];
+        payload[..8].copy_from_slice(&now.to_be_bytes());
+        rand::thread_rng().fill_bytes(&mut payload[8..]);
+
+        // cache1 接受
+        assert!(cache1.verify_replay(&payload).is_ok());
+        // cache2 也应接受（独立实例，不共享状态）
+        assert!(
+            cache2.verify_replay(&payload).is_ok(),
+            "不同 NonceCache 实例应独立"
+        );
     }
 }
