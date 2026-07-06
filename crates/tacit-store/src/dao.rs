@@ -987,7 +987,7 @@ pub fn load_device_identity(conn: &Connection) -> CoreResult<Option<DeviceIdenti
                 static_private,
                 static_public,
                 binding_proof,
-                created_at: UNIX_EPOCH + Duration::from_millis(created_at_ms as u64),
+                created_at: from_millis(created_at_ms),
             }))
         }
         None => Ok(None),

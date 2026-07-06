@@ -377,8 +377,12 @@ impl DefaultSyncEngine {
         use tacit_core::FrontierOps;
 
         // 检测本地是否有独有变更（local_frontier 未被 stale_frontier 覆盖）
-        let local_frontier = self.doc_store.block_frontier(doc_id, block_id)?;
-        let has_local_changes = !stale_frontier.covers(&local_frontier);
+        // 如果本地不存在该 block（返回 Err），则视为无本地独有变更，直接导入
+        let local_frontier = self.doc_store.block_frontier(doc_id, block_id);
+        let has_local_changes = match &local_frontier {
+            Ok(lf) => !stale_frontier.covers(lf),
+            Err(_) => false,
+        };
 
         if has_local_changes {
             debug!(

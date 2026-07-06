@@ -183,9 +183,10 @@ impl NonceCache {
             )));
         }
 
-        // #13: 时钟回拨检测——仅 warn，不改变拒绝/接受逻辑。
+        // #13: 时钟回拨检测与 max_seen_timestamp 更新。
+        // 合并为一个锁区间以减少锁竞争和开销。
         {
-            let guard = self.inner.lock();
+            let mut guard = self.inner.lock();
             if timestamp < guard.max_seen_timestamp
                 && guard.max_seen_timestamp - timestamp > CLOCK_ROLLBACK_WARN_SECS
             {
@@ -195,13 +196,7 @@ impl NonceCache {
                     guard.max_seen_timestamp,
                     guard.max_seen_timestamp - timestamp
                 );
-            }
-        }
-        // 更新 max_seen_timestamp（在锁外操作以减少锁持有时间，
-        // 竞态不影响正确性——取 max 是幂等的）
-        {
-            let mut guard = self.inner.lock();
-            if timestamp > guard.max_seen_timestamp {
+            } else if timestamp > guard.max_seen_timestamp {
                 guard.max_seen_timestamp = timestamp;
             }
         }

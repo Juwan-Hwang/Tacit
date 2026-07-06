@@ -149,16 +149,12 @@ impl TacitEngine {
             None => return Ok(None),
         };
         let static_kp = StaticKeypair {
-            private: {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&rec.static_private);
-                arr
-            },
-            public: {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&rec.static_public);
-                arr
-            },
+            private: rec.static_private.as_slice().try_into().map_err(|_| {
+                CoreError::Crypto("数据库中存储的静态私钥长度不正确".into())
+            })?,
+            public: rec.static_public.as_slice().try_into().map_err(|_| {
+                CoreError::Crypto("数据库中存储的静态公钥长度不正确".into())
+            })?,
         };
         let identity = DeviceIdentity::from_keys(
             &rec.signing_key,
