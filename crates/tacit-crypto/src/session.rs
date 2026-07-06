@@ -157,14 +157,28 @@ impl Session {
 mod tests {
     use super::*;
     use crate::identity::DeviceIdentity;
-    use crate::noise::NoiseHandshake;
+    use crate::noise::{NoiseHandshake, NonceCache};
+    use std::sync::Arc;
 
     fn establish_session() -> (Session, Session) {
         let id1 = DeviceIdentity::generate().unwrap();
         let id2 = DeviceIdentity::generate().unwrap();
 
-        let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-        let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+        let cache = Arc::new(NonceCache::new());
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            b"tacit-test-v1",
+            cache.clone(),
+            None,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            b"tacit-test-v1",
+            cache,
+            None,
+        )
+        .unwrap();
 
         let msg1 = init.step(None).unwrap();
         let msg2 = resp.step(Some(&msg1)).unwrap();

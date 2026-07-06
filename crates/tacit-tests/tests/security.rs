@@ -8,7 +8,7 @@
 //! - 会话加密解密
 
 use tacit_core::{BatchFlag, PeerId};
-use tacit_crypto::{DeviceIdentity, NoiseHandshake};
+use tacit_crypto::DeviceIdentity;
 use tacit_transport::batch::{BatchSigner, BatchVerifier, BatchVerifyResult};
 use tacit_transport_relay::{generate_proof, verify_proof, RelayServer};
 
@@ -18,11 +18,27 @@ fn pid(n: u64) -> PeerId {
 
 /// 建立一对 Noise 会话（initiator, responder），用于加密测试。
 fn establish_sessions() -> (tacit_crypto::Session, tacit_crypto::Session) {
+    use std::sync::Arc;
+    use tacit_crypto::{NoiseHandshake, NonceCache};
+
     let id1 = DeviceIdentity::generate().unwrap();
     let id2 = DeviceIdentity::generate().unwrap();
 
-    let mut init = NoiseHandshake::initiator(id1.static_keypair().private.as_slice()).unwrap();
-    let mut resp = NoiseHandshake::responder(id2.static_keypair().private.as_slice()).unwrap();
+    let cache = Arc::new(NonceCache::new());
+    let mut init = NoiseHandshake::initiator(
+        id1.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache.clone(),
+        None,
+    )
+    .unwrap();
+    let mut resp = NoiseHandshake::responder(
+        id2.static_keypair().private.as_slice(),
+        b"tacit-test-v1",
+        cache,
+        None,
+    )
+    .unwrap();
 
     let msg1 = init.step(None).unwrap();
     let msg2 = resp.step(Some(&msg1)).unwrap();
