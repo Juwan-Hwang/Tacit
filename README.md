@@ -109,8 +109,8 @@ let view = engine.open_document("doc1".into())?;
 ### Frame Formats (Binary)
 
 - **Discovery Frame**: `magic(2) | version(1) | group_id(4) | device_id(8) | capability_bits(2) | checksum(2)`
-- **Control Frame**: `magic(2) | version(1) | ctrl_type(1) | session_id(8) | payload_len(2) | payload(n) | mac(16)`
-- **Data Frame**: `magic(2) | version(1) | flags(1) | doc_id(8) | actor_id(8) | seq(4) | kind(1) | payload_len(4) | payload(n) | ref(8) | sig(batch) | mac(16)`
+- **Control Frame**: `magic(2) | version(1) | ctrl_type(1) | session_id(8) | payload_len(2) | payload(n)`
+- **Data Frame**: `magic(2) | version(1) | flags(1) | doc_id(8) | actor_id(8) | seq(4) | kind(1) | payload_len(4) | payload(n) | ref(8) | sig(batch)`
 
 ### Sync Flow
 
