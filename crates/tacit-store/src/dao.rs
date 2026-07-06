@@ -928,6 +928,72 @@ pub fn update_transport_ema(
     Ok(())
 }
 
+// ===== 设备身份持久化（#4）=====
+
+/// 设备身份记录（对应 `device_identity` 表）。
+pub struct DeviceIdentityRecord {
+    pub signing_key: Vec<u8>,
+    pub static_private: Vec<u8>,
+    pub static_public: Vec<u8>,
+    pub binding_proof: Vec<u8>,
+    pub created_at: SystemTime,
+}
+
+/// 保存设备身份（upsert，单行表）。
+pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> CoreResult<()> {
+    let now = rec
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT OR REPLACE INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+         VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+        params![
+            rec.signing_key,
+            rec.static_private,
+            rec.static_public,
+            rec.binding_proof,
+            now
+        ],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// 加载设备身份。
+pub fn load_device_identity(conn: &Connection) -> CoreResult<Option<DeviceIdentityRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT signing_key, static_private, static_public, binding_proof, created_at
+             FROM device_identity WHERE id = 'default'",
+            [],
+            |row| {
+                let signing_key: Vec<u8> = row.get(0)?;
+                let static_private: Vec<u8> = row.get(1)?;
+                let static_public: Vec<u8> = row.get(2)?;
+                let binding_proof: Vec<u8> = row.get(3)?;
+                let created_at_ms: i64 = row.get(4)?;
+                Ok((signing_key, static_private, static_public, binding_proof, created_at_ms))
+            },
+        )
+        .optional()
+        .map_err(store_err)?;
+
+    match row {
+        Some((signing_key, static_private, static_public, binding_proof, created_at_ms)) => {
+            Ok(Some(DeviceIdentityRecord {
+                signing_key,
+                static_private,
+                static_public,
+                binding_proof,
+                created_at: UNIX_EPOCH + Duration::from_millis(created_at_ms as u64),
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 // ===== 辅助 =====
 
 fn store_err(e: rusqlite::Error) -> CoreError {

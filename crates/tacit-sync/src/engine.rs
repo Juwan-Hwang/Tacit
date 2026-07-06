@@ -357,6 +357,63 @@ impl DefaultSyncEngine {
         Ok(())
     }
 
+    /// #8 接入点：peer 侧接收 anchor 发来的 shallow snapshot 并执行手术式重入。
+    ///
+    /// 当 anchor 检测到 peer 处于 stale 状态时，anchor 调用 `stale_catchup_export`
+    /// 导出 shallow snapshot + tail delta 并发送给 peer。peer 收到后调用此方法：
+    ///
+    /// 1. 检测本地是否有自 `stale_frontier` 以来的独有变更
+    /// 2. 如果有冲突，调用 `surgical_reentry` 执行手术式重入（备份→提取本地增量→重建→重放）
+    /// 3. 如果无冲突，直接导入 snapshot
+    /// 4. 冲突合并后发射 `ConflictMerged` 事件通知 UI
+    pub fn apply_recovery_snapshot(
+        &self,
+        doc_id: &DocId,
+        block_id: &BlockId,
+        remote_snapshot: &[u8],
+        stale_frontier: &Frontier,
+    ) -> CoreResult<()> {
+        use crate::recovery::surgical_reentry;
+        use tacit_core::FrontierOps;
+
+        // 检测本地是否有独有变更（local_frontier 未被 stale_frontier 覆盖）
+        let local_frontier = self.doc_store.block_frontier(doc_id, block_id)?;
+        let has_local_changes = !stale_frontier.covers(&local_frontier);
+
+        if has_local_changes {
+            debug!(
+                doc_id = %doc_id,
+                block_id = %block_id,
+                "检测到本地独有变更，执行手术式重入"
+            );
+            let result = surgical_reentry(
+                &self.doc_store,
+                doc_id,
+                block_id,
+                remote_snapshot,
+                stale_frontier,
+            )?;
+
+            if result.had_conflict {
+                self.push_action(SyncAction::EmitEvent(
+                    tacit_core::CoreEvent::ConflictMerged {
+                        doc_id: doc_id.clone(),
+                        block_id: Some(block_id.clone()),
+                    },
+                ));
+            }
+        } else {
+            debug!(
+                doc_id = %doc_id,
+                block_id = %block_id,
+                "无本地独有变更，直接导入 shallow snapshot"
+            );
+            self.doc_store.import_block(doc_id, block_id, remote_snapshot)?;
+        }
+
+        Ok(())
+    }
+
     /// 应用远端 MetaDoc delta。
     pub fn apply_remote_meta_delta(
         &self,
