@@ -7,12 +7,13 @@
 //! - UI 线程可通过 `CommandBus` 发送命令，由 `RuntimeSupervisor` 异步消费。
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use parking_lot::Mutex;
 use tacit_core::{
     BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId, SyncReason,
 };
+use tacit_crypto::{DeviceIdentity, StaticKeypair};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tracing::debug;
@@ -121,6 +122,55 @@ impl TacitEngine {
         self.doc_store.create_doc(DocId::new(doc_id), &kind)
     }
 
+    /// #4: 保存设备身份到数据库（持久化）。
+    ///
+    /// 将 Ed25519 签名密钥、X25519 静态密钥对和绑定证明写入 `device_identity` 表。
+    /// 应用启动时调用 `load_device_identity` 恢复身份，避免每次重启生成新身份。
+    ///
+    /// # Security Notice
+    /// 私钥以明文存储在 SQLite 中。生产环境应使用平台安全存储（iOS Keychain /
+    /// Android Keystore）或 SQLCipher 加密数据库。当前实现适用于开发和测试阶段；
+    /// 后续应通过 trait 抽象存储后端，由各平台提供安全实现。
+    pub fn save_device_identity(&self, identity: &DeviceIdentity) -> CoreResult<()> {
+        let conn = self.doc_store.store().conn();
+        let rec = tacit_store::dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(
+                identity
+                    .signing_key_bytes()
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::Crypto("签名密钥长度不为 32 字节".into()))?,
+            ),
+            static_private: zeroize::Zeroizing::new(identity.static_keypair().private),
+            static_public: identity.static_keypair().public.to_vec(),
+            binding_proof: identity.binding_proof().to_vec(),
+            created_at: SystemTime::now(),
+        };
+        tacit_store::dao::save_device_identity(&conn, &rec)
+    }
+
+    /// #4: 从数据库加载设备身份。
+    ///
+    /// 返回 `Ok(Some(identity))` 表示数据库中已有身份；
+    /// 返回 `Ok(None)` 表示首次启动，需要调用 `DeviceIdentity::generate()` 生成新身份。
+    pub fn load_device_identity(&self) -> CoreResult<Option<DeviceIdentity>> {
+        let conn = self.doc_store.store().conn();
+        let rec = match tacit_store::dao::load_device_identity(&conn)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let static_kp = StaticKeypair {
+            private: *rec.static_private,
+            public: rec
+                .static_public
+                .as_slice()
+                .try_into()
+                .map_err(|_| CoreError::Crypto("数据库中存储的静态公钥长度不正确".into()))?,
+        };
+        let identity = DeviceIdentity::from_keys(&*rec.signing_key, static_kp, &rec.binding_proof)?;
+        Ok(Some(identity))
+    }
+
     /// 打开文档，返回视图。
     pub fn open_document(&self, doc_id: String) -> CoreResult<DocumentView> {
         let doc_id = DocId::new(doc_id);
@@ -142,6 +192,20 @@ impl TacitEngine {
         })
     }
 
+    /// 获取 block 的渲染内容（字节数组）。
+    ///
+    /// 返回 block 的 `render_bytes`，格式取决于 block 类型：
+    /// - Text: UTF-8 文本
+    /// - Todo/Log: JSON 数组
+    ///
+    /// 用于移动端 UI 渲染文档内容。
+    pub fn get_block_content(&self, doc_id: String, block_id: String) -> CoreResult<Vec<u8>> {
+        let doc_id_obj = DocId::new(doc_id);
+        let block_id_obj = BlockId::new(block_id);
+        let block = self.doc_store.get_block(&doc_id_obj, &block_id_obj)?;
+        block.export_render_bytes()
+    }
+
     /// 创建 block。
     pub fn create_block(&self, doc_id: String, block_id: String, kind: String) -> CoreResult<()> {
         use tacit_core::BlockKind;
@@ -160,23 +224,28 @@ impl TacitEngine {
     ///
     /// `edit_bytes`：Loro delta 编码。
     ///
-    /// 此方法同步执行 CRDT 合并与持久化。对于大导入（>1MB）或非关键路径，
-    /// 建议通过 `send_command(Command::ApplyUserEdit{...})` 异步执行，
-    /// 命令会通过 per-doc actor 串行处理，不阻塞 UI 线程。
+    /// # 大导入限制
+    ///
+    /// 此方法为**同步 API**，仅适用于小编辑（< 1MB）。
+    /// 超过 1MB 的编辑会被拒绝并返回 `Error`，调用方应改用异步路径：
+    /// ```ignore
+    /// engine.send_command(Command::ApplyUserEdit { doc_id, block_id, edit_bytes })?;
+    /// ```
+    /// 异步路径通过 per-doc actor 串行处理，不阻塞 UI 线程。
     pub fn apply_user_edit(
         &self,
         doc_id: String,
         block_id: String,
         edit_bytes: Vec<u8>,
     ) -> CoreResult<()> {
-        // 大导入检测：超过 1MB 记录 warn 日志
-        if edit_bytes.len() > 1024 * 1024 {
-            tracing::warn!(
-                doc_id = %doc_id,
-                block_id = %block_id,
-                size = edit_bytes.len(),
-                "大导入同步执行，建议通过 send_command 异步执行"
-            );
+        // #19/#9: 大导入检测——同步 API 拒绝 >1MB 的编辑，引导使用异步路径
+        const SYNC_EDIT_MAX_BYTES: usize = 1024 * 1024;
+        if edit_bytes.len() > SYNC_EDIT_MAX_BYTES {
+            return Err(CoreError::Store(format!(
+                "同步 API 拒绝大导入（{} 字节 > {} 字节），请使用 send_command(Command::ApplyUserEdit) 异步路径",
+                edit_bytes.len(),
+                SYNC_EDIT_MAX_BYTES
+            )));
         }
         let doc_id_obj = DocId::new(doc_id);
         let block_id_obj = BlockId::new(block_id);
@@ -483,6 +552,111 @@ impl TacitEngine {
         doc_id: String,
     ) -> Result<DocumentView, crate::error::TacitFfiError> {
         Ok(self.open_document(doc_id)?)
+    }
+
+    /// 获取 block 的渲染内容。
+    ///
+    /// 返回 `render_bytes`（Text 为 UTF-8 文本，Todo/Log 为 JSON 数组）。
+    pub fn ffi_get_block_content(
+        &self,
+        doc_id: String,
+        block_id: String,
+    ) -> Result<Vec<u8>, crate::error::TacitFfiError> {
+        Ok(self.get_block_content(doc_id, block_id)?)
+    }
+
+    /// 生成并保存设备身份到数据库。
+    ///
+    /// 私钥永远不会离开 Rust 内存空间，FFI 调用方只能获取公开信息。
+    ///
+    /// 如果数据库中已存在设备身份，则直接返回现有身份的公开信息，
+    /// 不会静默覆盖——防止已有 PeerId 的文档和同步状态被孤立。
+    ///
+    /// 采用三步式设计避免在持有 DB 锁时执行昂贵的密码学操作：
+    /// 1. 锁内检查已有身份 → 2. 锁外生成密钥 → 3. 锁内二次检查 + INSERT
+    pub fn ffi_generate_and_save_device_identity(
+        &self,
+    ) -> Result<crate::view::FfiDevicePublicInfo, crate::error::TacitFfiError> {
+        // 1. 先在锁内检查是否存在已有身份
+        {
+            let conn = self.doc_store.store().conn();
+            if let Some(rec) = tacit_store::dao::load_device_identity(&conn)? {
+                let static_kp = StaticKeypair {
+                    private: *rec.static_private,
+                    public: rec.static_public.as_slice().try_into().map_err(|_| {
+                        CoreError::Crypto("数据库中存储的静态公钥长度不正确".into())
+                    })?,
+                };
+                let di =
+                    DeviceIdentity::from_keys(&*rec.signing_key, static_kp, &rec.binding_proof)?;
+                return Ok(crate::view::FfiDevicePublicInfo {
+                    verifying_key: di.verifying_key().to_bytes().to_vec(),
+                    static_public: di.static_keypair().public.to_vec(),
+                    peer_id: di.peer_id().0.clone(),
+                });
+            }
+        }
+
+        // 2. 锁外生成新身份（避免持有 DB 锁执行昂贵的密码学操作）
+        let di = tacit_crypto::DeviceIdentity::generate()?;
+        let info = crate::view::FfiDevicePublicInfo {
+            verifying_key: di.verifying_key().to_bytes().to_vec(),
+            static_public: di.static_keypair().public.to_vec(),
+            peer_id: di.peer_id().0.clone(),
+        };
+        let rec = tacit_store::dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new(
+                di.signing_key_bytes()
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::Crypto("签名密钥长度不为 32 字节".into()))?,
+            ),
+            static_private: zeroize::Zeroizing::new(di.static_keypair().private),
+            static_public: di.static_keypair().public.to_vec(),
+            binding_proof: di.binding_proof().to_vec(),
+            created_at: SystemTime::now(),
+        };
+
+        // 3. 重新获取锁并保存（INSERT 约束会自动防止并发覆盖）
+        let conn = self.doc_store.store().conn();
+        // 二次检查：如果在此期间已有其他线程保存了身份，直接返回已有身份
+        if let Some(existing_rec) = tacit_store::dao::load_device_identity(&conn)? {
+            let static_kp = StaticKeypair {
+                private: *existing_rec.static_private,
+                public: existing_rec
+                    .static_public
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoreError::Crypto("数据库中存储的静态公钥长度不正确".into()))?,
+            };
+            let existing_di = DeviceIdentity::from_keys(
+                &*existing_rec.signing_key,
+                static_kp,
+                &existing_rec.binding_proof,
+            )?;
+            return Ok(crate::view::FfiDevicePublicInfo {
+                verifying_key: existing_di.verifying_key().to_bytes().to_vec(),
+                static_public: existing_di.static_keypair().public.to_vec(),
+                peer_id: existing_di.peer_id().0.clone(),
+            });
+        }
+        tacit_store::dao::save_device_identity(&conn, &rec)?;
+        Ok(info)
+    }
+
+    /// 获取已保存设备身份的公开信息。
+    ///
+    /// 只返回公钥和 PeerId，不暴露私钥。
+    pub fn ffi_get_device_public_info(
+        &self,
+    ) -> Result<Option<crate::view::FfiDevicePublicInfo>, crate::error::TacitFfiError> {
+        Ok(self
+            .load_device_identity()?
+            .map(|di| crate::view::FfiDevicePublicInfo {
+                verifying_key: di.verifying_key().to_bytes().to_vec(),
+                static_public: di.static_keypair().public.to_vec(),
+                peer_id: di.peer_id().0.clone(),
+            }))
     }
 
     /// 创建 block。
