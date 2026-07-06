@@ -6,17 +6,20 @@
 //! 本类型与 Loro 解耦：`tacit-crdt` 负责 Loro 原生 frontier 与本类型之间的
 //! 双向转换，使 store/sync 层无需直接依赖 Loro。
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::ids::PeerId;
 
 /// 版本向量。记录每个 peer 已知的最新 seq。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 内部使用 `BTreeMap` 而非 `HashMap`，确保迭代顺序确定，
+/// 从而 `Hash` 实现稳定一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Frontier {
     /// peer_id -> 该 peer 的最新已知 seq。
-    map: HashMap<String, u64>,
+    map: BTreeMap<String, u64>,
 }
 
 impl Frontier {
