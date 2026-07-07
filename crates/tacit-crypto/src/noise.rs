@@ -58,6 +58,11 @@ pub enum NoiseRole {
 pub struct HandshakeResult {
     /// 对端的静态公钥（X25519，32 字节）。
     pub remote_static_pubkey: [u8; 32],
+    /// 对端的 Ed25519 验证公钥（32 字节），用于上层信任校验。
+    ///
+    /// 握手完成后，调用方可用此公钥查询 `PeerRegistry` 判断对端是否为已配对设备。
+    /// crypto 层不做信任查询（避免循环依赖），仅暴露公钥供上层决策。
+    pub remote_ed25519_pubkey: [u8; 32],
     /// 加密会话。
     pub session: Session,
 }
@@ -270,6 +275,30 @@ pub struct NoiseHandshake {
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
 impl NoiseHandshake {
+    /// 构造 Noise prologue：`protocol_version || group_id`。
+    ///
+    /// 确保握手双方使用统一格式的 prologue，避免因拼接顺序或编码不一致
+    /// 导致握手失败。prologue 不匹配会导致握手在解密阶段失败，
+    /// 从而实现跨版本/跨组隔离。
+    ///
+    /// # 参数
+    /// - `protocol_version`: 协议版本号（1 字节）
+    /// - `group_id`: 群组标识
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let prologue = NoiseHandshake::make_prologue(1, b"group-A");
+    /// let mut init = NoiseHandshake::initiator(
+    ///     sk, &prologue, cache, identity,
+    /// )?;
+    /// ```
+    pub fn make_prologue(protocol_version: u8, group_id: &[u8]) -> Vec<u8> {
+        let mut prologue = Vec::with_capacity(1 + group_id.len());
+        prologue.push(protocol_version);
+        prologue.extend_from_slice(group_id);
+        prologue
+    }
+
     /// 创建 initiator。
     ///
     /// # 参数
@@ -520,6 +549,7 @@ impl NoiseHandshake {
             .map_err(|e| CoreError::Crypto(format!("转为传输模式失败: {e}")))?;
         Ok(HandshakeResult {
             remote_static_pubkey: remote_pubkey,
+            remote_ed25519_pubkey: *ed25519_pubkey,
             session: Session::new(transport),
         })
     }
@@ -584,9 +614,12 @@ mod tests {
         let result1 = init.into_transport().unwrap();
         let result2 = resp.into_transport().unwrap();
 
-        // 验证对端公钥
+        // 验证对端 X25519 公钥
         assert_eq!(result1.remote_static_pubkey, id2.static_keypair().public);
         assert_eq!(result2.remote_static_pubkey, id1.static_keypair().public);
+        // 验证对端 Ed25519 公钥
+        assert_eq!(result1.remote_ed25519_pubkey, id2.public_key());
+        assert_eq!(result2.remote_ed25519_pubkey, id1.public_key());
     }
 
     #[test]
@@ -744,6 +777,115 @@ mod tests {
         let cache = make_nonce_cache();
         let result = cache.verify_replay(&[]);
         assert!(result.is_err(), "空 payload 应被拒绝");
+    }
+
+    #[test]
+    fn handshake_exposes_remote_ed25519_pubkey() {
+        let id1 = DeviceIdentity::generate().unwrap();
+        let id2 = DeviceIdentity::generate().unwrap();
+
+        let cache = make_nonce_cache();
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+        let local_id2 = (id2.public_key(), *id2.binding_proof());
+
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache,
+            local_id2,
+        )
+        .unwrap();
+
+        let msg1 = init.step(None).unwrap();
+        let msg2 = resp.step(Some(&msg1)).unwrap();
+        let msg3 = init.step(Some(&msg2)).unwrap();
+        let _ = resp.step(Some(&msg3)).unwrap();
+
+        let result1 = init.into_transport().unwrap();
+        let result2 = resp.into_transport().unwrap();
+
+        // initiator 应获得 responder 的 Ed25519 公钥
+        assert_eq!(result1.remote_ed25519_pubkey, id2.public_key());
+        // responder 应获得 initiator 的 Ed25519 公钥
+        assert_eq!(result2.remote_ed25519_pubkey, id1.public_key());
+    }
+
+    #[test]
+    fn make_prologue_correct_format() {
+        let prologue = NoiseHandshake::make_prologue(1, b"group-A");
+        assert_eq!(
+            prologue,
+            vec![1u8, b'g', b'r', b'o', b'u', b'p', b'-', b'A']
+        );
+    }
+
+    #[test]
+    fn make_prologue_different_inputs_produce_different_output() {
+        let p1 = NoiseHandshake::make_prologue(1, b"group-A");
+        let p2 = NoiseHandshake::make_prologue(2, b"group-A");
+        let p3 = NoiseHandshake::make_prologue(1, b"group-B");
+        assert_ne!(p1, p2, "不同版本应产生不同 prologue");
+        assert_ne!(p1, p3, "不同 group_id 应产生不同 prologue");
+        assert_eq!(
+            p1,
+            NoiseHandshake::make_prologue(1, b"group-A"),
+            "相同输入应产生相同 prologue"
+        );
+    }
+
+    #[test]
+    fn into_transport_rejects_mismatched_binding_proof() {
+        let id1 = DeviceIdentity::generate().unwrap();
+        let id2 = DeviceIdentity::generate().unwrap();
+
+        let cache = make_nonce_cache();
+        let local_id1 = (id1.public_key(), *id1.binding_proof());
+
+        // 篡改 responder 的 binding proof：翻转一个 bit
+        let mut tampered_proof = *id2.binding_proof();
+        tampered_proof[0] ^= 0xFF;
+        let local_id2 = (id2.public_key(), tampered_proof);
+
+        let mut init = NoiseHandshake::initiator(
+            id1.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache.clone(),
+            local_id1,
+        )
+        .unwrap();
+        let mut resp = NoiseHandshake::responder(
+            id2.static_keypair().private.as_slice(),
+            TEST_PROLOGUE,
+            cache,
+            local_id2,
+        )
+        .unwrap();
+
+        let msg1 = init.step(None).unwrap();
+        let msg2 = resp.step(Some(&msg1)).unwrap();
+        let msg3 = init.step(Some(&msg2)).unwrap();
+        let _ = resp.step(Some(&msg3)).unwrap();
+
+        // initiator 收到篡改的 binding proof，into_transport() 应失败
+        let result = init.into_transport();
+        assert!(
+            result.is_err(),
+            "篡改的 binding proof 应导致 into_transport() 失败"
+        );
+
+        // responder 收到 id1 的正确 binding proof，into_transport() 应成功
+        let result2 = resp.into_transport();
+        assert!(
+            result2.is_ok(),
+            "正确的 binding proof 应通过 into_transport() 验证"
+        );
     }
 
     #[test]
