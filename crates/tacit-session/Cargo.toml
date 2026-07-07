@@ -1,0 +1,24 @@
+[package]
+name = "tacit-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tacit-core = { workspace = true }
+tacit-sync = { workspace = true }
+tacit-transport = { workspace = true }
+tacit-store = { workspace = true }
+async-trait = "0.1"
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+tacit-crdt = { workspace = true }
