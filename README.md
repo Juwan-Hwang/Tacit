@@ -147,6 +147,6 @@ let view = engine.open_document("doc1".into())?;
 
 ## License
 
-MIT License -- Copyright (c) 2026 Juwan Hwang (黄治文)
+MIT License -- Copyright (c) 2026 Juwan Hwang
 
 See [LICENSE](LICENSE) for details.
