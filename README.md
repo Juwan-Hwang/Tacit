@@ -46,6 +46,8 @@ Tacit enables zero-wait local writes, near-field sync over LAN, cross-internet n
 | `tacit-transport-relay` | Relay protocol: client/server, admission gate, session-level temp IDs |
 | `tacit-sync` | SyncEngine, dependency wait queue, dual-watermark GC, stale peer recovery |
 | `tacit-ffi` | UniFFI FFI layer, CommandBus, EventBus, RuntimeSupervisor, per-doc actors |
+| `tacit-transport-sms` | Data SMS transport codec (experimental, not in main sync path) |
+| `tacit-bindgen` | UniFFI binding generator CLI (Kotlin/Swift/Python) |
 | `tacit-tests` | Integration, convergence (proptest), chaos, security, offline catch-up tests |
 
 ## Data Model
@@ -130,10 +132,24 @@ let view = engine.open_document("doc1".into())?;
 ## Security
 
 - Device public key = identity (Ed25519)
+- X25519 static key bound to Ed25519 via `binding_proof` (signature)
 - In-group pre-trust: all paired device keys are trusted
-- Face-to-face pairing with short authentication code (SAS)
-- Noise_XX handshake for session encryption
+- Face-to-face pairing with short authentication code (SAS, constant-time comparison)
+- Noise_XX handshake with prologue (`version || group_id`) for cross-group isolation
+- Replay protection: per-instance `NonceCache` (60s window, 100K cap, batch eviction)
 - Relay sees only connection metadata, never content
+
+### Encryption Paths
+
+| Path | Encryption | Notes |
+|---|---|---|
+| QUIC direct (LAN/WAN) | TLS 1.3 (quinn) | Transport-layer encryption; no additional Noise AEAD overlay |
+| Relay | Noise E2E AEAD (ChaCha20-Poly1305) | Relay server is untrusted; only endpoints hold session keys |
+
+### Known Security Debt (v1.0)
+
+- **Private key storage**: Device signing key and X25519 static private key are stored in plaintext SQLite by default. Desktop platforms (macOS Keychain, Windows Credential Manager, Linux Secret Service) are now supported via the `keyring` feature. Platform secure enclaves for mobile (iOS Keychain / Android Keystore) are planned for v2.0.
+- **No handshake rate limiting**: Relay admission proof mitigates spam; client-side rate limiting is deferred to relay server-side implementation.
 
 ## Testing
 
@@ -144,6 +160,8 @@ let view = engine.open_document("doc1".into())?;
 | Integration tests | 3-node LAN sync, Anchor offline switch, stale device catch-up, relay fallback, fast-resume, Noise handshake |
 | Chaos tests | Random disconnects, packet loss simulation |
 | Security tests | Peer spoofing, replay attacks, unauthorized relay access |
+
+> **Note**: This repository is a **sync engine library**, not a standalone application. End-to-end network sync requires a host integration layer (iOS/Android/desktop app) that wires `SyncEngine` actions to real transports. Integration tests in this repository operate at the DocStore level (simulated byte transfer between in-memory stores), not through real network transports.
 
 ## License
 
