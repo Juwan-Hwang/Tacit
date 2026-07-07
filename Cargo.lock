@@ -2987,6 +2987,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "hex",
  "parking_lot",
  "serde",
  "serde_json",

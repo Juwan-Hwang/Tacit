@@ -130,10 +130,24 @@ let view = engine.open_document("doc1".into())?;
 ## Security
 
 - Device public key = identity (Ed25519)
+- X25519 static key bound to Ed25519 via `binding_proof` (signature)
 - In-group pre-trust: all paired device keys are trusted
-- Face-to-face pairing with short authentication code (SAS)
-- Noise_XX handshake for session encryption
+- Face-to-face pairing with short authentication code (SAS, constant-time comparison)
+- Noise_XX handshake with prologue (`version || group_id`) for cross-group isolation
+- Replay protection: per-instance `NonceCache` (60s window, 100K cap, batch eviction)
 - Relay sees only connection metadata, never content
+
+### Encryption Paths
+
+| Path | Encryption | Notes |
+|---|---|---|
+| QUIC direct (LAN/WAN) | TLS 1.3 (quinn) | Transport-layer encryption; no additional Noise AEAD overlay |
+| Relay | Noise E2E AEAD (ChaCha20-Poly1305) | Relay server is untrusted; only endpoints hold session keys |
+
+### Known Security Debt (v1.0)
+
+- **Private key storage**: Device signing key and X25519 static private key are stored in plaintext SQLite. Platform secure enclaves (iOS Keychain / Android Keystore / Windows DPAPI) are planned for v2.0.
+- **No handshake rate limiting**: Relay admission proof mitigates spam; client-side rate limiting is deferred to relay server-side implementation.
 
 ## Testing
 
