@@ -8,6 +8,11 @@ authors.workspace = true
 repository.workspace = true
 description = "设备身份、签名、Noise 握手、session key 管理"
 
+[features]
+default = []
+# 启用桌面平台原生密钥存储（Windows Credential Manager / macOS Keychain / Linux secret-service）
+keyring = ["dep:keyring"]
+
 [dependencies]
 tacit-core.workspace = true
 thiserror.workspace = true
@@ -23,6 +28,7 @@ serde_json.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 subtle.workspace = true
+keyring = { version = "3", optional = true }
 
 [dev-dependencies]
 rand = { workspace = true, features = ["std_rng"] }

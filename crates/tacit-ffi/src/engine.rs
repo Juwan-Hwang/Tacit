@@ -452,6 +452,7 @@ impl TacitEngine {
                     bytes,
                     priority,
                     path,
+                    entry_id,
                 } => {
                     result.push(FfiSyncAction::SendData {
                         action: FfiSendDataAction {
@@ -461,6 +462,7 @@ impl TacitEngine {
                             data: bytes.clone(),
                             priority: priority_to_u8(*priority),
                             path: path_to_str(*path).to_string(),
+                            entry_id: entry_id.as_ref().map(|e| e.to_string()),
                         },
                     });
                 }
@@ -776,6 +778,16 @@ impl TacitEngine {
     /// 集成层应定期调用此方法（如每 50ms）。
     pub fn ffi_drain_actions(&self) -> Result<Vec<FfiSyncAction>, crate::error::TacitFfiError> {
         Ok(self.drain_actions()?)
+    }
+
+    /// 标记 store-and-forward 条目为已投递。
+    ///
+    /// FFI 宿主端在成功发送 `FfiSendDataAction`（含 `entry_id`）后调用此方法，
+    /// 将对应的 `sync_log` 记录标记为已投递，防止离线消息在每次 peer 上线时无限重发。
+    pub fn ffi_mark_delivered(&self, entry_id: String) -> Result<(), crate::error::TacitFfiError> {
+        let conn = self.doc_store.store().conn();
+        tacit_store::dao::mark_delivered(&conn, &entry_id, std::time::SystemTime::now())
+            .map_err(crate::error::TacitFfiError::from)
     }
 
     /// 处理依赖等待重试。
