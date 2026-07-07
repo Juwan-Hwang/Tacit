@@ -98,7 +98,7 @@ impl EventBus {
                 match sub.tx.try_send(event.clone()) {
                     Ok(()) => count += 1,
                     Err(crossbeam_channel::TrySendError::Full(_)) => {
-                        tracing::debug!("EventBus 订阅者 {} 队列已满，丢弃事件", sub.id);
+                        tracing::warn!("EventBus 订阅者 {} 队列已满，丢弃事件", sub.id);
                     }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                         disconnected_ids.push(sub.id);
