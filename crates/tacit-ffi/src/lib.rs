@@ -31,8 +31,8 @@ pub use event_bus::{EventBus, EventFilter, SubscriptionId};
 pub use listener::{ForeignEventListener, TacitEventListener};
 pub use runtime::{RuntimeConfig, RuntimeState, RuntimeSupervisor};
 pub use view::{
-    DocumentView, FfiRequestDeltaAction, FfiSendControlAction, FfiSendDataAction, FfiSyncAction,
-    SyncStatus,
+    DocumentView, DocumentViewWithContent, FfiBlockContent, FfiRequestDeltaAction,
+    FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus,
 };
 
 uniffi::setup_scaffolding!();
