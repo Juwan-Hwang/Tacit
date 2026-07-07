@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::RwLock;
 use tacit_core::CoreEvent;
 
@@ -56,7 +56,9 @@ impl EventBus {
         &self,
         filter: Option<EventFilter>,
     ) -> (SubscriptionId, Receiver<CoreEvent>) {
-        let (tx, rx) = unbounded();
+        // 有界通道：防止慢订阅者导致无界内存增长（DoS/OOM）。
+        // 容量 256：足以吸收突发事件，超出时丢弃并告警。
+        let (tx, rx) = bounded(256);
         let id = {
             let mut next = self.next_id.lock();
             let v = *next;
@@ -78,20 +80,39 @@ impl EventBus {
 
     /// 发布事件到所有匹配的订阅者。
     /// 返回成功送达的订阅者数量。
+    ///
+    /// 慢订阅者策略：`try_send` 非阻塞，队列满时丢弃事件并记录 warn 日志。
+    /// 这是有意设计——慢订阅者不应阻塞发布者（通常是同步引擎主线程）。
     pub fn publish(&self, event: &CoreEvent) -> usize {
-        let subscribers = self.subscribers.read();
+        let mut disconnected_ids = Vec::new();
         let mut count = 0;
-        for sub in subscribers.iter() {
-            // 检查过滤器
-            let matches = sub.filter.as_ref().map(|f| f(event)).unwrap_or(true);
-            if !matches {
-                continue;
+
+        // 1. 读锁内发送事件并收集已断开连接的订阅者 ID
+        {
+            let subscribers = self.subscribers.read();
+            for sub in subscribers.iter() {
+                let matches = sub.filter.as_ref().map(|f| f(event)).unwrap_or(true);
+                if !matches {
+                    continue;
+                }
+                match sub.tx.try_send(event.clone()) {
+                    Ok(()) => count += 1,
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        tracing::debug!("EventBus 订阅者 {} 队列已满，丢弃事件", sub.id);
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        disconnected_ids.push(sub.id);
+                    }
+                }
             }
-            // 非阻塞发送：订阅者慢时丢弃事件（避免阻塞发布者）
-            if sub.tx.try_send(event.clone()).is_ok() {
-                count += 1;
-            }
+        } // 读锁释放
+
+        // 2. 写锁内清理已断开连接的订阅者，防止内存泄漏和日志洪泛
+        if !disconnected_ids.is_empty() {
+            let mut subs = self.subscribers.write();
+            subs.retain(|s| !disconnected_ids.contains(&s.id));
         }
+
         count
     }
 
