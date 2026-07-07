@@ -69,6 +69,25 @@ impl Frontier {
             }
         }
     }
+
+    /// 生成确定性的规范字符串表示。
+    ///
+    /// 格式：`peer1:seq1,peer2:seq2`（按 peer_id 字典序排列）。
+    ///
+    /// 用于生成稳定的数据库键（`entry_id`），替代 `Debug` 格式化——
+    /// 后者虽然因 `BTreeMap` 而顺序确定，但格式含 `{}`/`[]` 等特殊字符，
+    /// 且可能在 Rust 版本升级时变化。
+    pub fn to_canonical_string(&self) -> String {
+        use std::fmt::Write;
+        let mut result = String::new();
+        for (i, (k, v)) in self.map.iter().enumerate() {
+            if i > 0 {
+                result.push(',');
+            }
+            let _ = write!(result, "{k}:{v}");
+        }
+        result
+    }
 }
 
 /// Frontier 操作集合。

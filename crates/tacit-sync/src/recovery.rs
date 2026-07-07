@@ -167,6 +167,7 @@ impl RecoveryCoordinator {
                 bytes: shallow,
                 priority: Priority::High,
                 path: tacit_transport::PathPreference::Any,
+                entry_id: None,
             });
         }
 
@@ -499,6 +500,27 @@ mod tests {
             )
             .unwrap();
         // 标记一个 peer 在线，使冷文档追赶能生成 RequestDelta
+        // 先写 DB 为 Trusted，再调 on_peer_summary（on_peer_summary 会验证信任）
+        {
+            let conn = doc_store.store().conn();
+            tacit_store::dao::upsert_peer(
+                &conn,
+                &tacit_core::PeerRecord {
+                    peer_id: pid(2),
+                    device_pubkey: "trusted".to_string(),
+                    capabilities: Default::default(),
+                    trust_state: tacit_core::TrustState::Trusted,
+                    anchor_priority: 0,
+                    last_seen_at: std::time::SystemTime::now(),
+                    last_endpoint: None,
+                    nat_capability: tacit_core::NatCapability::Unknown,
+                    relay_hint: None,
+                    success_ema: 1.0,
+                    rotation_seq: 0,
+                },
+            )
+            .unwrap();
+        }
         engine
             .on_peer_summary(
                 pid(2),
