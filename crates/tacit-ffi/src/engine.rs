@@ -452,6 +452,7 @@ impl TacitEngine {
                     bytes,
                     priority,
                     path,
+                    entry_id: _,
                 } => {
                     result.push(FfiSyncAction::SendData {
                         action: FfiSendDataAction {
