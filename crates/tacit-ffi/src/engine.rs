@@ -421,9 +421,9 @@ impl TacitEngine {
             peer_id: peer_id.clone(),
             online: true,
         });
-        // 请求同步
-        self.engine.request_sync(peer_id, SyncReason::PeerOnline)?;
-        // 分发待执行动作的事件
+        // 注意：不在此处调 request_sync——ffi_on_peer_summary 会在收到
+        // Capabilities/握手信息后统一触发同步（此时 frontier 更精确）。
+        // 两个入口都调会导致重复 push（CRDT import 幂等但浪费带宽）。
         self.flush_actions_to_events();
         Ok(())
     }
@@ -452,6 +452,7 @@ impl TacitEngine {
                     bytes,
                     priority,
                     path,
+                    entry_id,
                 } => {
                     result.push(FfiSyncAction::SendData {
                         action: FfiSendDataAction {
@@ -461,6 +462,7 @@ impl TacitEngine {
                             data: bytes.clone(),
                             priority: priority_to_u8(*priority),
                             path: path_to_str(*path).to_string(),
+                            entry_id: entry_id.as_ref().map(|e| e.to_string()),
                         },
                     });
                 }
@@ -770,12 +772,96 @@ impl TacitEngine {
         Ok(self.on_peer_online(peer_id)?)
     }
 
+    /// 通知 peer 摘要（信任握手 + frontier 同步）。
+    ///
+    /// FFI 宿主在收到 peer 的 Capabilities/握手信息后调用此方法，
+    /// 将 peer summary 喂入引擎，使 `peer_states` 标记该 peer 为 online。
+    /// 这是 `push_local_change` 能直接发送 SendData（而非走 store-and-forward）的前提。
+    pub fn ffi_on_peer_summary(
+        &self,
+        peer_id: String,
+        online: bool,
+    ) -> Result<(), crate::error::TacitFfiError> {
+        let pid = PeerId::new(peer_id);
+        let summary = tacit_core::PeerSummary {
+            peer_id: pid.clone(),
+            online,
+            frontier: tacit_core::Frontier::new(),
+            capabilities: Default::default(),
+        };
+        self.engine.on_peer_summary(pid.clone(), summary)?;
+        // 同步 online_peers 列表，确保 get_sync_status 返回正确值
+        if online {
+            let mut peers = self.online_peers.lock();
+            if !peers.contains(&pid) {
+                peers.push(pid.clone());
+            }
+        } else {
+            let mut peers = self.online_peers.lock();
+            peers.retain(|p| p != &pid);
+        }
+        // 触发 push/pull delta 交换（仅在线时）
+        if online {
+            self.engine.request_sync(pid, SyncReason::PeerOnline)?;
+            self.flush_actions_to_events();
+        }
+        Ok(())
+    }
+
+    /// 标记 peer 离线。
+    ///
+    /// FFI 宿主在检测到 peer 断开连接后调用此方法，
+    /// 使 `push_local_change` 正确路由后续变更到 store-and-forward。
+    pub fn ffi_mark_peer_offline(
+        &self,
+        peer_id: String,
+    ) -> Result<(), crate::error::TacitFfiError> {
+        let pid = PeerId::new(peer_id);
+        self.engine.mark_peer_offline(&pid);
+        // 同步 online_peers 列表
+        let mut peers = self.online_peers.lock();
+        peers.retain(|p| p != &pid);
+        Ok(())
+    }
+
+    /// 升级 peer 信任状态为 Trusted。
+    ///
+    /// FFI 宿主在完成 Noise 握手 / SAS 配对后调用此方法，
+    /// 将 peer 从 Pending 升级为 Trusted，同时清除负缓存。
+    pub fn ffi_upgrade_peer_trust(
+        &self,
+        peer_id: String,
+        device_pubkey: String,
+    ) -> Result<(), crate::error::TacitFfiError> {
+        Ok(self
+            .engine
+            .upgrade_peer_trust(&PeerId::new(peer_id), &device_pubkey)?)
+    }
+
     /// 拉取并分发待执行的同步动作。
     ///
     /// 返回 FFI 友好的动作列表，集成层根据动作类型执行实际网络发送。
     /// 集成层应定期调用此方法（如每 50ms）。
     pub fn ffi_drain_actions(&self) -> Result<Vec<FfiSyncAction>, crate::error::TacitFfiError> {
         Ok(self.drain_actions()?)
+    }
+
+    /// 标记 store-and-forward 条目为已投递+已确认。
+    ///
+    /// FFI 宿主端在成功发送 `FfiSendDataAction`（含 `entry_id`）后调用此方法，
+    /// 将对应的 `sync_log` 记录标记为已投递+已确认，防止离线消息在每次 peer 上线时无限重发，
+    /// 并允许 `cleanup_acknowledged` GC 回收旧记录。
+    ///
+    /// 同时标记 acknowledged 是因为当前架构无对端 ack 协议——FFI 发送成功即视为投递完成
+    /// （at-most-once 合约，与 `SyncSession::drive_outbound` 一致）。
+    pub fn ffi_mark_delivered(&self, entry_id: String) -> Result<(), crate::error::TacitFfiError> {
+        let conn = self.doc_store.store().conn();
+        tacit_store::dao::mark_delivered_and_acknowledged_batch(
+            &conn,
+            &[entry_id.as_str()],
+            std::time::SystemTime::now(),
+        )
+        .map_err(crate::error::TacitFfiError::from)
     }
 
     /// 处理依赖等待重试。

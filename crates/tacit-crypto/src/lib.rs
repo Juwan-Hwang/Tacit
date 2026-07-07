@@ -11,6 +11,7 @@
 pub mod identity;
 pub mod noise;
 pub mod pairing;
+pub mod secret_storage;
 pub mod session;
 pub mod signature;
 
@@ -19,6 +20,17 @@ pub use noise::{HandshakeResult, NoiseHandshake, NoiseRole, NonceCache};
 pub use pairing::{
     compute_binding_digest, confirm_sas_code, derive_sas_code, format_sas_code,
     generate_binding_salt, validate_payload_structure, PairingPayload, PairingRole, PairingSession,
+};
+/// 仅在桌面平台（macOS / Windows / Linux）上导出 KeyringStorage。
+/// `keyring` crate 的 target-specific 依赖只在桌面平台声明，
+/// 在 iOS/Android 上启用 feature 会导致未解析的 crate 引用。
+#[cfg(all(
+    feature = "keyring",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+pub use secret_storage::KeyringStorage;
+pub use secret_storage::{
+    deserialize_identity, serialize_identity, InMemoryStorage, SecretStorage,
 };
 
 pub use session::Session;
