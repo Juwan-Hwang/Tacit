@@ -16,20 +16,20 @@ Tacit enables zero-wait local writes, near-field sync over LAN, cross-internet n
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   tacit-ffi                      │  UniFFI API, CommandBus, EventBus
-├─────────────────────────────────────────────────┤
+┌──────────────────────────────────────────────────┐
+│                    tacit-ffi                     │  UniFFI API, CommandBus, EventBus
+├──────────────────────────────────────────────────┤
 │                   tacit-sync                     │  SyncEngine, PeerRegistry, CheckpointManager
 ├──────────┬──────────┬───────────┬────────────────┤
 │ tacit-   │ tacit-   │ tacit-    │ tacit-         │
 │ transport│ transport│ transport │ transport      │  Transport abstractions
 │          │ -quic    │ -ble      │ -relay         │
 ├──────────┴──────────┴───────────┴────────────────┤
-│          tacit-crdt    │    tacit-crypto          │  CRDT + Encryption
-│          tacit-store   │                          │  Storage
-├─────────────────────────────────────────────────┤
+│        tacit-crdt      │      tacit-crypto       │  CRDT + Encryption
+│       tacit-store      │                         │  Storage
+├──────────────────────────────────────────────────┤
 │                   tacit-core                     │  Shared types, IDs, events, frames
-└─────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────┘
 ```
 
 ### Crates
