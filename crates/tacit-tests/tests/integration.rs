@@ -10,10 +10,34 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tacit_core::{BlockId, BlockKind, DocId, PeerId, SyncReason};
+use tacit_core::{
+    BlockId, BlockKind, DocId, NatCapability, PeerId, PeerRecord, SyncReason, TrustState,
+};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncAction, SyncEngine};
 use tacit_transport_relay::{generate_proof, verify_proof, RelayClient, RelayServer};
+
+/// 在 DB 中将 peer 标记为 Trusted，使信任验证通过。
+fn write_trusted_peer(doc_store: &DocStore, peer_id: &PeerId) {
+    let conn = doc_store.store().conn();
+    tacit_store::dao::upsert_peer(
+        &conn,
+        &PeerRecord {
+            peer_id: peer_id.clone(),
+            device_pubkey: "trusted".to_string(),
+            capabilities: Default::default(),
+            trust_state: TrustState::Trusted,
+            anchor_priority: 0,
+            last_seen_at: std::time::SystemTime::now(),
+            last_endpoint: None,
+            nat_capability: NatCapability::Unknown,
+            relay_hint: None,
+            success_ema: 1.0,
+            rotation_seq: 0,
+        },
+    )
+    .unwrap();
+}
 
 fn pid(n: u64) -> PeerId {
     PeerId(n.to_string())
@@ -459,6 +483,9 @@ fn dependency_wait_and_retry() {
     ds.create_doc(doc_id.clone(), "note").unwrap();
     ds.create_block(&doc_id, block_id.clone(), BlockKind::Text)
         .unwrap();
+
+    // 先在 DB 中注册 peer 2 为 Trusted
+    write_trusted_peer(&ds, &pid(2));
 
     // peer 2 上线
     engine
