@@ -29,6 +29,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+hex = { workspace = true }
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
