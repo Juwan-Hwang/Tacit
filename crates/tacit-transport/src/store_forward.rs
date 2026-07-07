@@ -74,6 +74,28 @@ impl StoreAndForward {
         Ok(())
     }
 
+    /// 批量标记已投递+已确认（单事务，避免逐条 auto-commit 的 fsync 开销）。
+    ///
+    /// 适用于去重场景：已被更新版本覆盖的旧记录直接标记为已投递+已确认。
+    pub fn mark_delivered_and_acknowledged_batch(&self, entry_ids: &[&str]) -> CoreResult<()> {
+        let conn = self.store.conn();
+        dao::mark_delivered_and_acknowledged_batch(&conn, entry_ids, SystemTime::now())?;
+        if !entry_ids.is_empty() {
+            debug!(count = entry_ids.len(), "批量标记已投递+已确认");
+        }
+        Ok(())
+    }
+
+    /// 批量标记已投递（单事务）。
+    pub fn mark_delivered_batch(&self, entry_ids: &[&str]) -> CoreResult<()> {
+        let conn = self.store.conn();
+        dao::mark_delivered_batch(&conn, entry_ids, SystemTime::now())?;
+        if !entry_ids.is_empty() {
+            debug!(count = entry_ids.len(), "批量标记已投递");
+        }
+        Ok(())
+    }
+
     /// 列出指定 peer 的未投递消息（peer 上线后重发）。
     pub fn list_undelivered(&self, peer_id: &PeerId) -> CoreResult<Vec<dao::SyncLogRecord>> {
         let conn = self.store.conn();
