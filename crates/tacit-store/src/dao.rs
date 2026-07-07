@@ -758,10 +758,57 @@ pub fn mark_acknowledged(conn: &Connection, entry_id: &str, at: SystemTime) -> C
     Ok(())
 }
 
+/// 批量标记已投递+已确认（单事务，避免逐条 auto-commit 的 fsync 开销）。
+///
+/// 对每个 `entry_id` 同时设置 `delivered_at` 和 `acknowledged_at`。
+/// 适用于去重场景：已被更新版本覆盖的旧记录直接标记为已投递+已确认。
+pub fn mark_delivered_and_acknowledged_batch(
+    conn: &Connection,
+    entry_ids: &[&str],
+    at: SystemTime,
+) -> CoreResult<()> {
+    if entry_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(store_err)?;
+    let ts = to_millis(at);
+    for id in entry_ids {
+        tx.execute(
+            "UPDATE sync_log SET delivered_at = ?1, acknowledged_at = ?1 WHERE entry_id = ?2",
+            params![ts, id],
+        )
+        .map_err(store_err)?;
+    }
+    tx.commit().map_err(store_err)?;
+    Ok(())
+}
+
+/// 批量标记已投递（单事务）。
+pub fn mark_delivered_batch(
+    conn: &Connection,
+    entry_ids: &[&str],
+    at: SystemTime,
+) -> CoreResult<()> {
+    if entry_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction().map_err(store_err)?;
+    let ts = to_millis(at);
+    for id in entry_ids {
+        tx.execute(
+            "UPDATE sync_log SET delivered_at = ?1 WHERE entry_id = ?2",
+            params![ts, id],
+        )
+        .map_err(store_err)?;
+    }
+    tx.commit().map_err(store_err)?;
+    Ok(())
+}
+
 /// 列出未投递的 sync_log（store-and-forward 重发）。
 pub fn list_undelivered(conn: &Connection, peer_id: &PeerId) -> CoreResult<Vec<SyncLogRecord>> {
     let mut stmt = conn
-        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND delivered_at IS NULL")
+        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND delivered_at IS NULL ORDER BY rowid ASC")
         .map_err(store_err)?;
     let rows = stmt
         .query_map(params![peer_id.as_str()], |r| {
@@ -795,7 +842,7 @@ pub fn list_undelivered(conn: &Connection, peer_id: &PeerId) -> CoreResult<Vec<S
 /// 列出未确认的 sync_log。
 pub fn list_unacknowledged(conn: &Connection, peer_id: &PeerId) -> CoreResult<Vec<SyncLogRecord>> {
     let mut stmt = conn
-        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND acknowledged_at IS NULL")
+        .prepare("SELECT entry_id, doc_id, delta_id, recipient_peer_id, delivered_at, acknowledged_at, channel FROM sync_log WHERE recipient_peer_id = ?1 AND acknowledged_at IS NULL ORDER BY rowid ASC")
         .map_err(store_err)?;
     let rows = stmt
         .query_map(params![peer_id.as_str()], |r| {
