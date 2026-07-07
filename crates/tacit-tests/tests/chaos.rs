@@ -5,10 +5,32 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tacit_core::{BatchFlag, BlockId, BlockKind, DocId, Frontier, PeerId};
+use tacit_core::{BatchFlag, BlockId, BlockKind, DocId, Frontier, PeerId, PeerRecord, TrustState};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tacit_transport::batch::{BatchSigner, BatchVerifier, BatchVerifyResult};
+
+/// 在 DB 中将 peer 标记为 Trusted，使信任验证通过。
+fn write_trusted_peer(doc_store: &DocStore, peer_id: &PeerId) {
+    let conn = doc_store.store().conn();
+    tacit_store::dao::upsert_peer(
+        &conn,
+        &PeerRecord {
+            peer_id: peer_id.clone(),
+            device_pubkey: "trusted".to_string(),
+            capabilities: Default::default(),
+            trust_state: TrustState::Trusted,
+            anchor_priority: 0,
+            last_seen_at: std::time::SystemTime::now(),
+            last_endpoint: None,
+            nat_capability: tacit_core::NatCapability::Unknown,
+            relay_hint: None,
+            success_ema: 1.0,
+            rotation_seq: 0,
+        },
+    )
+    .unwrap();
+}
 
 fn pid(n: u64) -> PeerId {
     PeerId(n.to_string())
@@ -362,7 +384,10 @@ fn network_switch_triggers_fast_resume() {
 #[test]
 fn stale_peers_are_cleaned_up() {
     use tacit_core::PeerSummary;
-    let (_ds, engine) = make_node(1);
+    let (ds, engine) = make_node(1);
+
+    // 先在 DB 中注册 peer 2 为 Trusted
+    write_trusted_peer(&ds, &pid(2));
 
     // 注册 peer 并标记在线（on_peer_summary 会写入 peer_states）
     engine
