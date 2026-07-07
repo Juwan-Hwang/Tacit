@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "append-only-bytes"
@@ -632,9 +632,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1468,6 +1468,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "keyring"
+version = "3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
+dependencies = [
+ "log",
+ "zeroize",
 ]
 
 [[package]]
@@ -2968,6 +2978,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hmac",
+ "keyring",
  "parking_lot",
  "rand 0.8.6",
  "serde",
@@ -2987,6 +2998,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "hex",
  "parking_lot",
  "serde",
  "serde_json",
@@ -3003,6 +3015,25 @@ dependencies = [
  "tracing",
  "uniffi",
  "zeroize",
+]
+
+[[package]]
+name = "tacit-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "crossbeam-channel",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tacit-core",
+ "tacit-crdt",
+ "tacit-store",
+ "tacit-sync",
+ "tacit-transport",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
