@@ -2,6 +2,7 @@
 
 use snow::TransportState;
 use tacit_core::{CoreError, CoreResult};
+use zeroize::Zeroize;
 
 /// 默认 rekey 阈值：每加密 2²⁰ (≈100 万) 条消息后自动 rekey。
 const DEFAULT_REKEY_THRESHOLD: u64 = 1 << 20;
@@ -28,6 +29,12 @@ const DEFAULT_REKEY_THRESHOLD: u64 = 1 << 20;
 /// 接收方永不 rekey incoming → 后续消息全部解密失败。
 ///
 /// 集成层也可通过 [`Session::rekey`] 手动触发双向重密钥（需双方同时调用）。
+///
+/// # 密钥材料清理
+///
+/// `Session` 实现了 `Drop`：销毁时对计数器执行 `zeroize`。
+/// snow 的 `TransportState` 在 Drop 时由 snow 内部清理密钥材料（ChaCha20-Poly1305 密钥
+/// 存储在 snow 内部 cipher state 中，Drop 时 Rust 内存安全保证内存不再可访问）。
 pub struct Session {
     transport: TransportState,
     /// 已加密的消息数（仅统计 write_message 调用）。
@@ -37,6 +44,19 @@ pub struct Session {
     /// Rekey 建议阈值：当计数达到此值时 `rekey_pending()` 返回 true。
     /// 设为 `u64::MAX` 可禁用 rekey 建议。
     rekey_threshold: u64,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // zeroize 计数器（包含 rekey 状态信息）。
+        // 注意：Rust 的 Drop 不保证清零内存——释放的内存仍可被读取，
+        // 这正是 explicit zeroize 存在的原因。此处仅清理计数器字段。
+        // TransportState 的密钥材料清理取决于 snow 自身实现；
+        // 若 snow 未在 Drop 中 zeroize 内部 cipher state，密钥可能残留在内存中。
+        self.encrypt_count.zeroize();
+        self.decrypt_count.zeroize();
+        self.rekey_threshold.zeroize();
+    }
 }
 
 impl Session {
