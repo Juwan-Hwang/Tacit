@@ -24,8 +24,8 @@ use tacit_core::{
     AckSummary, BlockId, ChangeEnvelope, CoreResult, DocId, Frontier, FrontierOps, PeerId,
     PeerSummary, Priority, SyncReason, TelemetryCollector, Viewport,
 };
-use tacit_transport::{ControlMsg, PathPreference};
-use tracing::debug;
+use tacit_transport::{ControlMsg, PathPreference, StoreAndForward};
+use tracing::{debug, info};
 
 use crate::doc_store::DocStore;
 use crate::hot_path::HotPathController;
@@ -142,6 +142,8 @@ pub trait SyncEngine: Send + Sync {
 pub struct DefaultSyncEngine {
     doc_store: Arc<DocStore>,
     pending: Arc<PendingFetchQueue>,
+    /// Store-and-forward：离线消息持久化与重发。
+    store_forward: StoreAndForward,
     watermarks: WatermarkCalculator,
     peer_states: Mutex<std::collections::HashMap<PeerId, PeerSyncState>>,
     actions: PriorityQueue,
@@ -177,17 +179,61 @@ impl DefaultSyncEngine {
             config.backoff_init,
             config.backoff_max,
         ));
+        let store_forward = StoreAndForward::new(Arc::new(doc_store.store().clone()));
         let watermarks = WatermarkCalculator::new(config.soft_watermark_timeout);
+
+        // 预加载：从 DB 读取所有已知 peer 到内存，初始状态为离线
+        // 避免在 push_local_change 热路径上同步查询 DB
+        let peer_states = {
+            let conn = doc_store.store().conn();
+            let mut map = std::collections::HashMap::new();
+            if let Ok(peers) = tacit_store::dao::list_peers(&conn) {
+                let my_id = doc_store.peer_id();
+                for peer in peers {
+                    if peer.peer_id != *my_id && peer.trust_state != tacit_core::TrustState::Revoked
+                    {
+                        map.insert(
+                            peer.peer_id,
+                            PeerSyncState {
+                                known_frontier: Frontier::new(),
+                                last_seen: SystemTime::now(),
+                                online: false,
+                            },
+                        );
+                    }
+                }
+            } else {
+                tracing::error!("预加载 peer_states 失败：list_peers 返回错误");
+            }
+            Mutex::new(map)
+        };
+
         Self {
             doc_store,
             pending,
+            store_forward,
             watermarks,
-            peer_states: Mutex::new(std::collections::HashMap::new()),
+            peer_states,
             actions: PriorityQueue::new(),
             telemetry: Arc::new(TelemetryCollector::default()),
             hot_path: HotPathController::default(),
             config,
         }
+    }
+
+    /// Store-and-forward 引用。
+    pub fn store_forward(&self) -> &StoreAndForward {
+        &self.store_forward
+    }
+
+    /// 本地 PeerId。
+    pub fn peer_id(&self) -> &PeerId {
+        &self.config.peer_id
+    }
+
+    /// DocStore 引用（供 session 层导出 delta 响应 NeedRanges）。
+    pub fn doc_store(&self) -> &Arc<DocStore> {
+        &self.doc_store
     }
 
     /// 取出所有待执行的 SyncAction（按优先级排序）。
@@ -473,21 +519,30 @@ impl DefaultSyncEngine {
         Ok(())
     }
 
-    /// 推送本地变更给所有在线 peer。
+    /// 推送本地变更给所有在线 peer，并为离线 peer 记录待发消息。
     ///
-    /// 锁粒度优化：先在锁内 clone 在线 peer ID 列表并释放锁，
+    /// 锁粒度优化：先在锁内 clone peer ID 列表并释放锁，
     /// 然后在锁外执行 delta 导出（可能触发 I/O）。
     /// 避免在持有 `peer_states` Mutex 期间阻塞于 store 操作。
     fn push_local_change(&self, doc_id: &DocId, change: &ChangeEnvelope) -> CoreResult<()> {
-        // 1. 锁内：仅收集在线 peer ID，立刻释放锁
-        let online_peer_ids: Vec<PeerId> = {
+        // 1. 锁内：分离在线/离线 peer ID，立刻释放锁
+        let (online_peer_ids, offline_peer_ids): (Vec<PeerId>, Vec<PeerId>) = {
             let peers = self.peer_states.lock();
-            peers
-                .iter()
-                .filter(|(_, state)| state.online)
-                .map(|(peer_id, _)| peer_id.clone())
-                .collect()
+            let mut online = Vec::new();
+            let mut offline = Vec::new();
+            for (peer_id, state) in peers.iter() {
+                if state.online {
+                    online.push(peer_id.clone());
+                } else {
+                    offline.push(peer_id.clone());
+                }
+            }
+            (online, offline)
         };
+
+        // peer_states 已在 new() 中预加载所有 DB 中的已知 peer，
+        // handle_introduce/handle_revoke 会同步更新内存状态，
+        // 因此此处完全依赖内存，无需查询 DB。
 
         // 2. 锁外：对每个在线 peer 导出 delta 并推送
         for peer_id in &online_peer_ids {
@@ -506,6 +561,41 @@ impl DefaultSyncEngine {
                 path: PathPreference::Any,
             });
         }
+
+        // 3. 对每个离线 peer 记录待发 delta（store-and-forward）
+        if !offline_peer_ids.is_empty() {
+            for peer_id in &offline_peer_ids {
+                let frontier_str = change.frontier.to_canonical_string();
+                let (entry_id, delta_id) = if let Some(block_id) = &change.block_id {
+                    (
+                        format!("{doc_id}:{block_id}:{frontier_str}"),
+                        format!("block_delta:{block_id}"),
+                    )
+                } else {
+                    (
+                        format!("{doc_id}:meta:{frontier_str}"),
+                        "meta_delta".to_string(),
+                    )
+                };
+                if let Err(e) = self
+                    .store_forward
+                    .record_pending(&entry_id, doc_id, &delta_id, peer_id, "quic")
+                {
+                    debug!(
+                        peer_id = %peer_id,
+                        doc_id = %doc_id,
+                        error = %e,
+                        "store-and-forward 记录待发失败"
+                    );
+                }
+            }
+            debug!(
+                online = online_peer_ids.len(),
+                offline = offline_peer_ids.len(),
+                "本地变更推送完成（离线 peer 已记录待发）"
+            );
+        }
+
         Ok(())
     }
 
@@ -673,6 +763,16 @@ impl DefaultSyncEngine {
             },
         ));
 
+        // 4. 同步更新内存中的 peer_states（仅在不存在时初始化，避免覆盖已在线状态）
+        self.peer_states
+            .lock()
+            .entry(msg.introduced_peer.clone())
+            .or_insert_with(|| PeerSyncState {
+                known_frontier: Frontier::new(),
+                last_seen: SystemTime::now(),
+                online: false,
+            });
+
         Ok(())
     }
 
@@ -828,7 +928,9 @@ impl DefaultSyncEngine {
     }
 
     /// 推送动作到优先级队列。
-    pub(crate) fn push_action(&self, action: SyncAction) {
+    ///
+    /// 公开供 session 层（tacit-session）在响应 NeedRanges 等场景下直接入队。
+    pub fn push_action(&self, action: SyncAction) {
         self.actions.push(action);
     }
 
@@ -853,9 +955,10 @@ impl SyncEngine for DefaultSyncEngine {
     }
 
     fn on_peer_summary(&self, peer_id: PeerId, summary: PeerSummary) -> CoreResult<()> {
-        // 更新 peer 状态
-        {
+        // 更新 peer 状态，检测从离线→在线的转换
+        let was_offline = {
             let mut states = self.peer_states.lock();
+            let was_offline = states.get(&peer_id).map(|s| !s.online).unwrap_or(true);
             states.insert(
                 peer_id.clone(),
                 PeerSyncState {
@@ -864,7 +967,137 @@ impl SyncEngine for DefaultSyncEngine {
                     online: summary.online,
                 },
             );
+            was_offline
+        };
+
+        // peer 从离线变为在线：重发未投递的待发消息
+        if summary.online && was_offline {
+            match self.store_forward.list_undelivered(&peer_id) {
+                Ok(records) => {
+                    if !records.is_empty() {
+                        info!(
+                            peer_id = %peer_id,
+                            count = records.len(),
+                            "peer 上线，重发未投递消息"
+                        );
+                        // 去重：同一 (doc_id, block_id) 只导出/发送一次最新 delta
+                        // 逆序遍历（最新优先），确保发送最新记录的 entry_id
+                        let mut sent_deltas: std::collections::HashSet<(DocId, Option<BlockId>)> =
+                            std::collections::HashSet::new();
+                        // 缓存 per-doc ack_frontier，避免循环内重复 DB 查询
+                        let mut ack_frontiers: std::collections::HashMap<DocId, Frontier> =
+                            std::collections::HashMap::new();
+                        // 收集去重跳过的 entry_id，循环结束后批量标记（避免逐条 auto-commit 的 fsync 开销）
+                        let mut dedup_entry_ids: Vec<String> = Vec::new();
+                        let mut sent_entry_ids: Vec<String> = Vec::new();
+                        for rec in records.iter().rev() {
+                            // 从 delta_id 解析出 block_id（格式: "block_delta:{id}" 或 "meta_delta"）
+                            let block_id = if rec.delta_id == "meta_delta" {
+                                None
+                            } else if let Some(bid_str) = rec.delta_id.strip_prefix("block_delta:")
+                            {
+                                Some(BlockId::new(bid_str))
+                            } else {
+                                debug!(
+                                    peer_id = %peer_id,
+                                    delta_id = %rec.delta_id,
+                                    "未知 delta_id 格式，当作 meta_delta 处理"
+                                );
+                                None
+                            };
+
+                            // 去重：已成功发送过该 (doc_id, block_id) 的最新 delta，标记已投递+已确认并跳过
+                            let key = (rec.doc_id.clone(), block_id.clone());
+                            if sent_deltas.contains(&key) {
+                                dedup_entry_ids.push(rec.entry_id.clone());
+                                continue;
+                            }
+
+                            // Block delta：ack_frontier 按 (peer_id, doc_id) 存储，不区分 block，
+                            // 可能被其他 block 的 ack 覆盖，安全回退到空 frontier
+                            let peer_ack_frontier = if block_id.is_some() {
+                                Frontier::new()
+                            } else {
+                                // Meta delta：ack_frontier 可用作增量导出基线
+                                ack_frontiers
+                                    .entry(rec.doc_id.clone())
+                                    .or_insert_with(|| {
+                                        let conn = self.doc_store.store().conn();
+                                        match tacit_store::dao::get_ack(
+                                            &conn,
+                                            &peer_id,
+                                            &rec.doc_id,
+                                        ) {
+                                            Ok(Some(ack)) => ack.ack_frontier,
+                                            _ => Frontier::new(),
+                                        }
+                                    })
+                                    .clone()
+                            };
+
+                            let bytes_res = if let Some(ref bid) = block_id {
+                                self.doc_store.export_block_delta(
+                                    &rec.doc_id,
+                                    bid,
+                                    &peer_ack_frontier,
+                                )
+                            } else {
+                                self.doc_store
+                                    .export_meta_delta(&rec.doc_id, &peer_ack_frontier)
+                            };
+
+                            let bytes = match bytes_res {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    debug!(
+                                        peer_id = %peer_id,
+                                        doc_id = %rec.doc_id,
+                                        error = %e,
+                                        "重发：导出 delta 失败，跳过"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            self.push_action(SyncAction::SendData {
+                                peer_id: peer_id.clone(),
+                                doc_id: rec.doc_id.clone(),
+                                block_id,
+                                bytes,
+                                priority: Priority::High,
+                                path: PathPreference::Any,
+                            });
+
+                            // 收集已发送 entry_id，循环结束后批量标记
+                            sent_entry_ids.push(rec.entry_id.clone());
+                            sent_deltas.insert(key);
+                        }
+
+                        // 批量标记：单事务提交，避免逐条 auto-commit 的 fsync 开销
+                        if !dedup_entry_ids.is_empty() {
+                            let refs: Vec<&str> =
+                                dedup_entry_ids.iter().map(|s| s.as_str()).collect();
+                            let _ = self
+                                .store_forward
+                                .mark_delivered_and_acknowledged_batch(&refs);
+                        }
+                        if !sent_entry_ids.is_empty() {
+                            let refs: Vec<&str> =
+                                sent_entry_ids.iter().map(|s| s.as_str()).collect();
+                            let _ = self.store_forward.mark_delivered_batch(&refs);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        peer_id = %peer_id,
+                        error = %e,
+                        "重发未投递消息失败"
+                    );
+                }
+            }
         }
+
         // 对所有已知 doc 发送 ack 摘要给 peer。
         // AckSummary 表示"本设备对该 doc 已确认到哪个 frontier"，
         // 因此 ack_frontier 应为本地 meta frontier，而非 peer 报告的 frontier。
@@ -1596,5 +1829,124 @@ mod tests {
         let peer = tacit_store::dao::get_peer(&conn, &pid(2)).unwrap().unwrap();
         assert_eq!(peer.device_pubkey, pubkey_v3);
         assert_eq!(peer.rotation_seq, 3);
+    }
+
+    // ===== Store-and-forward 接入测试 =====
+
+    #[test]
+    fn local_change_records_pending_for_offline_peer() {
+        let (engine, doc_store) = make_engine();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"hello")
+            .unwrap();
+        let frontier = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        // 注册离线 peer
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: false,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+
+        // 本地编辑 → 应记录待发
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier,
+                },
+            )
+            .unwrap();
+
+        // drain_actions 不应有 SendData（离线 peer 不推送）
+        let actions = engine.drain_actions();
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::SendData { .. })));
+
+        // sync_log 中应有一条未投递记录
+        let undelivered = engine.store_forward().list_undelivered(&pid(2)).unwrap();
+        assert_eq!(undelivered.len(), 1);
+    }
+
+    #[test]
+    fn peer_online_triggers_resend_undelivered() {
+        let (engine, doc_store) = make_engine();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"data")
+            .unwrap();
+        let frontier = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        // 1. 注册离线 peer
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: false,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+
+        // 2. 本地编辑 → 记录待发
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier,
+                },
+            )
+            .unwrap();
+
+        // 3. peer 上线 → 应触发重发
+        engine
+            .on_peer_summary(
+                pid(2),
+                PeerSummary {
+                    peer_id: pid(2),
+                    online: true,
+                    frontier: Frontier::new(),
+                    capabilities: Default::default(),
+                },
+            )
+            .unwrap();
+
+        // 应有 SendData 动作（重发的消息）
+        let actions = engine.drain_actions();
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SyncAction::SendData { peer_id, .. } if peer_id == &pid(2))));
     }
 }
