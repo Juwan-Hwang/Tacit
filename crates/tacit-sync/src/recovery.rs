@@ -167,6 +167,7 @@ impl RecoveryCoordinator {
                 bytes: shallow,
                 priority: Priority::High,
                 path: tacit_transport::PathPreference::Any,
+                entry_id: None,
             });
         }
 
