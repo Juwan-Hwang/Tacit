@@ -11,6 +11,7 @@
 pub mod identity;
 pub mod noise;
 pub mod pairing;
+pub mod secret_storage;
 pub mod session;
 pub mod signature;
 
@@ -19,6 +20,11 @@ pub use noise::{HandshakeResult, NoiseHandshake, NoiseRole, NonceCache};
 pub use pairing::{
     compute_binding_digest, confirm_sas_code, derive_sas_code, format_sas_code,
     generate_binding_salt, validate_payload_structure, PairingPayload, PairingRole, PairingSession,
+};
+#[cfg(feature = "keyring")]
+pub use secret_storage::KeyringStorage;
+pub use secret_storage::{
+    deserialize_identity, serialize_identity, InMemoryStorage, SecretStorage,
 };
 
 pub use session::Session;
