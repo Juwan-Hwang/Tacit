@@ -186,6 +186,7 @@ mod tests {
             bytes: vec![1, 2, 3],
             priority: tacit_core::Priority::High,
             path: tacit_transport::PathPreference::Any,
+            entry_id: None,
         }
     }
 
