@@ -11,6 +11,7 @@ members = [
     "crates/tacit-transport-relay",
     "crates/tacit-transport-sms",
     "crates/tacit-sync",
+    "crates/tacit-session",
     "crates/tacit-ffi",
     "crates/tacit-bindgen",
     "crates/tacit-tests",
@@ -36,6 +37,7 @@ tacit-transport-quic = { path = "crates/tacit-transport-quic" }
 tacit-transport-relay = { path = "crates/tacit-transport-relay" }
 tacit-transport-sms = { path = "crates/tacit-transport-sms" }
 tacit-sync = { path = "crates/tacit-sync" }
+tacit-session = { path = "crates/tacit-session" }
 tacit-ffi = { path = "crates/tacit-ffi" }
 
 # 错误处理与日志（全 workspace 统一）
