@@ -8,6 +8,20 @@ authors.workspace = true
 repository.workspace = true
 description = "设备身份、签名、Noise 握手、session key 管理"
 
+[features]
+default = []
+# 启用桌面平台原生密钥存储（Windows Credential Manager / macOS Keychain / Linux secret-service）
+keyring = ["dep:keyring"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", optional = true, default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", optional = true, default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", optional = true, default-features = false, features = ["sync-secret-service"] }
+
 [dependencies]
 tacit-core.workspace = true
 thiserror.workspace = true
@@ -17,12 +31,15 @@ hmac.workspace = true
 rand.workspace = true
 hex.workspace = true
 ed25519-dalek.workspace = true
+curve25519-dalek = "4"
 zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 subtle.workspace = true
+# keyring 仅在 target-specific 节中声明（apple-native / windows-native / sync-secret-service），
+# 不在此处重复声明以避免无 backend 的 fallback 解析。
 
 [dev-dependencies]
 rand = { workspace = true, features = ["std_rng"] }

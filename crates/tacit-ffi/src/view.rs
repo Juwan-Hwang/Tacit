@@ -68,6 +68,10 @@ pub struct FfiSendDataAction {
     pub priority: u8,
     /// 路径偏好："any"/"ble"/"lan_quic"/"wan_quic"/"relay"。
     pub path: String,
+    /// Store-and-forward 条目 ID（仅离线重发时有值）。
+    /// FFI 宿主端在成功发送后应调用 `ffi_mark_delivered` 标记投递完成，
+    /// 否则离线消息会在每次 peer 上线时无限重发。
+    pub entry_id: Option<String>,
 }
 
 /// 发送控制消息动作（对应 SyncAction::SendControl）。
