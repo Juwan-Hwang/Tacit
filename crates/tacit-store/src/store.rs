@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(loaded.static_public, rec.static_public);
         assert_eq!(loaded.binding_proof, rec.binding_proof);
 
-        // 覆盖写入应失败（INSERT 防止静默覆盖）
+        // 覆盖写入应成功（INSERT OR REPLACE 允许覆盖，用于 Keyring 丢失后重新生成身份）
         let rec2 = dao::DeviceIdentityRecord {
             signing_key: zeroize::Zeroizing::new([0xAA; 32]),
             static_private: zeroize::Zeroizing::new([0xBB; 32]),
@@ -903,13 +903,20 @@ mod tests {
             created_at: SystemTime::now(),
         };
         assert!(
-            dao::save_device_identity(&conn, &rec2).is_err(),
-            "INSERT 应在已存在身份时失败，防止静默覆盖"
+            dao::save_device_identity(&conn, &rec2).is_ok(),
+            "INSERT OR REPLACE 应允许覆盖旧身份以支持 Keyring 丢失恢复"
         );
 
-        // 原身份应保持不变
+        // 新身份应已覆盖
         let loaded2 = dao::load_device_identity(&conn).unwrap().unwrap();
-        assert_eq!(loaded2.signing_key, rec.signing_key, "原身份不应被覆盖");
+        assert_eq!(
+            loaded2.signing_key, rec2.signing_key,
+            "新身份应已覆盖旧身份"
+        );
+        assert_eq!(
+            loaded2.static_public, rec2.static_public,
+            "static_public 应更新"
+        );
     }
 
     #[test]
