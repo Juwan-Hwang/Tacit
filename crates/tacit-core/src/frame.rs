@@ -17,7 +17,10 @@ use crate::model::{AnchorCapabilities, DataFrame, DataFrameKind};
 pub const MAGIC: [u8; 2] = [0x54, 0x43];
 
 /// 当前协议主版本。
-pub const PROTOCOL_VERSION: u8 = 1;
+///
+/// v2 变更：Data Frame 的 `doc_id` / `actor_id` 从固定 8 字节 SHA256 截断
+/// 改为变长原始字节（`len(1) + bytes(n)`），消除哈希不可逆问题。
+pub const PROTOCOL_VERSION: u8 = 2;
 
 // ===== Discovery Frame =====
 
@@ -238,10 +241,16 @@ impl BatchFlag {
 
 /// Data Frame（规范 13.3）。
 ///
+/// v2 格式（变长 ID）：
 /// ```text
-/// magic(2) | version(1) | flags(1) | doc_id(8) | actor_id(8) | seq(4) | kind(1)
-/// | payload_len(4) | payload(n) | ref(8) | sig(batch)
+/// magic(2) | version(1) | flags(1)
+/// | doc_id_len(1) | doc_id(n) | actor_id_len(1) | actor_id(m)
+/// | seq(4) | kind(1) | payload_len(4) | payload(n)
+/// | ref(8) | sig_len(2) | sig(batch)
 /// ```
+///
+/// v1 使用固定 8 字节 SHA256 截断作为 doc_id/actor_id，导致 ID 不可逆。
+/// v2 直接传输原始 UTF-8 字节（变长），接收方可无损还原 DocId/PeerId 字符串。
 ///
 /// #3: mac 字段已移除。传输层完整性由 QUIC TLS 1.3 保证，
 /// 应用层 E2E 加密由 Noise Session AEAD 保证，per-frame mac 冗余。
@@ -250,10 +259,10 @@ pub struct DataFrameWire {
     pub version: u8,
     /// flags：低 2 位为 BatchFlag，高 6 位保留。
     pub flags: u8,
-    /// doc_id 的 8 字节标识。
-    pub doc_id: [u8; 8],
-    /// actor_id（发送方 peer）的 8 字节标识。
-    pub actor_id: [u8; 8],
+    /// doc_id 原始字节（变长，v2）。
+    pub doc_id: Vec<u8>,
+    /// actor_id（发送方 peer）原始字节（变长，v2）。
+    pub actor_id: Vec<u8>,
     /// 序号。
     pub seq: u32,
     /// 帧类型。
@@ -265,6 +274,9 @@ pub struct DataFrameWire {
     /// 批次完整性标签（可变长度，由 sig_len 字段指示）。
     pub sig: Vec<u8>,
 }
+
+/// 单个变长字段的最大字节数（防止恶意对端发送超长 ID 耗尽内存）。
+pub const MAX_ID_LEN: usize = 255;
 
 impl DataFrameWire {
     /// 创建 DataFrameWire（sig 初始为空，由批次完整性标签填充）。
@@ -280,8 +292,8 @@ impl DataFrameWire {
         Self {
             version: PROTOCOL_VERSION,
             flags: batch_flag.as_u8(),
-            doc_id: doc_id_to_bytes(doc_id),
-            actor_id: peer_id_to_bytes(actor_id),
+            doc_id: doc_id.as_str().as_bytes().to_vec(),
+            actor_id: actor_id.as_str().as_bytes().to_vec(),
             seq,
             kind,
             payload,
@@ -297,13 +309,19 @@ impl DataFrameWire {
 
     /// 转换为领域模型 DataFrame。
     ///
-    /// 将二进制 doc_id/actor_id 转为 hex 字符串作为 DocId/PeerId。
-    /// 注意：这是单向转换（原始 ID 经 SHA256 哈希后不可逆），
-    /// sync 层需通过 hex 字符串匹配已知的 doc/peer。
+    /// v2 协议直接传输原始 UTF-8 字节，可无损还原 DocId/PeerId 字符串。
+    /// 若字节不是合法 UTF-8（可能来自恶意对端或 v1 兼容层），
+    /// 回退为 hex 编码以保留数据可调试性。
     pub fn to_data_frame(&self) -> DataFrame {
+        let doc_id = String::from_utf8(self.doc_id.clone())
+            .map(DocId::new)
+            .unwrap_or_else(|_| DocId::new(hex::encode(&self.doc_id)));
+        let actor_id = String::from_utf8(self.actor_id.clone())
+            .map(PeerId::new)
+            .unwrap_or_else(|_| PeerId::new(hex::encode(&self.actor_id)));
         DataFrame {
-            doc_id: DocId::new(hex::encode(self.doc_id)),
-            actor_id: PeerId::new(hex::encode(self.actor_id)),
+            doc_id,
+            actor_id,
             seq: self.seq,
             kind: self.kind,
             payload: self.payload.clone(),
@@ -311,17 +329,33 @@ impl DataFrameWire {
         }
     }
 
-    /// 编码为字节流。
+    /// 编码为字节流（v2 变长 ID 格式）。
     pub fn encode(&self) -> Vec<u8> {
         let payload_len = self.payload.len() as u32;
         let sig_len = self.sig.len() as u16;
+        let doc_id_len = self.doc_id.len() as u8;
+        let actor_id_len = self.actor_id.len() as u8;
         let mut buf = Vec::with_capacity(
-            2 + 1 + 1 + 8 + 8 + 4 + 1 + 4 + self.payload.len() + 8 + 2 + self.sig.len(),
+            2 + 1
+                + 1
+                + 1
+                + self.doc_id.len()
+                + 1
+                + self.actor_id.len()
+                + 4
+                + 1
+                + 4
+                + self.payload.len()
+                + 8
+                + 2
+                + self.sig.len(),
         );
         buf.extend_from_slice(&MAGIC);
         buf.push(self.version);
         buf.push(self.flags);
+        buf.push(doc_id_len);
         buf.extend_from_slice(&self.doc_id);
+        buf.push(actor_id_len);
         buf.extend_from_slice(&self.actor_id);
         buf.extend_from_slice(&self.seq.to_be_bytes());
         buf.push(data_frame_kind_to_u8(self.kind));
@@ -333,9 +367,17 @@ impl DataFrameWire {
         buf
     }
 
-    /// 从字节流解码。
+    /// 从字节流解码（v2 变长 ID 格式）。
+    ///
+    /// 帧布局：`magic(2) | version(1) | flags(1) | doc_id_len(1) | doc_id(n)
+    /// | actor_id_len(1) | actor_id(m) | seq(4) | kind(1) | payload_len(4)
+    /// | payload(n) | ref(8) | sig_len(2) | sig(k)`
     pub fn decode(data: &[u8]) -> Result<Self, FrameError> {
-        if data.len() < 29 {
+        // 最小头部：magic(2) + version(1) + flags(1) + doc_id_len(1) + actor_id_len(1)
+        // + seq(4) + kind(1) + payload_len(4) + ref(8) + sig_len(2) = 25
+        // （两个 len 为 0 的极端情况）
+        const MIN_HEAD: usize = 2 + 1 + 1 + 1 + 1 + 4 + 1 + 4 + 8 + 2;
+        if data.len() < MIN_HEAD {
             return Err(FrameError::TooShort);
         }
         if data[0..2] != MAGIC {
@@ -343,32 +385,61 @@ impl DataFrameWire {
         }
         let version = data[2];
         let flags = data[3];
-        let doc_id: [u8; 8] = data[4..12].try_into().unwrap();
-        let actor_id: [u8; 8] = data[12..20].try_into().unwrap();
-        let seq = u32::from_be_bytes(data[20..24].try_into().unwrap());
-        let kind = u8_to_data_frame_kind(data[24])?;
-        let payload_len = u32::from_be_bytes(data[25..29].try_into().unwrap()) as usize;
-        let required_len = 29usize
-            .checked_add(payload_len)
-            .and_then(|len| len.checked_add(8))
-            .and_then(|len| len.checked_add(2));
-        if required_len.is_none_or(|total| data.len() < total) {
+
+        let mut pos = 4;
+
+        // doc_id（变长）
+        let doc_id_len = data[pos] as usize;
+        pos += 1;
+        if pos + doc_id_len > data.len() {
             return Err(FrameError::TooShort);
         }
-        let total_len = required_len.unwrap();
-        let payload = Bytes::copy_from_slice(&data[29..29 + payload_len]);
-        let ref_id: [u8; 8] = data[29 + payload_len..29 + payload_len + 8]
-            .try_into()
-            .unwrap();
-        let sig_len = u16::from_be_bytes([data[total_len - 2], data[total_len - 1]]) as usize;
-        let sig_start = total_len;
-        if sig_start
-            .checked_add(sig_len)
-            .is_none_or(|total| data.len() < total)
-        {
+        let doc_id = data[pos..pos + doc_id_len].to_vec();
+        pos += doc_id_len;
+
+        // actor_id（变长）
+        if pos + 1 > data.len() {
             return Err(FrameError::TooShort);
         }
-        let sig = data[sig_start..sig_start + sig_len].to_vec();
+        let actor_id_len = data[pos] as usize;
+        pos += 1;
+        if pos + actor_id_len > data.len() {
+            return Err(FrameError::TooShort);
+        }
+        let actor_id = data[pos..pos + actor_id_len].to_vec();
+        pos += actor_id_len;
+
+        // seq(4) + kind(1) + payload_len(4)
+        let fixed_tail = 4 + 1 + 4;
+        if pos + fixed_tail > data.len() {
+            return Err(FrameError::TooShort);
+        }
+        let seq = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let kind = u8_to_data_frame_kind(data[pos])?;
+        pos += 1;
+        let payload_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // payload(n) + ref(8) + sig_len(2)
+        let tail = payload_len.checked_add(8).and_then(|v| v.checked_add(2));
+        let tail = tail.ok_or(FrameError::FrameTooLarge(usize::MAX))?;
+        if pos + tail > data.len() {
+            return Err(FrameError::TooShort);
+        }
+
+        let payload = Bytes::copy_from_slice(&data[pos..pos + payload_len]);
+        pos += payload_len;
+        let ref_id: [u8; 8] = data[pos..pos + 8].try_into().unwrap();
+        pos += 8;
+        let sig_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+
+        if pos + sig_len > data.len() {
+            return Err(FrameError::TooShort);
+        }
+        let sig = data[pos..pos + sig_len].to_vec();
+
         Ok(Self {
             version,
             flags,
@@ -461,6 +532,10 @@ pub enum FrameError {
 // ===== 辅助函数 =====
 
 /// group_id 字符串转 4 字节（取前 4 字节 hash）。
+///
+/// Discovery Frame 仍用固定 4 字节以保持发现层帧大小恒定（19 字节），
+/// 因为发现层广播帧越小越好，且 group_id 碰撞不影响安全性
+///（真正的身份验证在后续 Handshake 中完成）。
 fn group_id_to_bytes(group_id: &str) -> [u8; 4] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -480,16 +555,6 @@ fn device_id_to_bytes(device_id: &str) -> [u8; 8] {
     let mut out = [0u8; 8];
     out.copy_from_slice(&result[0..8]);
     out
-}
-
-/// doc_id 转 8 字节。
-fn doc_id_to_bytes(doc_id: &DocId) -> [u8; 8] {
-    device_id_to_bytes(doc_id.as_str())
-}
-
-/// peer_id 转 8 字节。
-fn peer_id_to_bytes(peer_id: &PeerId) -> [u8; 8] {
-    device_id_to_bytes(peer_id.as_str())
 }
 
 /// 能力位转 2 字节。
@@ -621,6 +686,68 @@ mod tests {
         let decoded = DataFrameWire::decode(&encoded).unwrap();
         assert_eq!(frame, decoded);
         assert_eq!(decoded.batch_flag(), BatchFlag::BatchStart);
+    }
+
+    #[test]
+    fn data_frame_id_reversibility() {
+        // v2 核心保证：doc_id/actor_id 编码后解码可无损还原
+        let doc_id = DocId::new("my-document-123");
+        let actor_id = PeerId::new("peer-abc-xyz");
+        let frame = DataFrameWire::new(
+            &doc_id,
+            &actor_id,
+            1,
+            DataFrameKind::Delta,
+            Bytes::from_static(b"data"),
+            BatchFlag::Single,
+            [0u8; 8],
+        );
+        let encoded = frame.encode();
+        let decoded = DataFrameWire::decode(&encoded).unwrap();
+        let df = decoded.to_data_frame();
+        assert_eq!(df.doc_id, doc_id, "doc_id 必须可逆还原");
+        assert_eq!(df.actor_id, actor_id, "actor_id 必须可逆还原");
+    }
+
+    #[test]
+    fn data_frame_long_id() {
+        // 变长 ID 支持任意长度（1..=255）
+        let long_id = "a".repeat(200);
+        let doc_id = DocId::new(long_id.clone());
+        let actor_id = PeerId::new("p");
+        let frame = DataFrameWire::new(
+            &doc_id,
+            &actor_id,
+            0,
+            DataFrameKind::SnapshotChunk,
+            Bytes::from_static(b"x"),
+            BatchFlag::Single,
+            [0xff; 8],
+        );
+        let encoded = frame.encode();
+        let decoded = DataFrameWire::decode(&encoded).unwrap();
+        assert_eq!(decoded.doc_id, long_id.as_bytes());
+        let df = decoded.to_data_frame();
+        assert_eq!(df.doc_id, doc_id);
+    }
+
+    #[test]
+    fn data_frame_empty_id() {
+        // 空 ID 也能正确编解码
+        let doc_id = DocId::new("");
+        let actor_id = PeerId::new("");
+        let frame = DataFrameWire::new(
+            &doc_id,
+            &actor_id,
+            0,
+            DataFrameKind::Delta,
+            Bytes::new(),
+            BatchFlag::Single,
+            [0u8; 8],
+        );
+        let encoded = frame.encode();
+        let decoded = DataFrameWire::decode(&encoded).unwrap();
+        assert_eq!(frame, decoded);
     }
 
     #[test]

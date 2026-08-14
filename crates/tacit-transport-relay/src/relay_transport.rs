@@ -144,10 +144,27 @@ impl RelayClientTransport {
     }
 
     /// 加密 payload。若该 peer 未注册 session，返回错误（强制 E2E 加密）。
+    ///
+    /// 自动 rekey：当 `encrypt_count` 达到阈值时，自动轮换发送密钥。
+    /// 接收方在解密时也会检查 `incoming_rekey_pending` 并自动轮换接收密钥。
+    /// 这是一种“隐式 rekey”策略——不发送带外通知，而是依赖双方各自
+    /// 达到阈值时同步轮换。因为阈值相同且 encrypt/decrypt 计数在
+    /// 正常通信中近似同步（每条消息被 encrypt 一次、decrypt 一次），
+    /// 所以轮换时机接近一致。
+    ///
+    /// 注意：如果消息丢失导致双方计数失步，接收方可能在发送方已 rekey
+    /// 后仍用旧密钥解密，导致解密失败。此时由上层重连逻辑重建 session。
+    /// 这与 v1.0 规范的 at-most-once 合约一致——消息丢失不破坏一致性，
+    /// 由 CRDT 的 pull 恢复路径补偿。
     fn encrypt_if_session(&self, peer_id: &PeerId, plaintext: Vec<u8>) -> CoreResult<Vec<u8>> {
         match self.sessions.read().get(peer_id) {
             Some(session) => {
                 let mut s = session.lock();
+                // 检查是否需要 rekey（encrypt_count 达到阈值）
+                if s.outgoing_rekey_pending() {
+                    debug!(peer = %peer_id, "E2E session 发送方向自动 rekey");
+                    s.rekey_outgoing();
+                }
                 s.encrypt(&plaintext)
             }
             None => Err(CoreError::Transport(format!(
@@ -380,6 +397,11 @@ impl RelayClientTransport {
                             let decrypted = match sessions_for_dispatch.read().get(&from) {
                                 Some(session) => {
                                     let mut s = session.lock();
+                                    // 检查是否需要 rekey（decrypt_count 达到阈值）
+                                    if s.incoming_rekey_pending() {
+                                        debug!(peer = %from, "E2E session 接收方向自动 rekey");
+                                        s.rekey_incoming();
+                                    }
                                     match s.decrypt(&data) {
                                         Ok(pt) => pt,
                                         Err(e) => {
@@ -782,7 +804,26 @@ impl RelayServerRunner {
     /// 每个客户端连接独立 task 处理：
     /// - 读取 bi-stream 上的请求（Register / Forward / Ping）。
     /// - 对于 Forward，调用 handle_forward 获取 Incoming，推送到目标 peer。
+    ///
+    /// 同时启动周期性 TTL 清理任务（默认每 60s 清理过期 session），
+    /// 防止无声断开的客户端 session 永久滞留内存。
     pub async fn run(self: Arc<Self>) -> CoreResult<()> {
+        // 启动周期 cleanup task
+        let server = self.server.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // 跳过首次立即触发
+            loop {
+                interval.tick().await;
+                let before = server.online_count();
+                server.cleanup_expired();
+                let after = server.online_count();
+                if before != after {
+                    debug!(before, after, "relay TTL 清理完成");
+                }
+            }
+        });
+
         debug!("relay 服务端开始接受连接");
         loop {
             match self.endpoint.accept().await {
@@ -860,24 +901,36 @@ impl RelayServerRunner {
         send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
-        // 读取请求（限制 10MB 防止 OOM DoS，与 request_response 和 push stream 一致）
+        // 读取请求（限制 10MB 防止 OOM DoS，15s 读取超时防止慢速 DoS）
         const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
         let mut buf = Vec::new();
         let mut chunk = vec![0u8; 4096];
-        loop {
-            match recv.read(&mut chunk).await {
-                Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => {
-                    if buf.len() + n > MAX_REQUEST_SIZE {
-                        warn!("请求大小超过 10MB 限制，丢弃");
-                        return;
+        let read_result = timeout(Duration::from_secs(15), async {
+            loop {
+                match recv.read(&mut chunk).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(n)) => {
+                        if buf.len() + n > MAX_REQUEST_SIZE {
+                            warn!("请求大小超过 10MB 限制，丢弃");
+                            return Err(());
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
                     }
-                    buf.extend_from_slice(&chunk[..n]);
+                    Err(e) => {
+                        debug!(error = %e, "读取请求失败");
+                        return Err(());
+                    }
                 }
-                Err(e) => {
-                    debug!(error = %e, "读取请求失败");
-                    return;
-                }
+            }
+            Ok(())
+        })
+        .await;
+        match read_result {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => return,
+            Err(_) => {
+                warn!("读取请求超时（15s），丢弃");
+                return;
             }
         }
         if buf.is_empty() {
