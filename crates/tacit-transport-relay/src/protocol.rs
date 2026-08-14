@@ -130,6 +130,7 @@ mod tests {
         let proof = crate::AdmissionProof {
             peer_id: "1".into(),
             timestamp_ms: 1000,
+            nonce: "a".repeat(32),
             signature: "abc".into(),
         };
         let msg = RelayMessage::Register(RegisterRequest { proof });

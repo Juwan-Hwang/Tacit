@@ -220,7 +220,7 @@ mod tests {
         // 前 2 字节是 magic
         assert_eq!(&payload[0..2], &[0x54, 0x43]);
         // version
-        assert_eq!(payload[2], 1);
+        assert_eq!(payload[2], tacit_core::frame::PROTOCOL_VERSION);
         // ext_flags: has_endpoint | is_ipv4 = 0b11
         assert_eq!(payload[19], 0b0000_0011);
     }
