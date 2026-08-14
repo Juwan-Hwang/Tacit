@@ -151,7 +151,7 @@ let view = engine.open_document("doc1".into())?;
 
 ### Known Security Debt (v1.0)
 
-- **Private key storage**: Device signing key and X25519 static private key are stored in plaintext SQLite by default. Desktop platforms (macOS Keychain, Windows Credential Manager, Linux Secret Service) are now supported via the `keyring` feature. Platform secure enclaves for mobile (iOS Keychain / Android Keystore) are planned for v2.0.
+- **Private key storage**: Device signing key and X25519 static private key are stored in plaintext SQLite by default. `SecretStorage` trait + `KeyringStorage` (macOS Keychain / Windows Credential Manager / Linux Secret Service) are defined but not yet wired into the identity lifecycle. Mobile platforms (iOS Keychain / Android Keystore) require host-injected implementations. See [Integration Layer Responsibilities](#integration-layer-responsibilities) below.
 - **No handshake rate limiting**: Relay admission proof mitigates spam; client-side rate limiting is deferred to relay server-side implementation.
 
 ## Testing
@@ -164,7 +164,46 @@ let view = engine.open_document("doc1".into())?;
 | Chaos tests | Random disconnects, packet loss simulation |
 | Security tests | Peer spoofing, replay attacks, unauthorized relay access |
 
-> **Note**: This repository is a **sync engine library**, not a standalone application. End-to-end network sync requires a host integration layer (iOS/Android/desktop app) that wires `SyncEngine` actions to real transports. Integration tests in this repository operate at the DocStore level (simulated byte transfer between in-memory stores), not through real network transports.
+## Integration Layer Responsibilities
+
+Tacit is a **sync engine library**, not a standalone application. The host app (iOS / Android / desktop) is responsible for the following items that are **deliberately out of scope** for the core crates:
+
+### 1. Secure Private Key Storage (Critical)
+
+Device Ed25519 signing keys and X25519 static private keys are currently stored as plaintext BLOBs in SQLite (`device_identity` table). The `SecretStorage` trait and `KeyringStorage` implementation (Windows Credential Manager / macOS Keychain / Linux Secret Service) are ready in `tacit-crypto::secret_storage`, but **not yet wired** into the identity lifecycle.
+
+**What the host must do:**
+- **Desktop**: Enable the `keyring` feature and inject a `KeyringStorage` instance into the engine at startup, replacing the default SQLite-backed identity store.
+- **iOS**: Implement `SecretStorage` on top of iOS Keychain (`SecItemAdd` / `SecItemCopyMatching`) and inject it.
+- **Android**: Implement `SecretStorage` on top of Android Keystore (`KeyStore.getInstance("AndroidKeyStore")`) and inject it.
+- Call `ensure_device_identity()` at app launch; if using platform secure storage, ensure the identity is loaded from / saved to the secure backend instead of SQLite.
+
+### 2. Transport Lifecycle Management
+
+Core crates define `SyncTransport` trait and provide QUIC / BLE / Relay implementations. The host is responsible for:
+- **BLE**: Providing platform-specific BLE advertising / scanning backends (CoreBluetooth on iOS, BluetoothLeScanner on Android, BlueZ on Linux). The `tacit-transport-ble` crate provides mock and Linux backends; iOS/Android backends must be host-injected.
+- **Network permissions**: Requesting the necessary OS permissions (Bluetooth, local network, internet) before starting transports.
+- **Foreground/background transitions**: Pausing/resuming sync loops based on app lifecycle events (iOS background limits, Android Doze mode).
+
+### 3. Peer Discovery and Pairing UX
+
+- **Face-to-face pairing**: The `tacit-crypto` pairing protocol (SAS code verification) is implemented, but the host app must provide the UI: display the SAS code, let the user confirm, and trigger `complete_pairing()`.
+- **mDNS / BLE discovery**: The host must wire discovery callbacks to the `SyncEngine` peer registry.
+- **Manual peer import**: QR code scanning or invitation links are host-side UX.
+
+### 4. Database Encryption (Optional but Recommended)
+
+SQLite is opened without encryption by default. For production deployments handling user content:
+- **SQLCipher**: The host may replace the `rusqlite` connection with a SQLCipher-backed connection for at-rest encryption.
+- **File-level encryption**: iOS Data Protection (NSFileProtectionComplete) and Android EncryptedSharedPreferences / file-based encryption are host-level configurations.
+
+### 5. Certificate / TLS Configuration
+
+QUIC transport uses self-signed certificates generated from the device PeerId (`generate_cert_with_peer_id`). The host may optionally:
+- Provide a custom certificate authority (CA) for stricter PKI.
+- Pin known peer certificates via the `ClientConfig` builder.
+
+> **Note**: End-to-end network sync requires a host integration layer that wires `SyncEngine` actions to real transports. Integration tests in this repository operate at the DocStore level (simulated byte transfer between in-memory stores), not through real network transports.
 
 ## License
 
