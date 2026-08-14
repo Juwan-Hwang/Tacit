@@ -16,9 +16,8 @@
 //! `keyring` crate 已覆盖 Win/Mac/Linux 原生钥匙串，Rust 端只需定义 trait + 接入
 //! 即可消除桌面端的这个债。只有 iOS/Android 需要宿主注入平台实现。
 //!
-//! **注意**：当前 `SecretStorage`/`KeyringStorage` 仅为 API 定义，尚未接入
-//! `ffi_generate_and_save_device_identity` 等实际调用路径。身份密钥仍以明文
-//! 存储在 SQLite `device_identity` 表中。集成待后续 PR 完成。
+//! **注意**：`SecretStorage` 已接入 `TacitEngine::save_device_identity` / `load_device_identity`。
+//! 私钥在设置了安全存储后优先存入平台钥匙串，SQLite 作为回退。
 
 use parking_lot::Mutex;
 use std::collections::HashMap;

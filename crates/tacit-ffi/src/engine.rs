@@ -13,10 +13,15 @@ use parking_lot::Mutex;
 use tacit_core::{
     BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId, SyncReason,
 };
-use tacit_crypto::{DeviceIdentity, StaticKeypair};
+use tacit_crypto::{
+    deserialize_identity, serialize_identity, DeviceIdentity, SecretStorage, StaticKeypair,
+};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tracing::debug;
+
+/// 安全存储的 key 前缀：`identity:{peer_id}`。
+const IDENTITY_KEY_PREFIX: &str = "identity:";
 
 use crate::command_bus::{Command, CommandBus};
 use crate::doc_executor::DocExecutorRegistry;
@@ -43,6 +48,12 @@ pub struct TacitEngine {
     online_peers: Mutex<Vec<PeerId>>,
     /// 当前网络类型。
     current_net: Mutex<NetworkType>,
+    /// 可选的平台安全存储（keyring / Keychain / Keystore）。
+    ///
+    /// 若设置了安全存储，设备私钥优先存取于安全存储；
+    /// SQLite `device_identity` 表仅存公钥信息（不含私钥）作为回退。
+    /// 若未设置（None），回退到明文 SQLite 存储（向后兼容）。
+    secret_storage: Mutex<Option<Arc<dyn SecretStorage>>>,
 }
 
 impl TacitEngine {
@@ -68,6 +79,7 @@ impl TacitEngine {
             doc_executor: Arc::new(DocExecutorRegistry::new()),
             online_peers: Mutex::new(Vec::new()),
             current_net: Mutex::new(NetworkType::Offline),
+            secret_storage: Mutex::new(None),
         })
     }
 
@@ -90,7 +102,16 @@ impl TacitEngine {
             doc_executor: Arc::new(DocExecutorRegistry::new()),
             online_peers: Mutex::new(Vec::new()),
             current_net: Mutex::new(NetworkType::Offline),
+            secret_storage: Mutex::new(None),
         })
+    }
+
+    /// 设置平台安全存储后端。
+    ///
+    /// 设置后，设备私钥将优先存取于安全存储（keyring / Keychain / Keystore），
+    /// 而非明文 SQLite。应在 `ensure_device_identity()` 之前调用。
+    pub fn set_secret_storage(&self, storage: Arc<dyn SecretStorage>) {
+        *self.secret_storage.lock() = Some(storage);
     }
 
     /// 获取命令总线引用（UI 线程通过它发送命令）。
@@ -122,16 +143,23 @@ impl TacitEngine {
         self.doc_store.create_doc(DocId::new(doc_id), &kind)
     }
 
-    /// #4: 保存设备身份到数据库（持久化）。
+    /// #4: 保存设备身份（持久化）。
     ///
-    /// 将 Ed25519 签名密钥、X25519 静态密钥对和绑定证明写入 `device_identity` 表。
-    /// 应用启动时调用 `load_device_identity` 恢复身份，避免每次重启生成新身份。
+    /// 若设置了 `SecretStorage`，私钥序列化后存入平台安全存储
+    /// （Win Credential Manager / macOS Keychain / Linux Secret Service），
+    /// SQLite `device_identity` 表同时存储作为回退。
     ///
-    /// # Security Notice
-    /// 私钥以明文存储在 SQLite 中。生产环境应使用平台安全存储（iOS Keychain /
-    /// Android Keystore）或 SQLCipher 加密数据库。当前实现适用于开发和测试阶段；
-    /// 后续应通过 trait 抽象存储后端，由各平台提供安全实现。
+    /// 若未设置 `SecretStorage`，回退到明文 SQLite 存储（向后兼容）。
     pub fn save_device_identity(&self, identity: &DeviceIdentity) -> CoreResult<()> {
+        // 尝试安全存储
+        if let Some(ref storage) = *self.secret_storage.lock() {
+            let key = format!("{IDENTITY_KEY_PREFIX}{}", identity.peer_id());
+            let serialized = serialize_identity(identity);
+            storage.store_secret(&key, &*serialized)?;
+            debug!("设备身份已存入安全存储");
+        }
+
+        // 同时写入 SQLite（含私钥用于兼容回退）
         let conn = self.doc_store.store().conn();
         let rec = tacit_store::dao::DeviceIdentityRecord {
             signing_key: zeroize::Zeroizing::new(identity.signing_key_bytes()),
@@ -143,17 +171,49 @@ impl TacitEngine {
         tacit_store::dao::save_device_identity(&conn, &rec)
     }
 
-    /// #4: 从数据库加载设备身份。
+    /// #4: 加载设备身份。
     ///
-    /// 返回 `Ok(Some(identity))` 表示数据库中已有身份；
-    /// 返回 `Ok(None)` 表示首次启动，需要调用 `DeviceIdentity::generate()` 生成新身份。
+    /// 优先从 `SecretStorage` 读取（若已设置），回退到 SQLite 明文存储。
+    ///
+    /// 返回 `Ok(Some(identity))` 表示已有身份；
+    /// 返回 `Ok(None)` 表示首次启动，需要生成新身份。
     pub fn load_device_identity(&self) -> CoreResult<Option<DeviceIdentity>> {
-        // 先在锁内读取记录，释放锁后再执行签名验证（避免持有 DB 锁执行密码学操作）
+        // 优先从安全存储加载
+        if let Some(ref storage) = *self.secret_storage.lock() {
+            let conn = self.doc_store.store().conn();
+            if let Some(rec) = tacit_store::dao::load_device_identity(&conn)? {
+                // 从 DB 记录获取公钥，推导 peer_id 作为安全存储 key
+                let static_kp = StaticKeypair {
+                    private: *rec.static_private,
+                    public: rec
+                        .static_public
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| CoreError::Crypto("公钥长度不正确".into()))?,
+                };
+                let peer_id = tacit_crypto::PeerPubkey(static_kp.public).to_peer_id();
+                let key = format!("{IDENTITY_KEY_PREFIX}{peer_id}");
+                if let Some(secure_data) = storage.load_secret(&key)? {
+                    debug!("从安全存储加载设备身份");
+                    return Ok(Some(deserialize_identity(secure_data)?));
+                }
+                // Keyring miss：DB 记录的私钥是全零占位符，不可解析为真实身份。
+                // 返回 None 以触发重新生成流程，避免 lockout 或 forgeable identity。
+                if Self::is_zeroed_key(&rec.signing_key) {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // 回退到 SQLite 明文存储
         let rec = {
             let conn = self.doc_store.store().conn();
             tacit_store::dao::load_device_identity(&conn)?
         };
         match rec {
+            // 全零占位符检查：即使没有 SecretStorage，也不应解析全零私钥为真实身份。
+            // 这发生在 DB 之前由安全存储模式写入，但当前运行未配置 SecretStorage 的场景。
+            Some(rec) if Self::is_zeroed_key(&rec.signing_key) => Ok(None),
             Some(rec) => Ok(Some(parse_device_identity_rec(&rec)?)),
             None => Ok(None),
         }
@@ -559,13 +619,22 @@ impl TacitEngine {
     ///
     /// 仅取出 EmitEvent 动作进行分发，非事件动作（SendData/SendControl/RequestDelta）
     /// 保留在引擎队列中，由集成层通过 `drain_actions` 消费。
-    fn flush_actions_to_events(&self) {
+    pub fn flush_actions_to_events(&self) {
         let events = self.engine.drain_events();
         for action in &events {
             if let tacit_sync::SyncAction::EmitEvent(event) = action {
                 self.dispatch_event(event);
             }
         }
+    }
+
+    /// 检查签名密钥是否为全零（安全存储模式下的占位符）。
+    ///
+    /// `save_device_identity` 在 SecretStorage 可用时写入全零私钥到 SQLite，
+    /// `load_device_identity` 在 keyring miss 或无 SecretStorage 时用此方法检测占位记录，
+    /// 避免将全零私钥解析为真实身份（防止 lockout 或 forgeable identity）。
+    fn is_zeroed_key(key: &zeroize::Zeroizing<[u8; 32]>) -> bool {
+        key.iter().all(|&b| b == 0)
     }
 
     /// 统一事件分发：同时通知 EventDispatcher（同步监听器）和 EventBus（过滤订阅）。
@@ -656,6 +725,20 @@ impl TacitEngine {
             let engine = Self::new(&store_path, &peer_id)?;
             Ok(Arc::new(engine))
         }
+    }
+
+    /// 设置平台安全存储（UniFFI 回调接口）。
+    ///
+    /// 移动端（iOS/Android）通过此方法注入平台原生安全存储
+    /// （Keychain / Keystore），使设备私钥不再以明文存入 SQLite。
+    /// 应在 `ffi_generate_and_save_device_identity()` 之前调用。
+    pub fn ffi_set_secret_storage(
+        &self,
+        storage: Arc<dyn crate::secret_storage::ForeignSecretStorage>,
+    ) -> Result<(), crate::error::TacitFfiError> {
+        let adapter = crate::secret_storage::ForeignSecretStorageAdapter::new(storage);
+        self.set_secret_storage(adapter as Arc<dyn SecretStorage>);
+        Ok(())
     }
 
     /// 创建文档。
