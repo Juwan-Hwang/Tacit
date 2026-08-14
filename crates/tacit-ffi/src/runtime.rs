@@ -9,7 +9,9 @@
 //!
 //! RuntimeSupervisor 在独立 tokio 任务中运行，消费 CommandBus 的命令并
 //! 调用 TacitEngine 的方法执行。它还负责定期触发 process_pending 和
-//! drain_actions，确保依赖等待重试和动作分发及时执行。
+//! flush_actions_to_events，确保依赖等待重试和事件分发及时执行。
+//! SendData/SendControl/RequestDelta 等传输动作保留在引擎队列中，
+//! 由集成层通过 drain_actions 主动消费。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,7 +175,8 @@ impl RuntimeSupervisor {
             let handle = rt.handle().spawn(async move {
                 self_clone
                     .periodic_task_inner(engine_clone, interval, |eng| {
-                        eng.drain_actions().map(|_| ())
+                        eng.flush_actions_to_events();
+                        Ok(())
                     })
                     .await;
             });
@@ -223,7 +226,8 @@ impl RuntimeSupervisor {
             let handle = tokio::spawn(async move {
                 self_clone
                     .periodic_task(engine_clone, config.drain_interval, move |eng| {
-                        eng.drain_actions().map(|_| ())
+                        eng.flush_actions_to_events();
+                        Ok(())
                     })
                     .await;
             });
