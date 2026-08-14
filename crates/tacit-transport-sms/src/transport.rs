@@ -401,7 +401,8 @@ impl SyncTransport for SmsTransport {
                 &frame.payload,
                 tacit_core::BatchFlag::Single,
                 [0u8; 8],
-            );
+            )
+            .map_err(|e| CoreError::Serialize(format!("数据帧编码失败: {e}")))?;
             if encoded.len() > MAX_SMS_DATA_PAYLOAD {
                 return Err(CoreError::Transport(format!(
                     "DataFrame 过大: {} 字节，超过 SMS 数据面上限 {} 字节（等待 IP 恢复后走 QUIC）",

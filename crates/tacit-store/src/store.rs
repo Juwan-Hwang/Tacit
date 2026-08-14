@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(loaded.static_public, rec.static_public);
         assert_eq!(loaded.binding_proof, rec.binding_proof);
 
-        // 覆盖写入应失败（INSERT 防止静默覆盖）
+        // 覆盖有效身份应失败（条件 upsert 保护 TOCTOU 竞争）
         let rec2 = dao::DeviceIdentityRecord {
             signing_key: zeroize::Zeroizing::new([0xAA; 32]),
             static_private: zeroize::Zeroizing::new([0xBB; 32]),
@@ -904,12 +904,34 @@ mod tests {
         };
         assert!(
             dao::save_device_identity(&conn, &rec2).is_err(),
-            "INSERT 应在已存在身份时失败，防止静默覆盖"
+            "条件 upsert 应拒绝覆盖已有有效身份，防止 TOCTOU 竞争"
         );
 
         // 原身份应保持不变
         let loaded2 = dao::load_device_identity(&conn).unwrap().unwrap();
         assert_eq!(loaded2.signing_key, rec.signing_key, "原身份不应被覆盖");
+
+        // 覆盖全零占位符应成功（Keyring 丢失恢复路径）
+        // 占位符：signing_key 全零 AND static_public 为空（区分安全模式有效身份）
+        let zeroed = dao::DeviceIdentityRecord {
+            signing_key: zeroize::Zeroizing::new([0u8; 32]),
+            static_private: zeroize::Zeroizing::new([0u8; 32]),
+            static_public: vec![],
+            binding_proof: vec![],
+            created_at: SystemTime::now(),
+        };
+        // 先用 overwrite 写入全零占位符
+        dao::overwrite_device_identity(&conn, &zeroed).unwrap();
+        // 再用 save 覆盖全零占位符——应成功
+        assert!(
+            dao::save_device_identity(&conn, &rec2).is_ok(),
+            "条件 upsert 应允许覆盖全零占位符以支持 Keyring 丢失恢复"
+        );
+        let loaded3 = dao::load_device_identity(&conn).unwrap().unwrap();
+        assert_eq!(
+            loaded3.signing_key, rec2.signing_key,
+            "新身份应已覆盖全零占位符"
+        );
     }
 
     #[test]
