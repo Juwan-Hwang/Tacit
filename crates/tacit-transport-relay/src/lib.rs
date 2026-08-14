@@ -14,7 +14,9 @@ pub mod protocol;
 pub mod relay_transport;
 pub mod server;
 
-pub use admission::{generate_proof, verify_proof, AdmissionProof};
+pub use admission::{
+    generate_proof, verify_proof, verify_proof_with_replay, AdmissionProof, NonceCache,
+};
 pub use client::RelayClient;
 pub use protocol::{ForwardRequest, RegisterRequest, RelayMessage, RelayTier};
 pub use relay_transport::{RelayClientTransport, RelayPushEvent, RelayServerRunner};

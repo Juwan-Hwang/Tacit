@@ -13,10 +13,15 @@ use parking_lot::Mutex;
 use tacit_core::{
     BlockId, ChangeEnvelope, CoreError, CoreResult, DocId, NetworkType, PeerId, SyncReason,
 };
-use tacit_crypto::{DeviceIdentity, StaticKeypair};
+use tacit_crypto::{
+    deserialize_identity, serialize_identity, DeviceIdentity, SecretStorage, StaticKeypair,
+};
 use tacit_store::Store;
 use tacit_sync::{DefaultSyncEngine, DocStore, EngineConfig, SyncEngine};
 use tracing::debug;
+
+/// 安全存储的 key 前缀：`identity:{peer_id}`。
+const IDENTITY_KEY_PREFIX: &str = "identity:";
 
 use crate::command_bus::{Command, CommandBus};
 use crate::doc_executor::DocExecutorRegistry;
@@ -43,6 +48,12 @@ pub struct TacitEngine {
     online_peers: Mutex<Vec<PeerId>>,
     /// 当前网络类型。
     current_net: Mutex<NetworkType>,
+    /// 可选的平台安全存储（keyring / Keychain / Keystore）。
+    ///
+    /// 若设置了安全存储，设备私钥优先存取于安全存储；
+    /// SQLite `device_identity` 表仅存公钥信息（不含私钥）作为回退。
+    /// 若未设置（None），回退到明文 SQLite 存储（向后兼容）。
+    secret_storage: Mutex<Option<Arc<dyn SecretStorage>>>,
 }
 
 impl TacitEngine {
@@ -68,6 +79,7 @@ impl TacitEngine {
             doc_executor: Arc::new(DocExecutorRegistry::new()),
             online_peers: Mutex::new(Vec::new()),
             current_net: Mutex::new(NetworkType::Offline),
+            secret_storage: Mutex::new(None),
         })
     }
 
@@ -90,7 +102,16 @@ impl TacitEngine {
             doc_executor: Arc::new(DocExecutorRegistry::new()),
             online_peers: Mutex::new(Vec::new()),
             current_net: Mutex::new(NetworkType::Offline),
+            secret_storage: Mutex::new(None),
         })
+    }
+
+    /// 设置平台安全存储后端。
+    ///
+    /// 设置后，设备私钥将优先存取于安全存储（keyring / Keychain / Keystore），
+    /// 而非明文 SQLite。应在 `ensure_device_identity()` 之前调用。
+    pub fn set_secret_storage(&self, storage: Arc<dyn SecretStorage>) {
+        *self.secret_storage.lock() = Some(storage);
     }
 
     /// 获取命令总线引用（UI 线程通过它发送命令）。
@@ -122,33 +143,77 @@ impl TacitEngine {
         self.doc_store.create_doc(DocId::new(doc_id), &kind)
     }
 
-    /// #4: 保存设备身份到数据库（持久化）。
+    /// #4: 保存设备身份（持久化）。
     ///
-    /// 将 Ed25519 签名密钥、X25519 静态密钥对和绑定证明写入 `device_identity` 表。
-    /// 应用启动时调用 `load_device_identity` 恢复身份，避免每次重启生成新身份。
+    /// 若设置了 `SecretStorage`，私钥序列化后存入平台安全存储
+    /// （Win Credential Manager / macOS Keychain / Linux Secret Service），
+    /// SQLite `device_identity` 表仅存储公钥信息作为回退索引。
     ///
-    /// # Security Notice
-    /// 私钥以明文存储在 SQLite 中。生产环境应使用平台安全存储（iOS Keychain /
-    /// Android Keystore）或 SQLCipher 加密数据库。当前实现适用于开发和测试阶段；
-    /// 后续应通过 trait 抽象存储后端，由各平台提供安全实现。
+    /// 若未设置 `SecretStorage`，回退到明文 SQLite 存储（向后兼容）。
     pub fn save_device_identity(&self, identity: &DeviceIdentity) -> CoreResult<()> {
+        let has_secure = self.secret_storage.lock().is_some();
+
+        // 尝试安全存储（私钥完整存入 keyring）
+        if let Some(ref storage) = *self.secret_storage.lock() {
+            let key = format!("{IDENTITY_KEY_PREFIX}{}", identity.peer_id());
+            let serialized = serialize_identity(identity);
+            storage.store_secret(&key, &*serialized)?;
+            debug!("设备身份已存入安全存储");
+        }
+
+        // SQLite：安全存储可用时只写公钥（不含私钥），否则写完整记录（向后兼容）
         let conn = self.doc_store.store().conn();
-        let rec = tacit_store::dao::DeviceIdentityRecord {
-            signing_key: zeroize::Zeroizing::new(identity.signing_key_bytes()),
-            static_private: zeroize::Zeroizing::new(identity.static_keypair().private),
-            static_public: identity.static_keypair().public.to_vec(),
-            binding_proof: identity.binding_proof().to_vec(),
-            created_at: SystemTime::now(),
+        let rec = if has_secure {
+            tacit_store::dao::DeviceIdentityRecord {
+                // 私钥置零——不落盘明文
+                signing_key: zeroize::Zeroizing::new([0u8; 32]),
+                static_private: zeroize::Zeroizing::new([0u8; 32]),
+                static_public: identity.static_keypair().public.to_vec(),
+                binding_proof: identity.binding_proof().to_vec(),
+                created_at: SystemTime::now(),
+            }
+        } else {
+            tacit_store::dao::DeviceIdentityRecord {
+                signing_key: zeroize::Zeroizing::new(identity.signing_key_bytes()),
+                static_private: zeroize::Zeroizing::new(identity.static_keypair().private),
+                static_public: identity.static_keypair().public.to_vec(),
+                binding_proof: identity.binding_proof().to_vec(),
+                created_at: SystemTime::now(),
+            }
         };
         tacit_store::dao::save_device_identity(&conn, &rec)
     }
 
-    /// #4: 从数据库加载设备身份。
+    /// #4: 加载设备身份。
     ///
-    /// 返回 `Ok(Some(identity))` 表示数据库中已有身份；
-    /// 返回 `Ok(None)` 表示首次启动，需要调用 `DeviceIdentity::generate()` 生成新身份。
+    /// 优先从 `SecretStorage` 读取（若已设置），回退到 SQLite 明文存储。
+    ///
+    /// 返回 `Ok(Some(identity))` 表示已有身份；
+    /// 返回 `Ok(None)` 表示首次启动，需要生成新身份。
     pub fn load_device_identity(&self) -> CoreResult<Option<DeviceIdentity>> {
-        // 先在锁内读取记录，释放锁后再执行签名验证（避免持有 DB 锁执行密码学操作）
+        // 优先从安全存储加载
+        if let Some(ref storage) = *self.secret_storage.lock() {
+            let conn = self.doc_store.store().conn();
+            if let Some(rec) = tacit_store::dao::load_device_identity(&conn)? {
+                // 从 DB 记录获取公钥，推导 peer_id 作为安全存储 key
+                let static_kp = StaticKeypair {
+                    private: *rec.static_private,
+                    public: rec
+                        .static_public
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| CoreError::Crypto("公钥长度不正确".into()))?,
+                };
+                let peer_id = tacit_crypto::PeerPubkey(static_kp.public).to_peer_id();
+                let key = format!("{IDENTITY_KEY_PREFIX}{peer_id}");
+                if let Some(secure_data) = storage.load_secret(&key)? {
+                    debug!("从安全存储加载设备身份");
+                    return Ok(Some(deserialize_identity(secure_data)?));
+                }
+            }
+        }
+
+        // 回退到 SQLite 明文存储
         let rec = {
             let conn = self.doc_store.store().conn();
             tacit_store::dao::load_device_identity(&conn)?
@@ -166,6 +231,8 @@ impl TacitEngine {
     ///
     /// 采用三步式设计避免在持有 DB 锁时执行昂贵的密码学操作：
     /// 1. 锁内检查已有身份 → 2. 锁外生成密钥 → 3. 锁内二次检查 + INSERT
+    ///
+    /// 新身份通过 `save_device_identity()` 持久化，确保 SecretStorage 路径被正确调用。
     pub fn ensure_device_identity(&self) -> CoreResult<DeviceIdentity> {
         // 1. 尝试加载已有身份（load_device_identity 内部获取锁后释放）
         if let Some(di) = self.load_device_identity()? {
@@ -174,16 +241,9 @@ impl TacitEngine {
 
         // 2. 锁外生成新身份（避免持有 DB 锁执行昂贵的密码学操作）
         let di = DeviceIdentity::generate()?;
-        let rec = tacit_store::dao::DeviceIdentityRecord {
-            signing_key: zeroize::Zeroizing::new(di.signing_key_bytes()),
-            static_private: zeroize::Zeroizing::new(di.static_keypair().private),
-            static_public: di.static_keypair().public.to_vec(),
-            binding_proof: di.binding_proof().to_vec(),
-            created_at: SystemTime::now(),
-        };
 
         // 3. 锁内原子操作：二次检查 + INSERT 必须在同一锁内完成，防止 TOCTOU 竞态。
-        //    但如果发现已有身份，先释放锁再执行签名验证（parse_device_identity_rec），
+        //    如果发现已有身份，先释放锁再执行签名验证（parse_device_identity_rec），
         //    避免持有 DB 锁执行昂贵的密码学操作。
         let conn = self.doc_store.store().conn();
         if let Some(existing) = tacit_store::dao::load_device_identity(&conn)? {
@@ -191,17 +251,19 @@ impl TacitEngine {
             // 并发竞态：另一线程已先保存，使用已有身份
             return parse_device_identity_rec(&existing);
         }
-        // INSERT 可能因并发竞态失败（另一线程在二次检查与 INSERT 之间插入），
-        // 此时再尝试加载已有身份。
-        if let Err(err) = tacit_store::dao::save_device_identity(&conn, &rec) {
-            // 使用 if let Ok 避免读取错误掩盖原始写入错误
-            if let Ok(Some(existing)) = tacit_store::dao::load_device_identity(&conn) {
-                drop(conn);
-                return parse_device_identity_rec(&existing);
+        drop(conn); // 释放锁，让 save_device_identity 内部重新获取
+                    // 通过 save_device_identity 持久化——确保 SecretStorage 路径被正确调用
+        match self.save_device_identity(&di) {
+            Ok(()) => Ok(di),
+            Err(err) => {
+                // INSERT 可能因并发竞态失败（另一线程在二次检查与 INSERT 之间插入）
+                // 此时尝试加载已有身份
+                if let Some(existing) = self.load_device_identity()? {
+                    return Ok(existing);
+                }
+                Err(err)
             }
-            return Err(err);
         }
-        Ok(di)
     }
 
     /// 打开文档，返回视图。
@@ -559,7 +621,7 @@ impl TacitEngine {
     ///
     /// 仅取出 EmitEvent 动作进行分发，非事件动作（SendData/SendControl/RequestDelta）
     /// 保留在引擎队列中，由集成层通过 `drain_actions` 消费。
-    fn flush_actions_to_events(&self) {
+    pub fn flush_actions_to_events(&self) {
         let events = self.engine.drain_events();
         for action in &events {
             if let tacit_sync::SyncAction::EmitEvent(event) = action {
