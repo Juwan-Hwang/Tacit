@@ -538,7 +538,8 @@ impl SyncTransport for QuicTransport {
             &frame.payload,
             tacit_core::BatchFlag::Single,
             [0u8; 8],
-        );
+        )
+        .map_err(|e| CoreError::Serialize(format!("数据帧编码失败: {e}")))?;
         self.send_bytes(peer_id, &bytes, priority).await
     }
 

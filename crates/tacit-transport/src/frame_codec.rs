@@ -47,7 +47,7 @@ pub fn encode_data(
     payload: &[u8],
     batch_flag: tacit_core::BatchFlag,
     ref_id: [u8; 8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FrameError> {
     let frame = DataFrameWire::new(
         doc_id,
         actor_id,
@@ -323,7 +323,8 @@ mod tests {
             b"hello",
             tacit_core::BatchFlag::Single,
             [0u8; 8],
-        );
+        )
+        .unwrap();
         let decoded = decode_data(&encoded).unwrap();
         assert_eq!(decoded.seq, 99);
         assert_eq!(decoded.payload.as_ref(), b"hello");
