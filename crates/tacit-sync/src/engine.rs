@@ -25,7 +25,7 @@ use tacit_core::{
     PeerSummary, Priority, SyncReason, TelemetryCollector, Viewport,
 };
 use tacit_transport::{ControlMsg, PathPreference, StoreAndForward};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::doc_store::DocStore;
 use crate::hot_path::HotPathController;
@@ -671,18 +671,37 @@ impl DefaultSyncEngine {
 
     /// 推送本地变更给所有在线 peer，并为离线 peer 记录待发消息。
     ///
-    /// 锁粒度优化：先在锁内 clone peer ID 列表并释放锁，
+    /// # Delta 导出语义
+    ///
+    /// **必须使用 peer 的已知 frontier 作为 `since` 参数**，而非 `change.frontier`
+    ///（后者是本地编辑后的*新* frontier）。`UpdatesSince(新frontier)` 会返回空 delta，
+    /// 因为没有任何操作发生在新 frontier 之后。
+    ///
+    /// 与 `run_push_pull` 保持一致：peer 的 `known_frontier` 为空（首次同步）时
+    /// 走 snapshot 路径，非空时走 delta 路径，delta 失败时回退 snapshot。
+    ///
+    /// # 锁粒度
+    ///
+    /// 先在锁内 clone peer ID + 已知 frontier，立刻释放锁，
     /// 然后在锁外执行 delta 导出（可能触发 I/O）。
-    /// 避免在持有 `peer_states` Mutex 期间阻塞于 store 操作。
     fn push_local_change(&self, doc_id: &DocId, change: &ChangeEnvelope) -> CoreResult<()> {
-        // 1. 锁内：分离在线/离线 peer ID，立刻释放锁
-        let (online_peer_ids, offline_peer_ids): (Vec<PeerId>, Vec<PeerId>) = {
+        // 1. 锁内：分离在线/离线 peer，同时收集每个在线 peer 的已知 frontier
+        let (online_peers, offline_peer_ids): (Vec<(PeerId, Frontier, Frontier)>, Vec<PeerId>) = {
             let peers = self.peer_states.lock();
             let mut online = Vec::new();
             let mut offline = Vec::new();
             for (peer_id, state) in peers.iter() {
                 if state.online {
-                    online.push(peer_id.clone());
+                    // (peer_id, meta_known_frontier, block_known_frontier)
+                    // block_known_frontier：若变更涉及 block，取 peer 对该 block 的已知 frontier
+                    let block_frontier = change.block_id.as_ref().and_then(|bid| {
+                        state
+                            .block_frontiers
+                            .get(&(doc_id.clone(), bid.clone()))
+                            .cloned()
+                    });
+                    let since_block = block_frontier.unwrap_or_default();
+                    online.push((peer_id.clone(), state.known_frontier.clone(), since_block));
                 } else {
                     offline.push(peer_id.clone());
                 }
@@ -690,17 +709,69 @@ impl DefaultSyncEngine {
             (online, offline)
         };
 
-        // peer_states 已在 new() 中预加载所有 DB 中的已知 peer，
-        // handle_introduce/handle_revoke 会同步更新内存状态，
-        // 因此此处完全依赖内存，无需查询 DB。
-
-        // 2. 锁外：对每个在线 peer 导出 delta 并推送
-        for peer_id in &online_peer_ids {
+        // 2. 锁外：对每个在线 peer 用其已知 frontier 导出 delta 并推送
+        for (peer_id, meta_since, block_since) in &online_peers {
             let bytes = if let Some(block_id) = &change.block_id {
-                self.doc_store
-                    .export_block_delta(doc_id, block_id, &change.frontier)?
+                if block_since.is_empty() {
+                    // peer 首次同步该 block → 发 snapshot
+                    self.doc_store.export_block_snapshot(doc_id, block_id)?
+                } else {
+                    // 尝试 delta 导出；失败或空 delta 回退到 snapshot。
+                    // 空 delta 防护：block_frontiers 可能被 doc-level ack 过度推进
+                    //（ack_frontier 是 per-doc 聚合，不区分 block），
+                    // 导致 UpdatesSince(过度推进的 since) 返回 Ok(empty)。
+                    // 不回退则 peer 永久缺失 block 基座数据。
+                    let delta = self
+                        .doc_store
+                        .export_block_delta(doc_id, block_id, block_since)
+                        .or_else(|e| {
+                            warn!(
+                                peer_id = %peer_id,
+                                doc_id = %doc_id,
+                                block_id = %block_id,
+                                error = %e,
+                                "block delta 导出失败，回退到 snapshot"
+                            );
+                            self.doc_store.export_block_snapshot(doc_id, block_id)
+                        })?;
+                    if delta.is_empty() {
+                        warn!(
+                            peer_id = %peer_id,
+                            doc_id = %doc_id,
+                            block_id = %block_id,
+                            "block delta 导出为空（frontier 可能被过度推进），回退到 snapshot"
+                        );
+                        self.doc_store.export_block_snapshot(doc_id, block_id)?
+                    } else {
+                        delta
+                    }
+                }
+            } else if meta_since.is_empty() {
+                // peer 首次同步该 doc 的 MetaDoc → 发 snapshot
+                self.doc_store.export_meta_snapshot(doc_id)?
             } else {
-                self.doc_store.export_meta_delta(doc_id, &change.frontier)?
+                let delta = self
+                    .doc_store
+                    .export_meta_delta(doc_id, meta_since)
+                    .or_else(|e| {
+                        warn!(
+                            peer_id = %peer_id,
+                            doc_id = %doc_id,
+                            error = %e,
+                            "meta delta 导出失败，回退到 snapshot"
+                        );
+                        self.doc_store.export_meta_snapshot(doc_id)
+                    })?;
+                if delta.is_empty() {
+                    warn!(
+                        peer_id = %peer_id,
+                        doc_id = %doc_id,
+                        "meta delta 导出为空，回退到 snapshot"
+                    );
+                    self.doc_store.export_meta_snapshot(doc_id)?
+                } else {
+                    delta
+                }
             };
             self.push_action(SyncAction::SendData {
                 peer_id: peer_id.clone(),
@@ -747,7 +818,7 @@ impl DefaultSyncEngine {
                 }
             }
             debug!(
-                online = online_peer_ids.len(),
+                online = online_peers.len(),
                 offline = offline_peer_ids.len(),
                 "本地变更推送完成（离线 peer 已记录待发）"
             );
@@ -760,6 +831,12 @@ impl DefaultSyncEngine {
     ///
     /// 封装在引擎层而非 session 层，使引擎能感知对端确认进度，
     /// 为后续水位计算和 compaction 触发提供基础。
+    ///
+    /// **不在此处更新 `block_frontiers`**：`ack_frontier` 是 per-doc 聚合的，
+    /// 不区分 block——peer 可能 ack 了 MetaDoc 进度但尚未收到 block 数据。
+    /// 从 doc-level ack 推进 block_frontiers 会导致后续 `export_block_delta`
+    /// 跳过 block 的 base edits（peer 收到 delta 但没有 base snapshot）。
+    /// `block_frontiers` 只在 `apply_remote_block_delta`（传输确认收到 block 数据）时更新。
     pub fn handle_ack_summary(&self, msg: &tacit_core::AckSummary) -> CoreResult<()> {
         let conn = self.doc_store.store().conn();
         tacit_store::dao::upsert_ack(&conn, msg)?;
@@ -2321,5 +2398,220 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, SyncAction::SendData { peer_id, .. } if peer_id == &pid(2))));
+    }
+
+    // ===== push_local_change delta 选择测试 =====
+
+    /// 辅助：从 actions 中提取发给指定 peer 的 SendData bytes。
+    fn extract_send_data(
+        actions: &[SyncAction],
+        peer: &PeerId,
+    ) -> Option<(Option<BlockId>, Vec<u8>)> {
+        for a in actions {
+            if let SyncAction::SendData {
+                peer_id,
+                block_id,
+                bytes,
+                ..
+            } = a
+            {
+                if peer_id == peer {
+                    return Some((block_id.clone(), bytes.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// 测试 (a)：peer 的 block_frontier 为空（首次同步）→ 收到非空 snapshot。
+    #[test]
+    fn push_local_change_empty_frontier_sends_snapshot() {
+        let (engine, doc_store) = make_engine();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"hello")
+            .unwrap();
+        let frontier = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        // 注册在线 peer，frontier 为空（首次同步）
+        register_online_peer(&engine, &doc_store, pid(2));
+
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier,
+                },
+            )
+            .unwrap();
+
+        let actions = engine.drain_actions();
+        let (_, bytes) = extract_send_data(&actions, &pid(2)).expect("应有 SendData");
+        // snapshot 非空
+        assert!(!bytes.is_empty(), "首次同步应收到非空 snapshot");
+    }
+
+    /// 测试 (b)：peer 已有 block_frontier → 收到非空 delta（而非 snapshot）。
+    #[test]
+    fn push_local_change_known_frontier_sends_delta() {
+        let (engine, doc_store) = make_engine();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        // 第一次编辑
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"hello")
+            .unwrap();
+        let frontier_after_first = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        // 注册在线 peer
+        register_online_peer(&engine, &doc_store, pid(2));
+
+        // 模拟 peer 已收到第一次编辑的 snapshot：手动设置 block_frontiers
+        {
+            let mut states = engine.peer_states.lock();
+            if let Some(s) = states.get_mut(&pid(2)) {
+                s.block_frontiers.insert(
+                    (DocId::new("d1"), BlockId::new("b1")),
+                    frontier_after_first.clone(),
+                );
+            }
+        }
+
+        // 第二次编辑
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b" world")
+            .unwrap();
+        let frontier_after_second = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier: frontier_after_second,
+                },
+            )
+            .unwrap();
+
+        let actions = engine.drain_actions();
+        let (_, bytes) = extract_send_data(&actions, &pid(2)).expect("应有 SendData");
+
+        // delta 应非空（包含 " world" 的增量）
+        assert!(!bytes.is_empty(), "已知 frontier 的 peer 应收到非空 delta");
+
+        // delta 应小于 snapshot（增量比全量小）
+        let snapshot = doc_store
+            .export_block_snapshot(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+        assert!(
+            bytes.len() <= snapshot.len(),
+            "delta ({}) 应 <= snapshot ({})",
+            bytes.len(),
+            snapshot.len()
+        );
+    }
+
+    /// 测试 (c)：本地 authored block 始终走 snapshot 路径（block_frontiers 不被更新）。
+    ///
+    /// `block_frontiers` 只在 `apply_remote_block_delta`（收到 peer 的 block 数据）时更新，
+    /// 且只记录远端 peer 的条目（排除本地 peer）。对于本地 authored block，
+    /// `block_frontiers` 始终为空，每次编辑都走 snapshot 路径——这是正确性优先于性能的设计：
+    /// 从 doc-level ack 推进 block_frontiers 会导致 peer 收到 delta 但缺少 base snapshot。
+    /// 空 delta 回退防护确保即使 block_frontiers 被错误推进，也不会发送空 delta。
+    #[test]
+    fn local_authored_block_always_uses_snapshot() {
+        let (engine, doc_store) = make_engine();
+        doc_store
+            .create_block(
+                &DocId::new("d1"),
+                BlockId::new("b1"),
+                tacit_core::BlockKind::Text,
+            )
+            .unwrap();
+        // 第一次编辑
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b"first")
+            .unwrap();
+        let frontier_after_first = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        // 注册在线 peer
+        register_online_peer(&engine, &doc_store, pid(2));
+
+        // 1. 第一次推送 → peer 的 block_frontier 为空 → 走 snapshot
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier: frontier_after_first.clone(),
+                },
+            )
+            .unwrap();
+        let actions = engine.drain_actions();
+        let (_, snap1) = extract_send_data(&actions, &pid(2)).expect("第一次应有 SendData");
+        assert!(!snap1.is_empty(), "首次同步应收到非空 snapshot");
+
+        // 2. 验证 block_frontiers 仍为空（本地 authored block 不会被更新）
+        {
+            let states = engine.peer_states.lock();
+            let s = states.get(&pid(2)).expect("peer 应存在");
+            let bf = s
+                .block_frontiers
+                .get(&(DocId::new("d1"), BlockId::new("b1")));
+            assert!(bf.is_none() || bf.is_some_and(|f| f.is_empty()));
+        }
+
+        // 3. 第二次编辑 → 仍走 snapshot 路径（block_frontier 仍为空）
+        doc_store
+            .apply_local_edit(&DocId::new("d1"), &BlockId::new("b1"), b" second")
+            .unwrap();
+        let frontier_after_second = doc_store
+            .block_frontier(&DocId::new("d1"), &BlockId::new("b1"))
+            .unwrap();
+
+        engine
+            .on_local_change(
+                DocId::new("d1"),
+                ChangeEnvelope {
+                    doc_id: DocId::new("d1"),
+                    block_id: Some(BlockId::new("b1")),
+                    delta: bytes::Bytes::new(),
+                    frontier: frontier_after_second,
+                },
+            )
+            .unwrap();
+
+        let actions = engine.drain_actions();
+        let (_, snap2) = extract_send_data(&actions, &pid(2)).expect("第二次应有 SendData");
+        assert!(
+            !snap2.is_empty(),
+            "本地 authored block 应始终收到非空 snapshot"
+        );
     }
 }
