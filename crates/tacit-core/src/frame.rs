@@ -452,6 +452,10 @@ pub enum FrameError {
     VersionMismatch(u8),
     #[error("帧过大: {0} 字节，超过最大限制")]
     FrameTooLarge(usize),
+    #[error("序列化失败: {0}")]
+    Serialize(String),
+    #[error("反序列化失败: {0}")]
+    Deserialize(String),
 }
 
 // ===== 辅助函数 =====

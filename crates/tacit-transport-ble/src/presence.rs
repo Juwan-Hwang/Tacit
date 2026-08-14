@@ -184,6 +184,8 @@ fn taci_core_frame_error_to_core(e: &FrameError) -> tacit_core::CoreError {
         FrameError::FrameTooLarge(size) => {
             CoreError::Deserialize(format!("帧过大: {size} 字节，超过最大限制"))
         }
+        FrameError::Serialize(msg) => CoreError::Deserialize(format!("帧序列化失败: {msg}")),
+        FrameError::Deserialize(msg) => CoreError::Deserialize(format!("帧反序列化失败: {msg}")),
     }
 }
 

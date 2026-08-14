@@ -178,11 +178,11 @@ fn control_msg_to_tlv(msg: &CMsg) -> Result<(ControlType, Vec<u8>), FrameError> 
     }
 }
 
-/// 序列化辅助函数，序列化失败时返回 `FrameError` 而非静默吞掉。
+/// 序列化辅助函数，序列化失败时返回 `FrameError::Serialize` 而非静默吞掉。
 fn serialize_msg<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
     serde_json::to_vec(value).map_err(|e| {
         tracing::error!(error = %e, "ControlMsg 序列化失败");
-        FrameError::UnknownControlType(0)
+        FrameError::Serialize(e.to_string())
     })
 }
 
@@ -195,31 +195,26 @@ fn tlv_to_control_msg(ctrl_type: ControlType, payload: &[u8]) -> Result<CMsg, Fr
     match ctrl_type {
         ControlType::Capabilities => {
             let ann: PeerAnnouncement = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::Capabilities as u8))?;
+                .map_err(|e| FrameError::Deserialize(format!("{e}: {value:?}")))?;
             Ok(CMsg::Capabilities(ann))
         }
         ControlType::KnownCheckpoint => {
             let json: serde_json::Value = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             let peer_id_str = json["peer_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(
-                    ControlType::KnownCheckpoint as u8,
-                ))?;
+                .ok_or_else(|| FrameError::Deserialize("missing peer_id".into()))?;
             let doc_id_str = json["doc_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(
-                    ControlType::KnownCheckpoint as u8,
-                ))?;
+                .ok_or_else(|| FrameError::Deserialize("missing doc_id".into()))?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             let checkpoint = json["checkpoint"]
                 .as_str()
                 .map(tacit_core::CheckpointId::new);
-            let frontier: tacit_core::Frontier = serde_json::from_value(json["frontier"].clone())
-                .map_err(|_| {
-                FrameError::UnknownControlType(ControlType::KnownCheckpoint as u8)
-            })?;
+            let frontier: tacit_core::Frontier =
+                serde_json::from_value(json["frontier"].clone())
+                    .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::KnownCheckpoint {
                 peer_id,
                 doc_id,
@@ -229,54 +224,50 @@ fn tlv_to_control_msg(ctrl_type: ControlType, payload: &[u8]) -> Result<CMsg, Fr
         }
         ControlType::AckSummary => {
             let ack: tacit_core::AckSummary = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::AckSummary as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::AckSummary(ack))
         }
         ControlType::NeedRanges => {
             let ranges: NeedRanges = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::NeedRanges as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::NeedRanges(ranges))
         }
         ControlType::SyncIntent => {
             let json: serde_json::Value = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::SyncIntent as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             let peer_id_str = json["peer_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(
-                    ControlType::SyncIntent as u8,
-                ))?;
+                .ok_or_else(|| FrameError::Deserialize("missing peer_id".into()))?;
             let doc_id_str = json["doc_id"]
                 .as_str()
-                .ok_or(FrameError::UnknownControlType(
-                    ControlType::SyncIntent as u8,
-                ))?;
+                .ok_or_else(|| FrameError::Deserialize("missing doc_id".into()))?;
             let peer_id = PeerId::new(peer_id_str);
             let doc_id = DocId::new(doc_id_str);
             Ok(CMsg::SyncIntent { peer_id, doc_id })
         }
         ControlType::TransportHints => {
             let hints: TransportHints = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::TransportHints as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::TransportHints(hints))
         }
         ControlType::RelayHints => {
             let hints: RelayHints = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::RelayHints as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::RelayHints(hints))
         }
         ControlType::Introduce => {
             let intro: IntroducePeer = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::Introduce as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::Introduce(intro))
         }
         ControlType::Revoke => {
             let revoke: RevokePeer = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::Revoke as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::Revoke(revoke))
         }
         ControlType::KeyRotate => {
             let rotate: KeyRotateNotice = serde_json::from_slice(value)
-                .map_err(|_| FrameError::UnknownControlType(ControlType::KeyRotate as u8))?;
+                .map_err(|e| FrameError::Deserialize(e.to_string()))?;
             Ok(CMsg::KeyRotate(rotate))
         }
     }

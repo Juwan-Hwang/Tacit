@@ -556,13 +556,19 @@ impl RelayClientTransport {
             .map_err(|e| CoreError::Transport(format!("写入 Ping 失败: {e}")))?;
         send.finish()
             .map_err(|e| CoreError::Transport(format!("finish 失败: {e}")))?;
-        // 读取 Pong 响应
+        // 读取 Pong 响应（限制 10MB 防止 OOM DoS）
+        const MAX_PONG_SIZE: usize = 10 * 1024 * 1024;
         let mut buf = Vec::new();
         let mut chunk = vec![0u8; 64];
         loop {
             match recv.read(&mut chunk).await {
                 Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Some(n)) => {
+                    if buf.len() + n > MAX_PONG_SIZE {
+                        return Err(CoreError::Transport("Pong 响应超过 10MB 限制".into()));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
                 Err(e) => return Err(CoreError::Transport(format!("读取 Pong 失败: {e}"))),
             }
         }
@@ -854,13 +860,20 @@ impl RelayServerRunner {
         send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) {
-        // 读取请求
+        // 读取请求（限制 10MB 防止 OOM DoS，与 request_response 和 push stream 一致）
+        const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
         let mut buf = Vec::new();
         let mut chunk = vec![0u8; 4096];
         loop {
             match recv.read(&mut chunk).await {
                 Ok(Some(0)) | Ok(None) => break,
-                Ok(Some(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Some(n)) => {
+                    if buf.len() + n > MAX_REQUEST_SIZE {
+                        warn!("请求大小超过 10MB 限制，丢弃");
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
                 Err(e) => {
                     debug!(error = %e, "读取请求失败");
                     return;
