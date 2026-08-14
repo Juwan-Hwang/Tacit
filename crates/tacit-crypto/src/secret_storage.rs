@@ -12,7 +12,7 @@
 //!
 //! ## 为什么 Rust 做 trait + 桌面默认
 //!
-//! 私钥明文存 SQLite 是已知安全债（AUDIT_REVIEW #63）。
+//! 私钥明文存 SQLite 是已知安全债。
 //! `keyring` crate 已覆盖 Win/Mac/Linux 原生钥匙串，Rust 端只需定义 trait + 接入
 //! 即可消除桌面端的这个债。只有 iOS/Android 需要宿主注入平台实现。
 //!
