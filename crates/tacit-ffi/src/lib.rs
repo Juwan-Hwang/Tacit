@@ -17,6 +17,7 @@ pub mod error;
 pub mod event_bus;
 pub mod listener;
 pub mod runtime;
+pub mod secret_storage;
 pub mod view;
 
 pub use ble::{
@@ -30,6 +31,7 @@ pub use error::TacitFfiError;
 pub use event_bus::{EventBus, EventFilter, SubscriptionId};
 pub use listener::{ForeignEventListener, TacitEventListener};
 pub use runtime::{RuntimeConfig, RuntimeState, RuntimeSupervisor};
+pub use secret_storage::ForeignSecretStorage;
 pub use view::{
     DocumentView, DocumentViewWithContent, FfiBlockContent, FfiRequestDeltaAction,
     FfiSendControlAction, FfiSendDataAction, FfiSyncAction, SyncStatus,
