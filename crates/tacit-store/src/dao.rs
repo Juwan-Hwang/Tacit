@@ -1001,9 +1001,33 @@ pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> Co
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+
+    // 条件 upsert：只在不存在行或全零占位符时写入，防止 TOCTOU 竞争覆盖有效身份。
+    //
+    // INSERT 尝试插入新行；若 id='default' 已存在则触发 ON CONFLICT，
+    // DO UPDATE 只在 signing_key 和 static_public 均为全零时替换。
+    //
+    // **关键区分**：安全存储模式下有效身份的 signing_key 也是全零（私钥在 Keyring），
+    // 但 static_public 非空（用于 Keyring lookup key 派生）。
+    // 真正的占位符是所有字段全零（Keyring 丢失后写入的临时记录）。
+    // 因此 WHERE 条件必须同时检查 signing_key 全零 AND static_public 为空，
+    // 才能正确区分"安全模式有效身份"和"全零占位符"。
+    //
+    // `changes()` 返回实际受影响行数：
+    //   - 新插入 → 1
+    //   - 覆盖全零占位符（所有字段全零）→ 1
+    //   - 已有有效身份（含安全模式）→ 0（返回错误）
     conn.execute(
         "INSERT INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
-         VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+         VALUES ('default', ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             signing_key = excluded.signing_key,
+             static_private = excluded.static_private,
+             static_public = excluded.static_public,
+             binding_proof = excluded.binding_proof,
+             created_at = excluded.created_at
+         WHERE device_identity.signing_key = X'0000000000000000000000000000000000000000000000000000000000000000'
+           AND (device_identity.static_public IS NULL OR device_identity.static_public = X'')",
         params![
             &rec.signing_key[..],
             &rec.static_private[..],
@@ -1013,6 +1037,58 @@ pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> Co
         ],
     )
     .map_err(store_err)?;
+
+    if conn.changes() == 0 {
+        return Err(store_err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: 19,
+            },
+            Some("device_identity 已存在有效身份，拒绝覆盖".into()),
+        )));
+    }
+    Ok(())
+}
+
+/// 覆盖设备身份（用于 Keyring 丢失后恢复）。
+///
+/// 与 `save_device_identity` 不同，此函数无条件覆盖现有身份。
+/// 仅在调用方确认需要恢复时使用（如 Keyring 丢失后重新生成身份）。
+/// 覆盖设备身份（用于 Keyring 丢失后恢复）。
+///
+/// 安全语义：仅覆盖全零占位符行（`signing_key` 全零且 `static_public` 为空），
+/// 不覆盖有效身份。这确保即使调用方误调，也不会破坏已有的有效身份。
+pub fn overwrite_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> CoreResult<()> {
+    let now = rec
+        .created_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let result = conn.execute(
+        "INSERT INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+         VALUES ('default', ?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             signing_key = ?1,
+             static_private = ?2,
+             static_public = ?3,
+             binding_proof = ?4,
+             created_at = ?5
+         WHERE signing_key = X'0000000000000000000000000000000000000000000000000000000000000000'
+           AND (static_public IS NULL OR static_public = '')",
+        params![
+            &rec.signing_key[..],
+            &rec.static_private[..],
+            rec.static_public,
+            rec.binding_proof,
+            now
+        ],
+    )
+    .map_err(store_err)?;
+    if result == 0 {
+        return Err(store_err(rusqlite::Error::ToSqlConversionFailure(
+            "overwrite_device_identity: 行不是全零占位符或不存在，拒绝覆盖有效身份".into(),
+        )));
+    }
     Ok(())
 }
 

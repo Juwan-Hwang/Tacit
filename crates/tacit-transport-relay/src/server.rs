@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use tacit_core::{CoreError, CoreResult, PeerId};
 use tracing::{debug, warn};
 
-use crate::admission::verify_proof;
+use crate::admission::{verify_proof_with_replay, NonceCache};
 use crate::protocol::{ForwardRequest, RelayMessage};
 
 /// session 条目。
@@ -87,6 +87,8 @@ pub struct RelayServer {
     rate_burst_bytes: f64,
     /// 限流配置：补充速率（字节/秒，默认 1 MB/s）。
     rate_bytes_per_sec: f64,
+    /// admission proof nonce 去重缓存（防重放）。
+    nonce_cache: NonceCache,
 }
 
 impl RelayServer {
@@ -101,6 +103,7 @@ impl RelayServer {
             rate_limiters: Mutex::new(HashMap::new()),
             rate_burst_bytes: 10.0 * 1024.0 * 1024.0,
             rate_bytes_per_sec: 1024.0 * 1024.0,
+            nonce_cache: NonceCache::new(),
         }
     }
 
@@ -119,8 +122,13 @@ impl RelayServer {
     ///
     /// 返回分配的 session_id。
     pub fn handle_register(&self, proof: &crate::AdmissionProof) -> CoreResult<String> {
-        // 验证 proof
-        verify_proof(proof, &self.secret, self.proof_max_age.as_secs())?;
+        // 验证 proof（含 nonce 重放检查）
+        verify_proof_with_replay(
+            proof,
+            &self.secret,
+            self.proof_max_age.as_secs(),
+            &self.nonce_cache,
+        )?;
 
         let peer_id = PeerId::new(&proof.peer_id);
         let session_id = self.generate_session_id();

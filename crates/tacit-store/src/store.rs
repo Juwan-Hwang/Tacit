@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(loaded.static_public, rec.static_public);
         assert_eq!(loaded.binding_proof, rec.binding_proof);
 
-        // 覆盖写入应失败（INSERT 防止静默覆盖）
+        // 覆盖有效身份应失败（条件 upsert 保护 TOCTOU 竞争）
         let rec2 = dao::DeviceIdentityRecord {
             signing_key: zeroize::Zeroizing::new([0xAA; 32]),
             static_private: zeroize::Zeroizing::new([0xBB; 32]),
@@ -904,12 +904,38 @@ mod tests {
         };
         assert!(
             dao::save_device_identity(&conn, &rec2).is_err(),
-            "INSERT 应在已存在身份时失败，防止静默覆盖"
+            "条件 upsert 应拒绝覆盖已有有效身份，防止 TOCTOU 竞争"
         );
 
         // 原身份应保持不变
         let loaded2 = dao::load_device_identity(&conn).unwrap().unwrap();
         assert_eq!(loaded2.signing_key, rec.signing_key, "原身份不应被覆盖");
+
+        // 覆盖全零占位符应成功（Keyring 丢失恢复路径）
+        // 占位符：signing_key 全零 AND static_public 为空（区分安全模式有效身份）
+        // 先用直接 SQL 写入全零占位符（模拟安全存储模式写入的占位符）
+        // 不能用 overwrite_device_identity，因为它现在有条件守卫（只覆盖已有的占位符行）
+        conn.execute(
+            "INSERT OR REPLACE INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+             VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                &[0u8; 32][..],
+                &[0u8; 32][..],
+                vec![] as Vec<u8>,
+                vec![] as Vec<u8>,
+                0i64
+            ],
+        ).unwrap();
+        // 再用 save 覆盖全零占位符——应成功
+        assert!(
+            dao::save_device_identity(&conn, &rec2).is_ok(),
+            "条件 upsert 应允许覆盖全零占位符以支持 Keyring 丢失恢复"
+        );
+        let loaded3 = dao::load_device_identity(&conn).unwrap().unwrap();
+        assert_eq!(
+            loaded3.signing_key, rec2.signing_key,
+            "新身份应已覆盖全零占位符"
+        );
     }
 
     #[test]
