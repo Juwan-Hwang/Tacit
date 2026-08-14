@@ -1002,7 +1002,7 @@ pub fn save_device_identity(conn: &Connection, rec: &DeviceIdentityRecord) -> Co
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     conn.execute(
-        "INSERT INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
+        "INSERT OR REPLACE INTO device_identity (id, signing_key, static_private, static_public, binding_proof, created_at)
          VALUES ('default', ?1, ?2, ?3, ?4, ?5)",
         params![
             &rec.signing_key[..],
