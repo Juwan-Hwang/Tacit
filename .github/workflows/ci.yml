@@ -117,3 +117,99 @@ jobs:
 
       - name: Run cargo-audit
         run: cargo audit
+
+  keyring-check:
+    name: Keyring feature check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libdbus-1-dev pkg-config
+
+      - name: Install protoc (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install protoc --yes
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: keyring-${{ matrix.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check keyring feature compiles
+        run: cargo check --features keyring -p tacit-crypto
+
+      - name: Check keyring feature clippy
+        run: cargo clippy --features keyring -p tacit-crypto -- -D warnings
+
+  coverage:
+    name: Coverage (tarpaulin + Codecov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libdbus-1-dev pkg-config
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: coverage-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: coverage-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin --version 0.31.4
+        env:
+          RUSTFLAGS: ""
+
+      - name: Run tarpaulin
+        run: cargo tarpaulin --workspace --lib --out xml --output-dir .
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Verify coverage report exists
+        run: test -f cobertura.xml
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        continue-on-error: true
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: cobertura.xml
+          fail_ci_if_error: false

@@ -82,7 +82,7 @@ proptest! {
             &did("doc1"), &pid("42"), 99,
             DataFrameKind::Delta, b"hello payload",
             BatchFlag::Single, [0u8; 8],
-        );
+        ).unwrap();
         if !encoded.is_empty() {
             let idx = flip_byte % encoded.len();
             let mut mutated = encoded.clone();
@@ -122,7 +122,7 @@ proptest! {
             &did("doc1"), &pid("42"), seq,
             DataFrameKind::Delta, &payload,
             BatchFlag::Single, [0u8; 8],
-        );
+        ).unwrap();
         let decoded = decode_data(&encoded).unwrap();
         prop_assert_eq!(decoded.seq, seq);
         prop_assert_eq!(decoded.payload.as_ref(), payload.as_slice());
